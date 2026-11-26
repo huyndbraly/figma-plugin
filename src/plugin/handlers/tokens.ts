@@ -157,9 +157,13 @@ async function getOrCreateCollection(
 async function existingVarsByName(
   collection: VariableCollection,
 ): Promise<Map<string, Variable>> {
+  // Called right before this collection is written to: the cached names are
+  // stale from here on, whatever the caller goes on to create.
+  invalidateVariables();
+  const byId = new Map((await localVariables()).map((v) => [v.id, v]));
   const map = new Map<string, Variable>();
   for (const id of collection.variableIds) {
-    const v = await figma.variables.getVariableByIdAsync(id);
+    const v = byId.get(id);
     if (v) map.set(v.name, v);
   }
   return map;
@@ -186,6 +190,7 @@ function upsertVar(
     return found;
   }
   const v = figma.variables.createVariable(name, collection, type);
+  invalidateVariables();
   existing.set(name, v);
   created.push(name);
   return v;
@@ -286,14 +291,79 @@ export async function applyVariable(ctx: HandlerContext): Promise<unknown> {
   return { id: node.id, bound: { field, tokenName, variableId: variable.id } };
 }
 
-export async function findVariableByName(name: string): Promise<Variable | null> {
-  const collections = await figma.variables.getLocalVariableCollectionsAsync();
-  for (const c of collections) {
+/**
+ * Every local variable, from ONE call into the editor.
+ *
+ * The old shape — collections, then `await getVariableByIdAsync` per id — is
+ * a round trip per variable, one after another: 400 tokens was 400 waits, and
+ * it ran for every `$token` of every node a create made.
+ * getLocalVariablesAsync hands back the lot at once. The per-id path stays
+ * only for a runtime that lacks it.
+ */
+export async function localVariables(): Promise<Variable[]> {
+  const api = figma.variables as VariablesAPI & {
+    getLocalVariablesAsync?: VariablesAPI["getLocalVariablesAsync"];
+  };
+  if (typeof api.getLocalVariablesAsync === "function") return api.getLocalVariablesAsync();
+  const out: Variable[] = [];
+  for (const c of await api.getLocalVariableCollectionsAsync()) {
     for (const id of c.variableIds) {
-      const v = await figma.variables.getVariableByIdAsync(id);
-      if (v && v.name === name) return v;
+      const v = await api.getVariableByIdAsync(id);
+      if (v) out.push(v);
     }
   }
+  return out;
+}
+
+/**
+ * name → variable, kept for a moment. A create with eighty `$token` fills
+ * asked for the whole list eighty times; two seconds covers one request, and
+ * every op in this file that creates, renames, deletes or imports a variable
+ * calls invalidateVariables, so the next lookup sees the change at once. Tied
+ * to the `figma.variables` object it was read from, so a different API (a
+ * reloaded plugin, a test's fresh fake) never sees another one's names.
+ */
+const VAR_CACHE_TTL_MS = 2000;
+let varCache: { at: number; api: unknown; byName: Map<string, Variable> } | null = null;
+
+export function invalidateVariables(): void {
+  varCache = null;
+}
+
+async function variablesByName(): Promise<Map<string, Variable>> {
+  const now = Date.now();
+  if (varCache && varCache.api === figma.variables && now - varCache.at < VAR_CACHE_TTL_MS) {
+    return varCache.byName;
+  }
+  const [collections, vars] = await Promise.all([
+    figma.variables.getLocalVariableCollectionsAsync(),
+    localVariables(),
+  ]);
+  const byId = new Map(vars.map((v) => [v.id, v]));
+  const byName = new Map<string, Variable>();
+  // Collection order, then each collection's own order — the order the old
+  // scan visited them in, so the FIRST of two same-named variables still wins.
+  for (const c of collections) {
+    for (const id of c.variableIds) {
+      const v = byId.get(id);
+      if (v && !byName.has(v.name)) byName.set(v.name, v);
+    }
+  }
+  varCache = { at: now, api: figma.variables, byName };
+  return byName;
+}
+
+export async function findVariableByName(name: string): Promise<Variable | null> {
+  const v = (await variablesByName()).get(name);
+  if (!v) return null;
+  try {
+    // Renamed or deleted in the editor since the list was read (a deleted
+    // one throws on any read): drop the list and say "not found" honestly.
+    if (v.name === name) return v;
+  } catch {
+    // fall through
+  }
+  invalidateVariables();
   return null;
 }
 
@@ -426,6 +496,7 @@ export async function createVariable(ctx: HandlerContext): Promise<unknown> {
     );
   }
   const variable = figma.variables.createVariable(name, collection, type);
+  invalidateVariables();
   if (typeof p.description === "string") variable.description = p.description;
   const modes = writeVariableValues(variable, collection, p, type);
   return { id: variable.id, name, type, collection: collection.name, modes };
@@ -480,6 +551,7 @@ export async function renameVariable(ctx: HandlerContext): Promise<unknown> {
   }
   const oldName = variable.name;
   variable.name = newName;
+  invalidateVariables();
   // Bindings reference the variable ID, so every consumer keeps resolving.
   return { id: variable.id, oldName, name: newName, referencesKept: true };
 }
@@ -618,6 +690,7 @@ export async function deleteVariable(ctx: HandlerContext): Promise<unknown> {
   const name = variable.name;
   const id = variable.id;
   variable.remove();
+  invalidateVariables();
   return {
     deleted: name,
     id,
@@ -651,10 +724,12 @@ async function collectNeutral(
 ): Promise<NeutralCollection[]> {
   // Variable-name lookup across ALL collections so alias refs resolve even
   // when the target lives in a collection not being exported.
+  // One fetch for every variable, not two awaits per variable.
+  const byId = new Map((await localVariables()).map((v) => [v.id, v]));
   const nameById = new Map<string, string>();
   for (const c of all) {
     for (const id of c.variableIds) {
-      const v = await figma.variables.getVariableByIdAsync(id);
+      const v = byId.get(id);
       if (v) nameById.set(v.id, v.name);
     }
   }
@@ -662,7 +737,7 @@ async function collectNeutral(
   for (const c of wanted) {
     const tokens: NeutralToken[] = [];
     for (const id of c.variableIds) {
-      const v = await figma.variables.getVariableByIdAsync(id);
+      const v = byId.get(id);
       if (!v) continue;
       const type = FIGMA_TO_TOKEN_TYPE[v.resolvedType] ?? "string";
       const valuesByMode: Record<string, TokenScalar> = {};

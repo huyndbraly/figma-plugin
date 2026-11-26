@@ -77,8 +77,41 @@ export async function getNodeByIdSafe(id: string): Promise<BaseNode | null> {
       allPagesLoaded = null;
     });
   }
-  await allPagesLoaded;
-  return figma.getNodeByIdAsync(id);
+  // The first lookup is NOT abandoned: a slow-but-healthy one (a busy editor,
+  // a throttled background tab) is still racing the retry, and whichever finds
+  // the node first wins. It used to be dropped at the stall, so a lookup that
+  // would have answered at 2.6s waited for a whole-document load instead.
+  return firstFulfilled(lookup, allPagesLoaded, () => figma.getNodeByIdAsync(id));
+}
+
+/**
+ * The first lookup or the retry after `loaded`, whichever finds the node
+ * first. A lookup that fails only counts once both have — and then it is the
+ * RETRY's error, the honest one: the first lookup failing late is the dead
+ * end the retry exists to get past. A failed page load is final at once: with
+ * no load there is nothing to retry, and the first lookup is the hang.
+ */
+function firstFulfilled<T>(
+  first: Promise<T>,
+  loaded: Promise<unknown>,
+  retry: () => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let failed = 0;
+    let retryError: unknown;
+    const fail = () => {
+      if (++failed === 2) reject(retryError);
+    };
+    first.then(resolve, fail);
+    loaded.then(
+      () =>
+        retry().then(resolve, (e) => {
+          retryError = e;
+          fail();
+        }),
+      reject,
+    );
+  });
 }
 
 /** Resolve a node id (async, dynamic-page safe) or throw NODE_NOT_FOUND. */

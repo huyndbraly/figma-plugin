@@ -21,19 +21,19 @@ import {
   type DesignObservedPatterns,
   type DesignScreen,
 } from "../../shared/design-system.js";
+import { localVariables } from "./tokens.js";
 
 export async function getComponent(ctx: HandlerContext): Promise<unknown> {
   const node = await resolveComponentNode(ctx.params);
   const depth = numberParam(ctx.params.depth, 3);
   const detail = normalizeDetail(ctx.params.detail ?? "design");
-  return {
-    component: await serializeComponent(node, {
-      detail,
-      depth,
-      includeAnatomy: ctx.params.includeAnatomy !== false,
-      includeInstances: ctx.params.includeInstances === true,
-    }),
-  };
+  const component = serializeComponent(node, {
+    detail,
+    depth,
+    includeAnatomy: ctx.params.includeAnatomy !== false,
+  });
+  if (ctx.params.includeInstances === true) await countInstances([node], [component], undefined);
+  return { component };
 }
 
 /**
@@ -110,11 +110,10 @@ export async function getLibraryComponent(
   return {
     imported: true,
     remote: (node as ComponentNode).remote === true,
-    component: await serializeComponent(node, {
+    component: serializeComponent(node, {
       detail,
       depth,
       includeAnatomy: p.includeAnatomy !== false,
-      includeInstances: false,
     }),
   };
 }
@@ -167,20 +166,63 @@ export async function listComponents(params: Record<string, unknown> = {}): Prom
   const maxComponents = optionalNumberParam(params.maxComponents);
   const nodes = figma.root.findAllWithCriteria({ types: ["COMPONENT", "COMPONENT_SET"] });
   const selected = maxComponents === undefined ? nodes : nodes.slice(0, maxComponents);
+  // A variant whose set is also being listed is already described inside
+  // the set (its `variants`, and the set's own text layers and slots walk
+  // through it). Serialized again in full it doubled the work and the
+  // response on every variant-heavy library, so it gets a light entry: what
+  // identifies it and the set it belongs to.
+  const listedSets = new Set(selected.filter((n) => n.type === "COMPONENT_SET").map((n) => n.id));
 
   const components: DesignComponent[] = [];
   for (let i = 0; i < selected.length; i++) {
+    const node = selected[i]!;
+    const light = node.type === "COMPONENT" && node.parent?.type === "COMPONENT_SET" && listedSets.has(node.parent.id);
     components.push(
-      await serializeComponent(selected[i]!, {
-        detail,
-        depth,
-        includeAnatomy,
-        includeInstances,
-      }),
+      light
+        ? variantEntry(node as ComponentNode, detail === "design" || includeAnatomy)
+        : serializeComponent(node, { detail, depth, includeAnatomy }),
     );
     if ((i + 1) % 25 === 0) await yieldToPlugin();
   }
+  if (includeInstances) await countInstances(selected, components, params.instanceCounts);
   return { count: components.length, total: nodes.length, omittedCount: Math.max(0, nodes.length - components.length), components };
+}
+
+/**
+ * Fill `instanceCount` on every COMPONENT entry. `known` is a count the
+ * caller already has (the kit's usage sweep, when it saw every instance), so
+ * nothing is asked twice; the rest are asked for in parallel batches rather
+ * than one awaited getInstancesAsync after another.
+ */
+async function countInstances(
+  selected: ReadonlyArray<ComponentNode | ComponentSetNode>,
+  components: DesignComponent[],
+  known: unknown,
+): Promise<void> {
+  const counts = known instanceof Map ? (known as Map<string, number>) : null;
+  const pending: number[] = [];
+  for (let i = 0; i < selected.length; i++) {
+    if (selected[i]!.type !== "COMPONENT") continue;
+    const k = counts?.get(selected[i]!.id);
+    if (counts) components[i]!.instanceCount = k ?? 0;
+    else pending.push(i);
+  }
+  for (let start = 0; start < pending.length; start += 25) {
+    const chunk = pending.slice(start, start + 25);
+    const found = await Promise.all(chunk.map((i) => (selected[i] as ComponentNode).getInstancesAsync()));
+    chunk.forEach((i, j) => (components[i]!.instanceCount = found[j]!.length));
+    await yieldToPlugin();
+  }
+}
+
+function variantEntry(node: ComponentNode, rich: boolean): DesignComponent {
+  const c: DesignComponent = { id: node.id, name: node.name, type: node.type, key: node.key };
+  if (!rich) return c;
+  const set = node.parent as ComponentSetNode;
+  c.componentSetId = set.id;
+  c.componentSetName = set.name;
+  c.variantProperties = plainValue(node.variantProperties) as Record<string, unknown> | null;
+  return c;
 }
 
 async function collectDesignSystemKit(ctx: HandlerContext): Promise<DesignSystemKit> {
@@ -188,18 +230,10 @@ async function collectDesignSystemKit(ctx: HandlerContext): Promise<DesignSystem
   const depth = numberParam(ctx.params.depth, 2);
   const includeScreens = ctx.params.includeScreens !== false;
   const includeComponentUsage = ctx.params.includeComponentUsage !== false;
-  const [styles, variables, components] = await Promise.all([
-    getRichStyles(),
-    getRichVariables(),
-    listComponents({
-      detail,
-      depth,
-      includeAnatomy: ctx.params.includeAnatomy === true,
-      includeInstances: ctx.params.includeInstances === true,
-      maxComponents: ctx.params.maxComponents,
-    }),
-  ]);
-
+  const includeInstances = ctx.params.includeInstances === true;
+  // The usage sweep counts every instance per component anyway; when it saw
+  // all of them, that IS the instance count, and asking each component for
+  // its instances again is a second document-wide search per component.
   const evidence = await collectDocumentEvidence(ctx, {
     includeScreens,
     includeComponentUsage,
@@ -207,6 +241,22 @@ async function collectDesignSystemKit(ctx: HandlerContext): Promise<DesignSystem
     maxScreens: boundedCountParam(ctx.params.maxScreens, 80, 500),
     maxInstances: boundedCountParam(ctx.params.maxInstances, 2_000, 20_000),
   });
+  const instanceCounts =
+    includeInstances && includeComponentUsage && evidence.inspectedInstances >= evidence.totalInstances
+      ? new Map([...evidence.usageByComponentId].map(([id, u]) => [id, u.instanceCount]))
+      : undefined;
+  const [styles, variables, components] = await Promise.all([
+    getRichStyles(),
+    getRichVariables(),
+    listComponents({
+      detail,
+      depth,
+      includeAnatomy: ctx.params.includeAnatomy === true,
+      includeInstances,
+      maxComponents: ctx.params.maxComponents,
+      ...(instanceCounts ? { instanceCounts } : {}),
+    }),
+  ]);
   for (const component of components.components) {
     const usage = evidence.usageByComponentId.get(component.id);
     if (usage) component.usageStats = usage;
@@ -402,10 +452,10 @@ async function resolveComponentNode(params: Record<string, unknown>): Promise<Co
   return node as ComponentNode | ComponentSetNode;
 }
 
-async function serializeComponent(
+function serializeComponent(
   node: ComponentNode | ComponentSetNode,
-  opts: { detail: Detail; depth: number; includeAnatomy: boolean; includeInstances: boolean },
-): Promise<DesignComponent> {
+  opts: { detail: Detail; depth: number; includeAnatomy: boolean },
+): DesignComponent {
   const c: DesignComponent = {
     id: node.id,
     name: node.name,
@@ -431,9 +481,6 @@ async function serializeComponent(
       c.componentSetId = node.parent.id;
       c.componentSetName = node.parent.name;
     }
-    if (opts.includeInstances) {
-      c.instanceCount = (await node.getInstancesAsync()).length;
-    }
   } else {
     c.variantGroupProperties = plainValue(node.variantGroupProperties) as Record<string, unknown>;
     c.defaultVariantId = node.defaultVariant?.id;
@@ -447,8 +494,9 @@ async function serializeComponent(
       }));
   }
 
-  c.textLayers = textLayers(node, opts.depth);
-  c.slots = slots(node, opts.depth);
+  const layers = textLayersAndSlots(node, opts.depth);
+  c.textLayers = layers.textLayers;
+  c.slots = layers.slots;
   if (opts.includeAnatomy) {
     c.anatomy = serializeTree(node, opts.detail, opts.depth);
   }
@@ -469,9 +517,18 @@ function usageHints(node: ComponentNode | ComponentSetNode): string[] {
   return hints;
 }
 
-function textLayers(root: BaseNode, maxDepth: number): Array<Record<string, unknown>> {
+/** Text layers and slots in ONE walk of the subtree — they used to take two. */
+function textLayersAndSlots(
+  root: BaseNode,
+  maxDepth: number,
+): { textLayers: Array<Record<string, unknown>>; slots: Array<Record<string, unknown>> } {
   const out: Array<Record<string, unknown>> = [];
+  const slotsOut: Array<Record<string, unknown>> = [];
   walk(root, maxDepth, (node, path) => {
+    if (node.type === "SLOT") {
+      slotsOut.push({ id: node.id, name: node.name, path: path.join("/") });
+      return;
+    }
     if (node.type !== "TEXT") return;
     const t = node as TextNode;
     out.push({
@@ -484,17 +541,7 @@ function textLayers(root: BaseNode, maxDepth: number): Array<Record<string, unkn
       constraints: "constraints" in t ? plainValue((t as ConstraintMixin).constraints) : undefined,
     });
   });
-  return out;
-}
-
-function slots(root: BaseNode, maxDepth: number): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  walk(root, maxDepth, (node, path) => {
-    if (node.type === "SLOT") {
-      out.push({ id: node.id, name: node.name, path: path.join("/") });
-    }
-  });
-  return out;
+  return { textLayers: out, slots: slotsOut };
 }
 
 function walk(root: BaseNode, maxDepth: number, fn: (node: SceneNode, path: string[]) => void): void {
@@ -592,10 +639,12 @@ async function getRichStyles(): Promise<NonNullable<DesignSystemKit["styles"]>> 
 
 async function getRichVariables(): Promise<NonNullable<DesignSystemKit["variables"]>> {
   const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  // One fetch for every variable; this used to await each id twice.
+  const byId = new Map((await localVariables()).map((v) => [v.id, v]));
   const variableNames = new Map<string, string>();
   for (const collection of collections) {
     for (const id of collection.variableIds) {
-      const variable = await figma.variables.getVariableByIdAsync(id);
+      const variable = byId.get(id);
       if (variable) variableNames.set(variable.id, variable.name);
     }
   }
@@ -605,7 +654,7 @@ async function getRichVariables(): Promise<NonNullable<DesignSystemKit["variable
     const modes = c.modes.map((m) => ({ id: m.modeId, name: m.name }));
     const variables: unknown[] = [];
     for (const id of c.variableIds) {
-      const v = await figma.variables.getVariableByIdAsync(id);
+      const v = byId.get(id);
       if (!v) continue;
       const values: Record<string, unknown> = {};
       for (const m of c.modes) {

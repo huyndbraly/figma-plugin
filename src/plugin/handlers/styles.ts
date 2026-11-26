@@ -3,7 +3,7 @@ import { HandlerContext, requireNode } from "../context.js";
 import { serializeNode } from "../serialize.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
-import { loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
+import { loadFontWithFallback, loadFontCached, DEFAULT_FONT } from "../fonts.js";
 import { toEffects } from "../paints.js";
 
 /**
@@ -169,6 +169,8 @@ export async function setupTextStyles(ctx: HandlerContext): Promise<unknown> {
     seen.add(s.name);
   }
 
+  // Created and renamed below: the cached list is stale from here on.
+  invalidateTextStyles();
   const existing = await figma.getLocalTextStylesAsync();
   const byName = new Map(existing.map((st) => [st.name, st]));
   const created: string[] = [];
@@ -292,6 +294,40 @@ export async function setupEffectStyles(ctx: HandlerContext): Promise<unknown> {
 }
 
 /**
+ * The local text styles, kept for a moment.
+ *
+ * resolveTextStyle runs once per TEXT node that names a style, and a screen
+ * of eighty labels fetched the whole style list eighty times. Two seconds
+ * covers one request; every op here that adds, renames or deletes a text
+ * style clears it, so the next lookup sees the change at once. Tied to the
+ * `figma` it was read from, so a re-run plugin (or a test's fresh fake) never
+ * sees another one's list.
+ */
+const TEXT_STYLE_TTL_MS = 2000;
+let textStyleCache: { at: number; api: unknown; styles: TextStyle[] } | null = null;
+
+export function invalidateTextStyles(): void {
+  textStyleCache = null;
+}
+
+async function localTextStyles(): Promise<TextStyle[]> {
+  const now = Date.now();
+  if (textStyleCache && textStyleCache.api === figma && now - textStyleCache.at < TEXT_STYLE_TTL_MS) {
+    // A style deleted in the editor meanwhile throws on every property read.
+    return textStyleCache.styles.filter((s) => {
+      try {
+        return typeof s.name === "string";
+      } catch {
+        return false;
+      }
+    });
+  }
+  const styles = await figma.getLocalTextStylesAsync();
+  textStyleCache = { at: now, api: figma, styles };
+  return styles;
+}
+
+/**
  * Resolve a local text style by id or (case-insensitive) name. Misses throw
  * INVALID_PARAMS listing the available names so the caller can self-correct.
  */
@@ -304,7 +340,7 @@ export async function resolveTextStyle(nameOrId: unknown): Promise<TextStyle> {
       'Example: "Title 01". List styles via figma_read get_styles.',
     );
   }
-  const styles = await figma.getLocalTextStylesAsync();
+  const styles = await localTextStyles();
   const byId = styles.find((s) => s.id === query);
   if (byId) return byId;
   const lower = query.toLowerCase();
@@ -332,8 +368,10 @@ export async function applyTextStyleToNode(
   node: TextNode,
   style: TextStyle,
 ): Promise<void> {
-  // The style's font must be loaded before Figma accepts the assignment.
-  await figma.loadFontAsync(style.fontName);
+  // The style's font must be loaded before Figma accepts the assignment —
+  // through the shared cache, since a style applied to a hundred nodes asked
+  // the editor for the same face a hundred times.
+  await loadFontCached(style.fontName);
   const n = node as TextNode & {
     setTextStyleIdAsync?: (id: string) => Promise<void>;
   };

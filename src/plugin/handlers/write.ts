@@ -254,16 +254,38 @@ async function modifyText(
         ? props.fontFamily
         : typeof fontName.family === "string"
           ? fontName.family
-          : DEFAULT_FONT.family;
+          : undefined;
     const style =
       typeof props.fontStyle === "string"
         ? props.fontStyle
         : typeof fontName.style === "string"
           ? fontName.style
-          : DEFAULT_FONT.style;
-    const res = await loadFontWithFallback({ family, style });
-    node.fontName = res.resolvedFont;
-    if (res.substituted && res.reason) ctx.warn(res.reason);
+          : undefined;
+    // The half that was not asked for is the one the text ALREADY has: "make
+    // it Bold" on Roboto Regular means Roboto Bold. It used to come from
+    // DEFAULT_FONT, so that call turned the text into Inter Bold.
+    const current = node.fontName;
+    if ((family !== undefined && style !== undefined) || current !== figma.mixed) {
+      const base = current !== figma.mixed ? (current as FontName) : DEFAULT_FONT;
+      const res = await loadFontWithFallback({ family: family ?? base.family, style: style ?? base.style });
+      node.fontName = res.resolvedFont;
+      if (res.substituted && res.reason) ctx.warn(res.reason);
+    } else {
+      // Several fonts along the text: each run keeps its own other half, so
+      // "Bold" on Inter Regular + Roboto Italic is Inter Bold + Roboto Bold.
+      const reasons = new Set<string>();
+      for (const seg of node.getStyledTextSegments(["fontName"])) {
+        const res = await loadFontWithFallback({
+          family: family ?? seg.fontName.family,
+          style: style ?? seg.fontName.style,
+        });
+        node.setRangeFontName(seg.start, seg.end, res.resolvedFont);
+        if (res.substituted && res.reason && !reasons.has(res.reason)) {
+          reasons.add(res.reason);
+          ctx.warn(res.reason);
+        }
+      }
+    }
   } else if (TEXT_LAYOUT_KEYS.some((k) => props[k] !== undefined)) {
     // Only a change that re-lays the glyphs needs the node's fonts. Loading
     // them for every modify made modify(text, {x}) fail outright on a file
@@ -380,8 +402,7 @@ export async function deleteNode(ctx: HandlerContext): Promise<unknown> {
         "Delete it in the file that publishes the library.",
       );
     }
-    const found = await (node as ComponentNode).getInstancesAsync?.();
-    instances = found ? found.length : 0;
+    instances = await countInstances(node as ComponentNode | ComponentSetNode);
     if (instances > 0 && !force) {
       throw err(
         ErrorCode.COMPONENT_IN_USE,
@@ -415,6 +436,22 @@ export async function deleteNode(ctx: HandlerContext): Promise<unknown> {
       : {}),
     ...(lastVariantOf ? { componentSetDeleted: lastVariantOf } : {}),
   };
+}
+
+/**
+ * Instances of a component — or of every variant of a set. A COMPONENT_SET
+ * has no getInstancesAsync of its own (its instances point at a variant), so
+ * the old `?.` read 0 for every set and deleted one still in use without
+ * asking for force.
+ */
+async function countInstances(node: ComponentNode | ComponentSetNode): Promise<number> {
+  if (node.type === "COMPONENT_SET") {
+    const variants = node.children.filter((c): c is ComponentNode => c.type === "COMPONENT");
+    const found = await Promise.all(variants.map((v) => v.getInstancesAsync()));
+    return found.reduce((sum, list) => sum + list.length, 0);
+  }
+  const found = await node.getInstancesAsync?.();
+  return found ? found.length : 0;
 }
 
 /**
