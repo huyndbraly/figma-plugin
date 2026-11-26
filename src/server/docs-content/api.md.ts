@@ -48,7 +48,11 @@ A malformed color THROWS — it is never silently replaced.
 - \`group(nodeIds)\`, \`ungroup(nodeId)\`, \`flatten(nodeId)\`.
 - \`batch(ops, {resultDetail?})\` — see recipes; streams in chunks with partial
   commit. \`resultDetail: "ids"\` trims each successful item to just its id
-  (skip echoing a full node per item on large create batches).
+  (skip echoing a full node per item on large create batches). Item warnings
+  land in the call's warnings. \`load_image\` items take \`{source: url|data:}\`
+  and \`load_icon\` items \`{name, library?}\` — resolved server-side.
+- Await every figma.* call: un-awaited ones are waited for before the call
+  answers, and their failures come back only as warnings.
 
 ## Components
 A component is named by NAME (\`"Button"\`, \`"Button/Size=sm, State=default"\`),
@@ -67,7 +71,8 @@ separators; a near miss throws with the closest names — never a guess.
   \`arrangeComponentSet(setId, {rowsBy?, gap?})\` re-tidies one.
 - \`addComponentProperty(id, {name, type: BOOLEAN|TEXT|INSTANCE_SWAP|VARIANT,
   defaultValue, bind?})\` → \`{key}\`. \`bind: "Label"\` (layer name / "A/B" path
-  / id, or a list) wires it to layers — on a set, in EVERY variant.
+  / id, or a list) wires it to layers — on a set, in EVERY variant. Layers
+  inside a nested instance cannot be bound; a refused bind removes the property.
   \`editComponentProperty(id, property, {name?, defaultValue?})\`,
   \`deleteComponentProperty(id, property)\`, \`setComponentDescription(id, text)\`.
 - \`instantiate(component, {variant?, properties?, overrides?, parentId?,
@@ -78,7 +83,7 @@ separators; a near miss throws with the closest names — never a guess.
 - \`setInstanceOverrides(id, [{target:"Label", props:{characters:"Hi"}}])\` —
   modify() props on layers inside the instance; \`{from: otherInstanceId}\`
   copies another instance's overrides. \`getInstanceOverrides(id)\` reads them.
-- \`swapComponent(id, component)\`, \`exposeNestedInstance(id)\`,
+- \`swapComponent(id, component|{key}, {variant?})\`, \`exposeNestedInstance(id)\`,
   \`detachInstance(id)\`, \`resetInstanceOverrides(id, {keepProperties?})\` (also
   resets property values to their defaults; the variant is kept).
 - \`getLibraryComponent(key)\` — import a component/set from a PUBLISHED
@@ -88,20 +93,23 @@ separators; a near miss throws with the closest names — never a guess.
 
 ## Quality audits
 - \`a11yAudit(nodeId?, {minTouch?: 44, minFontSize?: 11})\` → findings per node:
-  contrast below WCAG AA, tap targets under 44×44 (controls = reactions or a
-  control word in the layer name), small text, controls with no name.
+  contrast below WCAG AA, tap targets under 44×44 (controls = reactions, or a
+  control word in the name of a layer ≤ 120 px tall), small text, controls
+  with no name. Text inside controls is still checked.
 - \`auditDesignSystem(nodeId?, {kinds?})\` → \`compliance\` %, \`autoFixable\`,
   per-kind bound/bindable/near/off counts, top off-palette colours.
 - \`applyDesignSystem(nodeId?, {dryRun?, kinds?, includeNear?})\` — bind every
-  literal that EQUALS a token (colour → variable per paint, text → style,
-  radius/spacing → number variable). Run with \`dryRun: true\` first.
+  literal that EQUALS a token (colour → variable per paint, text → style with
+  the same font AND line height/tracking/case, radius/spacing → number
+  variable). Run with \`dryRun: true\` first.
 - \`responsiveAudit(nodeId, {presets?: ["iphone-se","ipad"], sizes?, keep?})\`
-  — layout_audit of a resized copy per viewport; copies are removed.
+  — layout_audit of a resized copy per viewport (on the page; an instance for
+  a component/variant); copies are removed.
 
 ## Code ↔ Figma component map
 - \`exportComponentMap(query? | names[])\` → \`{map, typescript}\`: a starting
   map (code name → Figma component, props ↔ variants/properties). Save it in
-  the codebase; \`checkComponentMap(map)\` reports drift.
+  the codebase; \`checkComponentMap(map)\` reports drift (\`fixed\` included).
 - \`useComponentMap(map)\` once, then \`render("Button", {tone: "primary",
   children: "Save"}, {parentId})\` instantiates the exact variant.
 
@@ -153,8 +161,8 @@ separators; a near miss throws with the closest names — never a guess.
 ## Text & assets
 - \`setText(nodeId, content)\`.
 - \`searchIcons(query)\` → candidate canonical names (no fetch).
-- \`loadIcon(name, {library, size, color, parentId})\` — SVG fetched server-side,
-  drawn by the plugin.
+- \`loadIcon(name, {library, size, color, parentId, x, y, inset, align,
+  insertAt})\` — SVG fetched server-side, drawn by the plugin.
 - \`loadImage(urlOrBase64)\`.
 
 ## Userflow
@@ -229,9 +237,11 @@ These change existing nodes rather than drawing new ones. See the
   matched, the result carries \`hasMore\`/\`totalMatched\` — narrow the query or
   raise \`limit\` rather than assuming the list is complete.
 - \`getSelection()\`, \`getDocumentInfo()\`, \`getDesignContext({nodeId?, detail?,
-  depth?})\` — a WHOLE-PAGE read (no nodeId) defaults to \`sparse\` because a page
-  can be tens of thousands of tokens; pass a nodeId to deep-read one subtree, or
-  detail:"compact"/"full" for more per-node data.
+  depth?, maxNodes?})\` — a WHOLE-PAGE read (no nodeId) defaults to \`sparse\`
+  because a page can be tens of thousands of tokens; pass a nodeId to deep-read
+  one subtree, or detail:"compact"/"full" for more per-node data. Capped at
+  \`maxNodes\` (3000) — \`truncated: true\` means read a subtree instead.
+  \`scanNodesByTypes(types, {limit?})\` returns 200 by default (\`hasMore\`).
 - \`readSelection({ detail?, depth? })\` — deep read of the CURRENT selection in
   one call (ids, types, bounds, text, fills). The entry point for editing what
   the user picked: readSelection → modify → layoutAudit.
@@ -259,7 +269,8 @@ These change existing nodes rather than drawing new ones. See the
 - \`screenshot({nodeId, scale})\`, \`exportNode({nodeId, format})\`. PNG/JPG come
   back as a real image the model can SEE (an MCP image block), not a base64 text
   blob — so a screenshot is a genuine visual check, not a token sink. Still take
-  ONE at the end, not repeatedly. SVG/PDF return as data.
+  ONE at the end, not repeatedly. SVG/PDF return as data. The scale is lowered
+  so the longest side stays ≤ 4096px.
 - \`layoutAudit(nodeId)\` — structured verify.
 
 ## Misc

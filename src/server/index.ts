@@ -336,6 +336,8 @@ export function resolveStartPort(
 export interface ServerHandle {
   server: Server;
   coordinator: Coordinator;
+  /** Settles when leader election finishes; tool calls wait on it. */
+  ready: Promise<"leader" | "follower">;
   /** Live status snapshot (exposed for tests + the figma_status tool path). */
   diagnostics: () => Promise<Diagnostics>;
   close: () => Promise<void>;
@@ -363,7 +365,7 @@ export async function createServer(): Promise<ServerHandle> {
     // THE single choke point. Called for leader-direct ops AND /rpc forwards —
     // wired by leader.ts onto EVERY bridge it creates, so the synthetic ops
     // below keep working across takeovers (no post-hoc router to forget).
-    runValidated: async (op, params, sessionId, route) => {
+    runValidated: async (op, params, sessionId, route, signal) => {
       const hint = parseRouteArg(route);
       // Synthetic /rpc ops from followers (never sent to the plugin, so they
       // must be intercepted before validateOperation rejects them):
@@ -394,13 +396,21 @@ export async function createServer(): Promise<ServerHandle> {
             return b.dispatch(v, p, {
               ...hint,
               ...(sessionId ? { sessionId } : {}),
-              ...(ctx ? { signal: ctx.signal } : {}),
+              ...(ctx?.signal ? { signal: ctx.signal } : {}),
+              ...(ctx?.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
             });
           },
-        });
+        }, signal ? { signal } : undefined);
       }
       const { op: validOp, params: validParams } = validateOperation(op, params);
-      return dispatchLeader(validOp, validParams, sessionId, hint);
+      return dispatchLeader(validOp, validParams, sessionId, hint, signal);
+    },
+    // Every time this process starts following a leader — including a new
+    // one after a takeover — tell it about this session, so the plugin's
+    // picker keeps listing it. Best-effort: a failure only delays visibility
+    // until the first write.
+    onFollowerCreated: () => {
+      void coordinator.forward("__register__", {}, defaultSessionId).catch(() => {});
     },
     // Runs for the initial bridge AND any takeover replacement.
     onBridgeCreated: (bridge) => {
@@ -437,6 +447,7 @@ export async function createServer(): Promise<ServerHandle> {
     params: Record<string, unknown>,
     sessionId?: string,
     route?: { channel?: string; file?: string; page?: string },
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const bridge = liveBridge();
     if (!bridge) {
@@ -452,32 +463,39 @@ export async function createServer(): Promise<ServerHandle> {
     const res: BridgeResponse = await bridge.dispatch(op, params, {
       ...parseRouteArg(route),
       ...(sessionId ? { sessionId } : {}),
+      ...(signal ? { signal } : {}),
     });
     return unwrap(res);
   }
 
-  /** validate → (leader: dispatch | follower: forward). Used by tool handlers. */
+  /**
+   * validate → (leader: dispatch | follower: forward). Used by tool handlers.
+   * `signal` is the MCP request's: when the client cancels the call (or goes
+   * away), an op still queued is dropped instead of running for nobody.
+   */
   async function runValidated(
     op: string,
     params: Record<string, unknown>,
     sessionId?: string,
     route?: RouteArg,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const { op: validOp, params: validParams } = validateOperation(op, params);
     const sid = resolveSession(sessionId);
     const hint = parseRouteArg(route);
     if (coordinator.role === "leader") {
-      return dispatchLeader(validOp, validParams, sid, hint);
+      return dispatchLeader(validOp, validParams, sid, hint, signal);
     }
     // Follower: local validation already done; leader validates again on /rpc.
     return coordinator.forward(validOp, validParams, sid, hint.channel, undefined, {
       file: hint.file,
       page: hint.page,
+      ...(signal ? { signal } : {}),
     });
   }
 
   /** figma_write execution. On a follower, forward the whole code to the leader. */
-  async function runWrite(code: string, sessionId?: string, route?: RouteArg): Promise<WriteResult | unknown> {
+  async function runWrite(code: string, sessionId?: string, route?: RouteArg, signal?: AbortSignal): Promise<WriteResult | unknown> {
     const sid = resolveSession(sessionId);
     const hint = parseRouteArg(route);
     if (coordinator.role === "follower") {
@@ -488,6 +506,7 @@ export async function createServer(): Promise<ServerHandle> {
       return coordinator.forward("__write__", { code }, sid, hint.channel, undefined, {
         file: hint.file,
         page: hint.page,
+        ...(signal ? { signal } : {}),
       });
     }
     const session = sessions.get(sid);
@@ -506,10 +525,11 @@ export async function createServer(): Promise<ServerHandle> {
         return bridge.dispatch(validOp, validParams, {
           ...hint,
           sessionId: sid,
-          ...(ctx ? { signal: ctx.signal } : {}),
+          ...(ctx?.signal ? { signal: ctx.signal } : {}),
+          ...(ctx?.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
         });
       },
-    });
+    }, signal ? { signal } : undefined);
   }
 
   /**
@@ -628,17 +648,20 @@ export async function createServer(): Promise<ServerHandle> {
   const ctx: ToolContext = { runValidated, runWrite, sessions, diagnostics };
 
   // Elect role + start bridge/forwarding. Bridge wiring (rpc routing, session
-  // provider) happens inside the coordinator deps (runValidated /
-  // onBridgeCreated) so it applies to takeover bridges too.
-  await coordinator.start();
-
-  if (coordinator.role === "follower") {
-    // Register this process's session with the leader so the plugin UI's
-    // picker lists every connected agent session, not just ones that have
-    // already written. Best-effort: a failure just delays visibility until
-    // the first write.
-    void coordinator.forward("__register__", {}, defaultSessionId).catch(() => {});
-  }
+  // provider, follower registration) happens inside the coordinator deps
+  // (runValidated / onBridgeCreated / onFollowerCreated) so it applies to
+  // takeover bridges too.
+  //
+  // NOT awaited here: an election can take seconds (a busy incumbent, a
+  // startup race), and the MCP client times out the handshake meanwhile —
+  // "connection closed" / 0 tools. stdio connects first; tool calls wait for
+  // the election instead.
+  const ready = coordinator.start();
+  ready.catch((err: unknown) => {
+    process.stderr.write(
+      `[figma-plugin] election failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  });
 
   const server = new Server(
     { name: "figma-plugin", version: VERSION },
@@ -647,10 +670,23 @@ export async function createServer(): Promise<ServerHandle> {
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra): Promise<CallToolResult> => {
     const { name, arguments: args = {} } = req.params;
     try {
-      const result = await callTool(ctx, name, args as Record<string, unknown>);
+      await ready.catch((err: unknown) => {
+        throw new OpError(
+          ErrorCode.NOT_CONNECTED,
+          `This MCP server could not join the Figma bridge: ${err instanceof Error ? err.message : String(err)}`,
+          "Free the port named above (or set FIGMA_MCP_PORT inside the plugin's range), then restart this MCP server.",
+        );
+      });
+      // Per-call context: the client's cancellation reaches the op queue.
+      const callCtx: ToolContext = {
+        ...ctx,
+        runValidated: (op, params, sessionId, route) => runValidated(op, params, sessionId, route, extra.signal),
+        runWrite: (code, sessionId, route) => runWrite(code, sessionId, route, extra.signal),
+      };
+      const result = await callTool(callCtx, name, args as Record<string, unknown>);
       return toToolResult(result);
     } catch (err) {
       return toToolError(err);
@@ -660,8 +696,10 @@ export async function createServer(): Promise<ServerHandle> {
   return {
     server,
     coordinator,
+    ready,
     diagnostics,
     close: async () => {
+      await ready.catch(() => undefined);
       await coordinator.close();
     },
   };

@@ -55,6 +55,9 @@ member :> visitor       # member is a kind of visitor
 An id used only in a link is created for you when the other end makes its
 type obvious. \`actor … system\` draws a box on the right (a secondary actor);
 \`left\` / \`right\` force a side. \`/ text\` after a label adds a detail line.
+Ids may be in any script (\`uc tìm "Tìm phim"\`). An «include»/«extend»
+between two cases with another case between them is drawn in a lane beside
+the column, never through the middle ellipse.
 
 ### Fields
 

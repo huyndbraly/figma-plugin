@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { WebSocket } from "ws";
-import { Bridge } from "../../src/server/bridge.js";
+import { Bridge, type BridgeOptions } from "../../src/server/bridge.js";
 import type { WireMessage, BridgeRequest, PluginHello } from "../../src/shared/protocol.js";
 
 /** A fake Figma plugin that connects over WS, sends hello, and lets the test
@@ -15,8 +15,9 @@ class FakePlugin {
   /** Latest "channels" snapshot pushed by the server. */
   lastChannelsUpdate?: { self: string; channels: Array<{ channel: string }>; sessions: Array<{ id: string }> };
 
-  async connect(port: number, hello?: Partial<PluginHello>): Promise<void> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  /** `autoPong: false` models a dead socket: it never answers a liveness ping. */
+  async connect(port: number, hello?: Partial<PluginHello>, opts: { autoPong?: boolean } = {}): Promise<void> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { autoPong: opts.autoPong ?? true });
     this.ws = ws;
     await new Promise<void>((resolve, reject) => {
       ws.once("open", () => resolve());
@@ -61,8 +62,8 @@ function delay(ms: number): Promise<void> {
 }
 
 const bridges: Bridge[] = [];
-async function newBridge(): Promise<{ bridge: Bridge; port: number }> {
-  const bridge = new Bridge();
+async function newBridge(opts: BridgeOptions = {}): Promise<{ bridge: Bridge; port: number }> {
+  const bridge = new Bridge({}, { livenessProbeMs: 300, ...opts });
   bridges.push(bridge);
   // Random-ish start port to avoid collisions across tests.
   const port = await bridge.listen(41000 + Math.floor(Math.random() * 500), "token-" + Math.random());
@@ -158,7 +159,8 @@ describe("bridge request/response correlation", () => {
     p1.onRequest = () => {
       /* never respond */
     };
-    await p1.connect(port);
+    // A socket that no longer answers pings — the window behind it is gone.
+    await p1.connect(port, {}, { autoPong: false });
     expect(p1.assignedChannel).toBeTruthy();
 
     // Attach a rejection collector synchronously so the (synchronous) reject
@@ -179,6 +181,8 @@ describe("bridge request/response correlation", () => {
       resumeToken: p1.resumeToken,
     });
     await inflight;
+    await delay(30);
+    expect(p2.assignedChannel).toBe(p1.assignedChannel);
 
     expect(rejected?.code).toBe("NOT_CONNECTED");
     expect(bridge.pluginConnected).toBe(true);
@@ -599,7 +603,7 @@ describe("multi-channel routing", () => {
       bReqs.push(req);
       /* respond later */
     };
-    await pA.connect(port, { channel: "chan-a" });
+    await pA.connect(port, { channel: "chan-a" }, { autoPong: false });
     await pB.connect(port, { channel: "chan-b" });
 
     let aRejected: { code?: string } | undefined;
@@ -615,6 +619,8 @@ describe("multi-channel routing", () => {
     const pA2 = new FakePlugin();
     await pA2.connect(port, { channel: "chan-a", resumeToken: pA.resumeToken });
     await aOp;
+    await delay(30);
+    expect(pA2.assignedChannel).toBe("chan-a");
     expect(aRejected?.code).toBe("NOT_CONNECTED");
 
     // chan-b's op is still alive and settles normally.

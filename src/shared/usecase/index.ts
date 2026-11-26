@@ -81,7 +81,8 @@ export interface BoardBuild<M> {
 // Text
 // ---------------------------------------------------------------------------
 
-const LINK = /^([\w.-]+)\s*(=>|\+>|:>|-)\s*([\w.-]+)\s*(?::\s*(.*))?$/;
+// Ids are words in any script: `uc tìm "Tìm phim"` is the id "tìm", not "t".
+const LINK = /^([\p{L}\p{M}\p{N}_.-]+)\s*(=>|\+>|:>|-)\s*([\p{L}\p{M}\p{N}_.-]+)\s*(?::\s*(.*))?$/u;
 const LINK_KIND: Record<string, UcLinkKind> = { "-": "association", "=>": "include", "+>": "extend", ":>": "generalization" };
 
 export function parseUsecaseText(src: string): { system?: string; actors: UcActor[]; useCases: UcCase[]; links: UcLink[]; warnings: string[] } {
@@ -92,11 +93,12 @@ export function parseUsecaseText(src: string): { system?: string; actors: UcActo
   let system: string | undefined;
   for (const l of lines(src)) {
     const t = l.text;
-    if (/^system\b/.test(t)) {
+    // "system" the keyword, not a link from an id like `system-admin`.
+    if (/^system(\s|$)/.test(t)) {
       system = takeQuoted(t.slice(6)).value ?? t.slice(6).trim();
       continue;
     }
-    const decl = /^(actor|uc|usecase)\s+([\w.-]+)\s*(.*)$/.exec(t);
+    const decl = /^(actor|uc|usecase)\s+([\p{L}\p{M}\p{N}_.-]+)\s*(.*)$/u.exec(t);
     if (decl) {
       const { head, detail } = splitDetail(decl[3] ?? "");
       const q = takeQuoted(head);
@@ -268,7 +270,12 @@ export function checkUsecase(spec: { actors: UcActor[]; useCases: UcCase[]; link
 // ---------------------------------------------------------------------------
 
 const ACTOR_W = 140;
+/** The least an actor's slot is; a long name or a detail makes it taller. */
 const ACTOR_H = 120;
+const ACTOR_GAP = 18;
+/** Room beside the primary column for «include»/«extend» lines that skip a case. */
+const LANE_W = 84;
+const LANE_STEP = 10;
 const UC_GAP = 26;
 const COL_GAP = 90;
 const BOUND_PAD = 36;
@@ -368,8 +375,17 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
   const priW = Math.max(150, colW(primary));
   const secW = secondary.length ? colW(secondary) : 0;
 
+  // «include»/«extend» between two primary cases with another one between
+  // them cannot go straight down the column — it would run through the
+  // middle ellipse and read as a link to it. Those take a lane beside the column.
+  const priIndex = new Map(primary.map((u, i) => [u.id, i]));
+  const laneLinks = drawn.links.filter(
+    (l) => (l.kind === "include" || l.kind === "extend") && priIndex.has(l.from) && priIndex.has(l.to) && Math.abs(priIndex.get(l.from)! - priIndex.get(l.to)!) > 1,
+  );
+  const laneW = laneLinks.length ? LANE_W + LANE_STEP * Math.min(laneLinks.length - 1, 4) : 0;
+
   const title = spec.title || drawn.system || "Use cases";
-  const boundW = BOUND_PAD * 2 + priW + (secondary.length ? COL_GAP + secW : 0);
+  const boundW = BOUND_PAD * 2 + priW + laneW + (secondary.length ? COL_GAP + secW : 0);
   const leftW = left.length ? ACTOR_W + 70 : 0;
   const rightW = right.length ? ACTOR_W + 70 : 0;
   const frameW = Math.max(520, PAD * 2 + leftW + boundW + rightW);
@@ -388,7 +404,7 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
     y += s.h + UC_GAP;
   }
   let secY = boundY + BOUND_PAD + sysLabelH;
-  const secX = boundX + BOUND_PAD + priW + COL_GAP;
+  const secX = boundX + BOUND_PAD + priW + laneW + COL_GAP;
   for (const u of secondary) {
     const s = sizes.get(u.id)!;
     const base = drawn.links.find((l) => (l.kind === "include" && l.to === u.id) || (l.kind === "extend" && l.from === u.id));
@@ -400,10 +416,17 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
     secY = at + s.h + UC_GAP;
   }
   const contentBottom = Math.max(y, secY) - UC_GAP + BOUND_PAD;
-  const boundH = Math.max(contentBottom - boundY, ACTOR_H * Math.max(left.length, right.length, 1) + BOUND_PAD);
+  // Each actor's slot is as tall as its figure, name and detail — a long
+  // name wraps, and a fixed slot let it run into the next actor.
+  const slotH = (a: UcActor) => {
+    const nameH = textHeight(a.name ?? a.id, ACTOR_W, 12);
+    const detailH = a.detail ? textHeight(a.detail, ACTOR_W, 11) + 2 : 0;
+    return Math.max(ACTOR_H, 74 + nameH + detailH + ACTOR_GAP);
+  };
+  const actorBlock = (list: UcActor[]) => list.reduce((s, a) => s + slotH(a), 0);
+  const boundH = Math.max(contentBottom - boundY, Math.max(actorBlock(left), actorBlock(right), ACTOR_H) + BOUND_PAD);
 
   // Actors centred on the boundary's height.
-  const actorBlock = (list: UcActor[]) => list.length * ACTOR_H;
   const actorY0 = (list: UcActor[]) => boundY + Math.max(0, (boundH - actorBlock(list)) / 2);
   const anchors = new Map<string, Pt>();
   /** Where each actor stands: figure centre x, top of the head, bottom of its name. */
@@ -416,17 +439,24 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
     const nameH = textHeight(a.name ?? a.id, ACTOR_W, 12);
     figures.set(a.id, { cx: x + ACTOR_W / 2, top: y, bottom: y + 74 + nameH + 4 });
   };
-  left.forEach((a, i) => place(a, PAD, actorY0(left) + i * ACTOR_H, "left"));
-  right.forEach((a, i) => place(a, boundX + boundW + 70, actorY0(right) + i * ACTOR_H, "right"));
+  const stack = (list: UcActor[], x: number, side: "left" | "right") => {
+    let at = actorY0(list);
+    for (const a of list) {
+      place(a, x, at, side);
+      at += slotH(a);
+    }
+  };
+  stack(left, PAD, "left");
+  stack(right, boundX + boundW + 70, "right");
 
   /**
    * A straight line from an actor that passes through ANOTHER use case reads
    * as a link to that one (the ellipse is painted over the line). Detour
    * above or below the first ellipse in the way.
    */
-  const blockedBy = (a: Pt, b: Pt, skip: string): Box | undefined => {
+  const blockedBy = (a: Pt, b: Pt, ...skip: string[]): Box | undefined => {
     for (const [id, box] of boxes) {
-      if (id === skip) continue;
+      if (skip.includes(id)) continue;
       const rx = box.w / 2 + 6;
       const ry = box.h / 2 + 6;
       const cx = box.x + box.w / 2;
@@ -449,6 +479,37 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
     const targetCy = target.y + target.h / 2;
     const wp = Math.abs(above[1] - targetCy) <= Math.abs(below[1] - targetCy) ? above : below;
     return [from, wp, ellipsePoint(target, wp)];
+  };
+
+  /**
+   * «include»/«extend» between two use cases, and where its label goes. Two
+   * primary cases with others between them elbow out into the lane beside
+   * the column (short spans nearest it, so lanes never cross); any other line
+   * that would run through a third ellipse detours above or below it.
+   */
+  laneLinks.sort((p, q) => Math.abs(priIndex.get(p.from)! - priIndex.get(p.to)!) - Math.abs(priIndex.get(q.from)! - priIndex.get(q.to)!));
+  const laneLeft = boundX + BOUND_PAD + priW;
+  const caseLink = (l: UcLink, a: Box, b: Box): { path: Pt[]; label: { x: number; y: number; w: number; align: "LEFT" | "CENTER" } } => {
+    const lane = laneLinks.indexOf(l);
+    if (lane >= 0) {
+      const x = laneLeft + 18 + LANE_STEP * Math.min(lane, 4);
+      const ay = a.y + a.h / 2;
+      const by = b.y + b.h / 2;
+      return {
+        path: [[a.x + a.w, ay], [x, ay], [x, by], [b.x + b.w, by]],
+        label: { x: x + 4, y: (ay + by) / 2 - 7, w: Math.max(56, laneLeft + laneW - x - 4), align: "LEFT" },
+      };
+    }
+    const p1 = ellipsePoint(a, center(b));
+    const p2 = ellipsePoint(b, center(a));
+    const hit = blockedBy(p1, p2, l.from, l.to);
+    if (!hit) return { path: [p1, p2], label: { x: (p1[0] + p2[0]) / 2 - 50, y: (p1[1] + p2[1]) / 2 - 18, w: 100, align: "CENTER" } };
+    const cx = hit.x + hit.w / 2;
+    const above: Pt = [cx, hit.y - 14];
+    const below: Pt = [cx, hit.y + hit.h + 14];
+    const midY = (center(a)[1] + center(b)[1]) / 2;
+    const wp = Math.abs(above[1] - midY) <= Math.abs(below[1] - midY) ? above : below;
+    return { path: [ellipsePoint(a, wp), wp, ellipsePoint(b, wp)], label: { x: wp[0] - 50, y: wp[1] - 18, w: 100, align: "CENTER" } };
   };
 
   const children: Spec[] = [...head.specs];
@@ -500,12 +561,9 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
       const a = boxes.get(l.from);
       const b = boxes.get(l.to);
       if (!a || !b) continue;
-      const p1 = ellipsePoint(a, center(b));
-      const p2 = ellipsePoint(b, center(a));
-      children.push(line(name, [p1, p2], { color: MUTED, dashed: true, arrow: "line" }));
-      const mx = (p1[0] + p2[0]) / 2;
-      const my = (p1[1] + p2[1]) / 2;
-      children.push(text(`${name} label`, mx - 50, my - 18, 100, l.label ? `«${l.kind}» ${l.label}` : `«${l.kind}»`, { size: 10, color: MUTED, align: "CENTER" }));
+      const r = caseLink(l, a, b);
+      children.push(line(name, r.path, { color: MUTED, dashed: true, arrow: "line" }));
+      children.push(text(`${name} label`, r.label.x, r.label.y, r.label.w, l.label ? `«${l.kind}» ${l.label}` : `«${l.kind}»`, { size: 10, color: MUTED, align: r.label.align }));
     }
   }
   for (const l of drawn.links) {

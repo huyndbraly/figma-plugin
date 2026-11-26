@@ -5,6 +5,9 @@ import { buildPersona, parsePersonaText } from "../../src/shared/persona/index.j
 import { checkConsistency } from "../../src/shared/model/check.js";
 import { runBoard } from "../../src/server/board.js";
 
+/** Drawn height of a TEXT spec: its wrapped lines × line height. */
+const textHeightOf = (t: Record<string, unknown>) => String(t.characters).split("\n").length * (t.lineHeight as number);
+
 const USECASE = `
 system "Ticketing"
 actor visitor "Visitor"
@@ -105,6 +108,59 @@ describe("usecase layout", () => {
     }
   });
 
+  it("takes «include» between two primary cases round the case between them", () => {
+    const b = buildUsecase({ text: "actor v\nuc a\nuc s\nuc l\nv - a\nv - s\nv - l\na => l" });
+    const link = b.draw.children.find((c) => c.name === "link a include l")!;
+    const pts = link.points as number[][];
+    const s = b.draw.children.find((c) => c.name === "usecase:s")!;
+    const [sx, sy, sw, sh] = [s.x as number, s.y as number, s.width as number, s.height as number];
+    const inside = (x: number, y: number) => ((x - (sx + sw / 2)) / (sw / 2)) ** 2 + ((y - (sy + sh / 2)) / (sh / 2)) ** 2 < 1;
+    for (let i = 0; i < pts.length - 1; i++) {
+      for (let t = 0; t <= 1; t += 0.02) {
+        const x = pts[i]![0]! + (pts[i + 1]![0]! - pts[i]![0]!) * t;
+        const y = pts[i]![1]! + (pts[i + 1]![1]! - pts[i]![1]!) * t;
+        expect(inside(x, y), `segment ${i} crosses s at ${x},${y}`).toBe(false);
+      }
+    }
+    // The lane stays inside the system boundary, and so does its label.
+    const boundary = b.draw.children.find((c) => c.name === "system boundary")!;
+    const right = (boundary.x as number) + (boundary.width as number);
+    expect(Math.max(...pts.map((p) => p[0]!))).toBeLessThan(right);
+    const label = b.draw.children.find((c) => c.name === "link a include l label")!;
+    expect((label.x as number) + (label.width as number)).toBeLessThanOrEqual(right);
+  });
+
+  it("gives each actor a slot as tall as its name and detail", () => {
+    const long = "Quản trị viên hệ thống của rạp chiếu phim trung tâm";
+    const b = buildUsecase({
+      actors: [
+        { id: "a", name: long, detail: "Manages showtimes, rooms, prices and refunds for every branch" },
+        { id: "b", name: "Visitor" },
+      ],
+      useCases: [{ id: "x" }, { id: "y" }],
+      links: [{ from: "a", to: "x" }, { from: "b", to: "y" }],
+    });
+    const detail = b.draw.children.find((c) => c.name === "usecase:a detail")!;
+    const next = b.draw.children.find((c) => c.name === "usecase:b")!;
+    const detailBottom = (detail.y as number) + textHeightOf(detail);
+    expect(next.y as number).toBeGreaterThan(detailBottom);
+    const boundary = b.draw.children.find((c) => c.name === "system boundary")!;
+    const lastName = b.draw.children.find((c) => c.name === "usecase:b name")!;
+    expect((boundary.y as number) + (boundary.height as number)).toBeGreaterThanOrEqual(lastName.y as number);
+  });
+
+  it("reads `system-admin - book` as a link, and keeps non-ASCII ids whole", () => {
+    const p = parseUsecaseText('system "Rạp"\nactor quản_lý "Quản lý"\nuc tìm "Tìm phim"\nsystem-admin - tìm\nquản_lý - tìm');
+    expect(p.system).toBe("Rạp");
+    expect(p.useCases.map((u) => u.id)).toEqual(["tìm"]);
+    expect(p.actors.map((a) => a.id)).toEqual(["quản_lý"]);
+    expect(p.links).toEqual([
+      { from: "system-admin", to: "tìm", kind: "association" },
+      { from: "quản_lý", to: "tìm", kind: "association" },
+    ]);
+    expect(p.warnings).toEqual([]);
+  });
+
   it("draws an actor generalization from the child's head to under the parent's name", () => {
     const b = buildUsecase({ text: USECASE });
     const gen = b.draw.children.find((c) => c.name === "link member generalization visitor")!;
@@ -129,6 +185,33 @@ describe("journey", () => {
     expect(names).toContain("feeling curve");
     expect(names).toContain("journey:pay");
     expect(b.stats.phases).toBe(2);
+  });
+
+  it("keeps a non-ASCII phase id whole", () => {
+    const p = parseJourneyText('phase tìm "Tìm phim"\n  do Mở app\nphase đặt "Đặt vé"\n  do Chọn ghế');
+    expect(p.phases.map((x) => x.id)).toEqual(["tìm", "đặt"]);
+  });
+
+  it("puts a bad note above its dot and grows the curve row to fit long notes", () => {
+    const long = "Worried about hidden fees, the seat timer running out and whether the card will be charged twice";
+    const b = buildJourney({
+      persona: "Thu",
+      phases: [
+        { id: "a", actions: ["x"], feeling: -2, feelingNote: long, pains: ["p"], ideas: ["i"] },
+        { id: "b", actions: ["y"], feeling: 2, feelingNote: long },
+      ],
+    });
+    const get = (n: string) => b.draw.children.find((c) => c.name === n)!;
+    const bottomOf = (t: Record<string, unknown>) => (t.y as number) + textHeightOf(t);
+    const badDot = get("journey:a feeling");
+    const badNote = get("journey:a feeling note");
+    expect(bottomOf(badNote)).toBeLessThanOrEqual(badDot.y as number);
+    // Above the scale, but still inside the curve row.
+    const feelingRule = get("row feeling rule");
+    expect(badNote.y as number).toBeGreaterThan((feelingRule.points as number[][])[0]![1]!);
+    // The good note ends before the next row starts.
+    const nextRule = get("row pains rule");
+    expect(bottomOf(get("journey:b feeling note"))).toBeLessThan((nextRule.points as number[][])[0]![1]!);
   });
 
   it("reports a low point with no pain", () => {
@@ -166,6 +249,11 @@ describe("persona", () => {
     expect(b.draw.name).toMatch(/^Persona · /);
   });
 
+  it("keeps a non-ASCII persona id whole", () => {
+    const p = parsePersonaText('persona thư "Thư" primary\n  goal Đặt nhanh');
+    expect(p.personas[0]).toMatchObject({ id: "thư", name: "Thư", primary: true });
+  });
+
   it("asks for a source and a primary", () => {
     const b = buildPersona({ personas: [{ id: "a", goals: ["g"], pains: ["p"] }, { id: "b", goals: ["g"], pains: ["p"] }] });
     expect(b.warnings.join("\n")).toMatch(/No `source`/);
@@ -183,6 +271,19 @@ describe("cross-check", () => {
     const f = checkConsistency(pageModel).filter((x) => x.rule === "persona-drift");
     expect(f).toHaveLength(1);
     expect(f[0]!.message).toMatch(/"Lan"/);
+  });
+
+  it("matches a persona by whole words of the name before the first comma", () => {
+    const drift = (walker: string, card: string) =>
+      checkConsistency([
+        { nodeId: "1", kind: "persona", title: "Personas", spec: { personas: [{ id: "p", name: card }] } },
+        { nodeId: "2", kind: "journey", title: "Booking", spec: { persona: walker, phases: [] } },
+      ]).some((x) => x.rule === "persona-drift");
+    expect(drift("Thu, 28, đặt vé lần đầu", "Thu Trang")).toBe(false);
+    expect(drift("Thu Trang", "Thu")).toBe(false);
+    expect(drift("thu trang, office worker", "Nguyễn Thu Trang")).toBe(false);
+    expect(drift("An", "Thanh")).toBe(true);
+    expect(drift("Thu", "Thư")).toBe(true);
   });
 
   it("treats use case actors as roles", () => {

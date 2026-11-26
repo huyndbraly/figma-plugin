@@ -10,15 +10,15 @@
 import { HandlerContext, requireNode } from "../context.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
-import { compositeOver, contrastRatio } from "../color-util.js";
-import { effectiveBackground, firstSolidFillRgba, layoutAudit, wcagMinRatio } from "./audit.js";
+import { compositeOver, contrastRatio, type RGB, type RGBA } from "../color-util.js";
+import { firstSolidFillRgba, layoutAudit, wcagMinRatio } from "./audit.js";
 import { buildChildMap, type MiniNode } from "../tree-walk.js";
 import {
   hex,
+  isControlLike,
   isDefaultLayerName,
   isGenericControlName,
   isInteractiveTrigger,
-  looksLikeControl,
   matchColor,
   matchNumber,
   matchTextStyle,
@@ -90,11 +90,80 @@ function maxParam(v: unknown, def: number): number {
 // Accessibility
 // ---------------------------------------------------------------------------
 
+function hasTapReaction(n: BaseNode): boolean {
+  const reactions = (n as { reactions?: ReadonlyArray<Reaction> }).reactions;
+  return Array.isArray(reactions) && reactions.some((r) => isInteractiveTrigger(r?.trigger?.type));
+}
+
+function containsTapTarget(n: SceneNode): boolean {
+  if (!("findOne" in n)) return false;
+  return !!(n as ChildrenMixin).findOne((k) => k.visible !== false && hasTapReaction(k));
+}
+
 function isInteractive(n: SceneNode): boolean {
   const reactions = (n as { reactions?: ReadonlyArray<Reaction> }).reactions;
-  if (Array.isArray(reactions) && reactions.some((r) => isInteractiveTrigger(r?.trigger?.type))) return true;
-  if (n.type === "TEXT" || n.type === "VECTOR" || n.type === "LINE" || n.type === "BOOLEAN_OPERATION") return false;
-  return looksLikeControl(n.name);
+  const tap = Array.isArray(reactions) && reactions.some((r) => isInteractiveTrigger(r?.trigger?.type));
+  if (!tap && (n.type === "TEXT" || n.type === "VECTOR" || n.type === "LINE" || n.type === "BOOLEAN_OPERATION")) return false;
+  return isControlLike(n.name, (n as Partial<LayoutMixin>).height, tap);
+}
+
+type Box = { x: number; y: number; width: number; height: number };
+
+function boxOf(n: BaseNode): Box | null {
+  const b = (n as { absoluteBoundingBox?: Box | null }).absoluteBoundingBox;
+  return b && typeof b.width === "number" ? b : null;
+}
+
+function covers(outer: Box, inner: Box): boolean {
+  return (
+    outer.x <= inner.x + 0.5 &&
+    outer.y <= inner.y + 0.5 &&
+    outer.x + outer.width >= inner.x + inner.width - 0.5 &&
+    outer.y + outer.height >= inner.y + inner.height - 0.5
+  );
+}
+
+/**
+ * The colour behind a text layer. A card is often a Rectangle drawn BEFORE the
+ * text in the same group, not the text's parent — so at every level, earlier
+ * siblings that cover the text (nearest first) count before the parent does.
+ * Translucent layers composite until an opaque one is found.
+ */
+function backgroundBehind(t: SceneNode): RGB | null {
+  const box = boxOf(t);
+  const layers: RGBA[] = [];
+  const done = () => {
+    let acc: RGB = { r: layers[layers.length - 1]!.r, g: layers[layers.length - 1]!.g, b: layers[layers.length - 1]!.b };
+    for (let i = layers.length - 2; i >= 0; i--) acc = compositeOver(layers[i]!, acc);
+    return acc;
+  };
+  let child: BaseNode = t;
+  let cur: BaseNode | null = t.parent;
+  while (cur) {
+    const kids = (cur as Partial<ChildrenMixin>).children;
+    if (box && Array.isArray(kids)) {
+      for (let i = kids.indexOf(child as SceneNode) - 1; i >= 0; i--) {
+        const s = kids[i]!;
+        if (s.visible === false) continue;
+        const sb = boxOf(s);
+        if (!sb || !covers(sb, box)) continue;
+        const c = firstSolidFillRgba(s);
+        if (!c) continue;
+        layers.push(c);
+        if (c.a >= 0.999) return done();
+      }
+    }
+    if (cur.type !== "PAGE" && "fills" in cur) {
+      const c = firstSolidFillRgba(cur as SceneNode);
+      if (c) {
+        layers.push(c);
+        if (c.a >= 0.999) return done();
+      }
+    }
+    child = cur;
+    cur = cur.parent;
+  }
+  return layers.length ? done() : null;
 }
 
 function hasLabelText(n: SceneNode): boolean {
@@ -113,12 +182,17 @@ export async function a11yAudit(ctx: HandlerContext): Promise<unknown> {
   const add = (n: SceneNode, kind: string, severity: Severity, message: string) =>
     findings.push({ nodeId: n.id, name: n.name, kind, severity, message });
 
+  // A control's own children are its anatomy: their text is still read for
+  // contrast and size, but a nested "icon" is not another tap target.
+  const inControl = new Set<string>();
+  const underControl = (n: SceneNode) => !!n.parent && inControl.has(n.parent.id);
   const checked = walk(root, (n) => {
+    if (underControl(n)) inControl.add(n.id);
     if (n.type === "TEXT") {
       const t = n as TextNode;
       if (!t.characters.trim()) return;
       const fg = firstSolidFillRgba(t);
-      const bg = effectiveBackground(t);
+      const bg = backgroundBehind(t);
       if (fg && bg) {
         const ratio = contrastRatio(compositeOver(fg, bg), bg);
         const min = wcagMinRatio(t);
@@ -131,7 +205,15 @@ export async function a11yAudit(ctx: HandlerContext): Promise<unknown> {
       }
       return;
     }
-    if (!isInteractive(n)) return;
+    const tap = hasTapReaction(n);
+    // A layer with its OWN tap reaction is a control wherever it sits; only
+    // name-matched anatomy inside a control (an "icon", a "chip" glyph) is
+    // left alone.
+    if ((inControl.has(n.id) && !tap) || !isInteractive(n)) return;
+    // Matched by name only, but holding real controls: a container ("Settings
+    // menu" hugging its rows), not a control — its items are checked instead.
+    if (!tap && containsTapTarget(n)) return;
+    inControl.add(n.id);
     const box = n as SceneNode & LayoutMixin;
     if ("width" in box && (box.width < minTouch - 0.5 || box.height < minTouch - 0.5)) {
       add(n, "touch-target", "error", `Tap target is ${Math.round(box.width)}×${Math.round(box.height)} — below ${minTouch}×${minTouch}. Grow the hit area (padding or a transparent frame), not necessarily the visual.`);
@@ -141,8 +223,6 @@ export async function a11yAudit(ctx: HandlerContext): Promise<unknown> {
     } else if (!hasLabelText(n) && isGenericControlName(n.name)) {
       add(n, "unnamed-control", "warning", `Icon-only control named only "${n.name}". Name it by its action (e.g. "Close", "Share") so it has an accessible label.`);
     }
-    // A control's own children are its anatomy, not more controls.
-    return "skip";
   });
 
   return { root: root.id, checked, minTouch, minFontSize: minFont, ...summarize(findings, maxParam(p.maxFindings, 200)) };
@@ -194,7 +274,17 @@ async function loadTokens(): Promise<DsTokens> {
     }
   }
   for (const s of await figma.getLocalTextStylesAsync()) {
-    out.textStyles.push({ id: s.id, name: s.name, family: s.fontName.family, style: s.fontName.style, size: s.fontSize });
+    out.textStyles.push({
+      id: s.id,
+      name: s.name,
+      family: s.fontName.family,
+      style: s.fontName.style,
+      size: s.fontSize,
+      lineHeight: s.lineHeight,
+      letterSpacing: s.letterSpacing,
+      textCase: s.textCase,
+      textDecoration: s.textDecoration,
+    });
   }
   return out;
 }
@@ -217,6 +307,11 @@ const RADIUS_FIELDS = ["topLeftRadius", "topRightRadius", "bottomLeftRadius", "b
 function bound(n: SceneNode, field: string): boolean {
   const b = (n as { boundVariables?: Record<string, unknown> }).boundVariables;
   return !!b && b[field] !== undefined;
+}
+
+/** figma.mixed → null: a value the style would flatten, so never an exact match. */
+function unmixed<T>(v: T): Exclude<T, symbol> | null {
+  return typeof v === "symbol" ? null : (v as Exclude<T, symbol>);
 }
 
 function scanDesignSystem(root: BaseNode, tokens: DsTokens, kinds: Set<DsKind>, includeInstances: boolean): { items: DsItem[]; checked: number } {
@@ -253,8 +348,14 @@ function scanDesignSystem(root: BaseNode, tokens: DsTokens, kinds: Set<DsKind>, 
       else if (typeof t.fontSize === "number" && typeof t.fontName === "object") {
         const fn = t.fontName as FontName;
         const value = `${fn.family} ${fn.style} ${t.fontSize}`;
-        const s = matchTextStyle(fn.family, fn.style, t.fontSize, tokens.textStyles);
-        items.push({ node: t, kind: "text", field: "text", value, state: s ? "bindable" : "off", ...(s ? { token: { id: s.id, name: s.name } } : {}) });
+        const m = matchTextStyle(fn.family, fn.style, t.fontSize, tokens.textStyles, {
+          lineHeight: unmixed(t.lineHeight),
+          letterSpacing: unmixed(t.letterSpacing),
+          textCase: unmixed(t.textCase),
+          textDecoration: unmixed(t.textDecoration),
+        });
+        const s = m.exact ?? m.near;
+        items.push({ node: t, kind: "text", field: "text", value, state: m.exact ? "bindable" : m.near ? "near" : "off", ...(s ? { token: { id: s.id, name: s.name } } : {}) });
       }
     }
     if (kinds.has("radius") && "cornerRadius" in n) {
@@ -406,6 +507,12 @@ async function bindItem(it: DsItem, tokens: DsTokens): Promise<void> {
 // Responsive
 // ---------------------------------------------------------------------------
 
+function pageOf(node: BaseNode): PageNode | null {
+  let p: BaseNode | null = node;
+  while (p && p.type !== "PAGE") p = p.parent;
+  return (p as PageNode | null) ?? null;
+}
+
 function toMini(node: BaseNode): MiniNode {
   const mini: MiniNode = { id: node.id };
   if ("children" in node) {
@@ -431,15 +538,21 @@ export async function responsiveAudit(ctx: HandlerContext): Promise<unknown> {
 
   const results: unknown[] = [];
   const kept: string[] = [];
-  let x = base.x + base.width + 200;
+  // Copies live on the page, not in base's parent: inside auto-layout a
+  // clone would take a slot and push its siblings around (x is ignored there),
+  // and a clone of a variant would become one more variant of its set.
+  const page = pageOf(base) ?? figma.currentPage;
+  const abs = boxOf(base) ?? { x: base.x, y: base.y, width: base.width, height: base.height };
+  let x = abs.x + abs.width + 200;
   for (let i = 0; i < viewports.length; i++) {
     const vp = viewports[i]!;
-    const copy = base.clone();
-    // Far from anything until the audit is done; `keep` lays them in a row.
-    copy.x = keep ? x : -100000;
-    copy.y = keep ? base.y : -100000;
-    copy.name = `${base.name} — ${vp.name}`;
+    const copy = node.type === "COMPONENT" ? node.createInstance() : base.clone();
     try {
+      page.appendChild(copy);
+      // Far from anything until the audit is done; `keep` lays them in a row.
+      copy.x = keep ? x : -100000;
+      copy.y = keep ? abs.y : -100000;
+      copy.name = `${base.name} — ${vp.name}`;
       const h = vp.height !== undefined && !hugsHeight ? vp.height : copy.height;
       copy.resize(vp.width, h);
       const map = buildChildMap(toMini(base), toMini(copy));

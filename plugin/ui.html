@@ -272,12 +272,20 @@
   var HEARTBEAT_DEAD_MS = 12000;
   var BACKOFF_MIN = 500;
   var BACKOFF_MAX = 8000;
-  // After LOSING an established connection, retry the SAME port this many
-  // times before walking the range: a restarted/taken-over leader almost
-  // always rebinds the same port, and walking first meant a full lap of dead
-  // ports (tens of seconds) before coming back to it.
-  var SAME_PORT_RETRIES = 3;
+  // After LOSING an established connection, keep retrying the port that
+  // worked, every FAST_RETRY_MS for FAST_RETRY_WINDOW_MS, before walking the
+  // range: a restarted or taken-over leader rebinds that same port within
+  // about a second, and walking first meant a full lap of dead ports (tens of
+  // seconds) before coming back to it.
+  var FAST_RETRY_MS = 500;
+  var FAST_RETRY_WINDOW_MS = 10000;
   var WALK_STEP_MS = 600;
+  // A port that accepts TCP but never completes the WebSocket handshake
+  // (something else listening there) must not stall the walk.
+  var CONNECT_TIMEOUT_MS = 2500;
+  // Wait this long for the main thread's hello (stored channel + resume
+  // token) before connecting anyway.
+  var HELLO_WAIT_MS = 1000;
   var MAX_LOG_ROWS = 100;
 
   // Mirrored from src/shared/protocol.ts WRITE_OPERATIONS — used to classify
@@ -297,11 +305,15 @@
   };
 
   // ---- state ----
-  var ws = null;
+  var ws = null;                   // the CURRENT socket; handlers of any other ignore themselves
   var portIndex = 0;               // which port in the fallback range we are trying
-  var samePortLeft = 0;            // same-port retries left before walking the range
+  var lostAt = 0;                  // when an established connection dropped (fast-retry window)
+  var lastGoodIndex = 0;           // portIndex of the last connection that opened
   var backoff = BACKOFF_MIN;
   var reconnectTimer = null;
+  var connectTimer = null;
+  var started = false;             // connect() runs once the hello is in (or HELLO_WAIT_MS)
+  var requestedChannel = null;     // channel the last hello asked for (to notice a different assign)
   var heartbeatTimer = null;
   var lastHeartbeatAt = 0;
   var connectedPort = null;
@@ -533,8 +545,17 @@
     };
   }
 
-  // Ask the main thread for handshake + hello on load.
+  // Ask the main thread for handshake + hello on load. The socket waits for
+  // that hello: connecting first sent a hello with no channel, no resume
+  // token and version "0.0.0", so the server assigned a NEW channel and every
+  // session bound to this window lost it on each reload.
   toMain({ kind: "handshake" });
+  function start() {
+    if (started) return;
+    started = true;
+    connect();
+  }
+  setTimeout(start, HELLO_WAIT_MS);
 
   window.onmessage = function (event) {
     var msg = event.data && event.data.pluginMessage;
@@ -551,6 +572,7 @@
         renderMeta();
         // If already connected, (re)send hello so the server has fresh file info.
         if (ws && ws.readyState === 1) sendHello();
+        start();
         break;
       case "context": {
         hello = msg.hello || hello;
@@ -611,20 +633,38 @@
     renderMeta();
 
     var url = "ws://localhost:" + port + "/ws";
+    // Every handler below checks `sock !== ws` first. Reconnect / Join /
+    // Auto-detect close the old socket and connect at once, and the OLD
+    // socket's onclose arrives later: acting on the global `ws` it nulled the
+    // new socket, stopped its heartbeat, scheduled yet another connect and —
+    // on "replaced" — forgot the channel the user had just joined. The window
+    // ended up on a random channel with an orphan socket left on the old one.
+    var sock;
     try {
-      ws = new WebSocket(url);
+      sock = new WebSocket(url);
     } catch (e) {
       scheduleReconnect(true);
       return;
     }
+    ws = sock;
 
-    ws.onopen = function () {
+    clearTimeout(connectTimer);
+    connectTimer = setTimeout(function () {
+      if (sock !== ws || sock.readyState !== 0) return;
+      // Accepted TCP but never finished the handshake: not our server.
+      dropSocket();
+      setState("bad", "No answer on :" + port);
+      scheduleReconnect(true);
+    }, CONNECT_TIMEOUT_MS);
+
+    sock.onopen = function () {
+      if (sock !== ws) return;
+      clearTimeout(connectTimer);
       connectedPort = port;
       backoff = BACKOFF_MIN;
       attemptCount = 0;
-      // This port is known-good: if the connection drops later, retry it
-      // first instead of immediately walking the range.
-      samePortLeft = SAME_PORT_RETRIES;
+      lostAt = 0;
+      lastGoodIndex = portIndex;
       // Seed contact time so the staleness watchdog has a baseline from t=0.
       lastHeartbeatAt = Date.now();
       setState("ok", "Connected");
@@ -633,14 +673,15 @@
       renderMeta();
     };
 
-    ws.onmessage = function (event) {
+    sock.onmessage = function (event) {
+      if (sock !== ws) return;
       var data;
       try { data = JSON.parse(event.data); } catch (e) { return; }
       if (!data || typeof data !== "object") return;
 
       if (data.type === "ping") {
         lastHeartbeatAt = Date.now();
-        ws.send(JSON.stringify({ type: "pong", at: Date.now() }));
+        sock.send(JSON.stringify({ type: "pong", at: Date.now() }));
         return;
       }
       if (data.type === "pong") {
@@ -655,11 +696,18 @@
       if (data.type === "assigned" && data.channel) {
         // The server confirmed/assigned this window's channel. Persist it so
         // reopening the plugin in this file rejoins the same channel.
+        var askedFor = requestedChannel;
         channel = data.channel;
         resumeToken = data.resumeToken || null;
         replacedByPeer = false;
         toMain({ kind: "save-channel", channel: channel, resumeToken: resumeToken });
         renderMeta();
+        if (askedFor && askedFor !== channel) {
+          // Another window of this file still holds the stored channel (the
+          // plugin keys it by file name); the server kept that one live and
+          // gave this window its own.
+          setState("ok", "Connected — \"" + askedFor + "\" is live in another window; this one is \"" + channel + "\"");
+        }
         return;
       }
       if (data.type === "channels") {
@@ -669,12 +717,18 @@
       }
     };
 
-    ws.onerror = function () {
+    sock.onerror = function () {
       // onclose will handle reconnect.
     };
 
-    ws.onclose = function (event) {
+    sock.onclose = function (event) {
+      if (sock !== ws) return; // a socket we already replaced or dropped
+      clearTimeout(connectTimer);
       stopHeartbeat();
+      if (connectedPort != null) {
+        // An established connection dropped: start the fast-retry window.
+        lostAt = Date.now();
+      }
       ws = null;
       connectedPort = null;
       // Our channel was deliberately taken by another window ("Join" there or
@@ -695,11 +749,28 @@
     };
   }
 
+  /**
+   * Close the current socket on purpose. Its handlers are detached first, so
+   * nothing it does on the way out (its onclose arrives later) can touch the
+   * socket that replaces it.
+   */
+  function dropSocket() {
+    clearTimeout(connectTimer);
+    stopHeartbeat();
+    var old = ws;
+    ws = null;
+    connectedPort = null;
+    if (!old) return;
+    old.onopen = old.onmessage = old.onerror = old.onclose = null;
+    try { old.close(); } catch (e) { /* already closing */ }
+  }
+
   function sendHello() {
     if (!ws || ws.readyState !== 1) return;
     var pv = (handshake && handshake.protocolVersion) || 1;
     var pluginVersion = (handshake && handshake.pluginVersion) || "0.0.0";
     var h = hello || {};
+    requestedChannel = channel;
     // Reconstructs the hello field-by-field. pluginBuild MUST be forwarded:
     // the main thread already stamps the bundle, but dropping it here made
     // every reload look like a plugin older than the stamp mechanism itself.
@@ -738,14 +809,18 @@
 
   function scheduleReconnect(advancePort) {
     if (reconnectTimer) return;
+    if (lostAt > 0 && Date.now() - lostAt < FAST_RETRY_WINDOW_MS) {
+      // Just lost a working connection: its server is most likely coming
+      // straight back on the same port (restart, takeover by another MCP
+      // process). Knock there twice a second instead of walking away.
+      portIndex = lastGoodIndex;
+      setState("connecting", "Reconnecting to :" + currentPort() + "…");
+      reconnectTimer = setTimeout(connect, FAST_RETRY_MS);
+      return;
+    }
     if (advancePort) {
-      if (samePortLeft > 0) {
-        // Recently-working port: burn a same-port retry before walking.
-        samePortLeft--;
-      } else {
-        // Walk the fallback port range so we find the server wherever it bound.
-        portIndex = (portIndex + 1) % PORT_RANGE;
-      }
+      // Walk the fallback port range so we find the server wherever it bound.
+      portIndex = (portIndex + 1) % PORT_RANGE;
     }
     // Walking the fallback ports is a sweep, not a retry: each port is a fresh
     // target, so it gets a short fixed step. Backoff grows only on the default
@@ -759,11 +834,18 @@
     if (!walking) backoff = Math.min(backoff * 2, BACKOFF_MAX);
   }
 
-  el.retry.onclick = function () {
+  /** Drop the current socket and connect again right away. */
+  function reconnectNow() {
     backoff = BACKOFF_MIN;
-    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    lostAt = 0;
+    dropSocket();
     clearTimeout(reconnectTimer); reconnectTimer = null;
+    started = true;
     connect();
+  }
+
+  el.retry.onclick = function () {
+    reconnectNow();
   };
 
   el.clear.onclick = function () {
@@ -805,10 +887,7 @@
     el.channelEditor.className = "channel-editor";
     renderMeta();
     // Reconnect so the server re-handshakes us onto the new channel.
-    backoff = BACKOFF_MIN;
-    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-    clearTimeout(reconnectTimer); reconnectTimer = null;
-    connect();
+    reconnectNow();
   };
   el.channelInput.onkeydown = function (e) {
     if (e.key === "Enter") el.channelJoin.onclick();
@@ -818,15 +897,9 @@
   // Sweep the whole fallback port range immediately instead of waiting on
   // the backoff timer to walk through it one port at a time.
   el.autodetect.onclick = function () {
-    backoff = BACKOFF_MIN;
     portIndex = 0;
-    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-    clearTimeout(reconnectTimer); reconnectTimer = null;
+    reconnectNow();
     setState("connecting", "Auto-detecting…");
-    connect();
   };
-
-  // Kick off.
-  connect();
 })();
 </script>

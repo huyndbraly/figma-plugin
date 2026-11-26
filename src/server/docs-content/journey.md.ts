@@ -38,6 +38,7 @@ phase pay "Thanh toán"
 \`\`\`
 
 Every line after a \`phase\` belongs to it; repeat a word for several items.
+Phase ids may be in any script (\`phase tìm "Tìm phim"\`).
 
 ### Fields
 

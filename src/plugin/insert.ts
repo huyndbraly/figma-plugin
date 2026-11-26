@@ -15,6 +15,17 @@ export function insertInto(
   node: SceneNode,
   insertAt: InsertAt | undefined,
 ): void {
+  // The two ends need no index: reading every child's id to find the end of
+  // the list made each create on a 2 000-layer page cost 2 000 reads.
+  // appendChild / insertChild(0) also reparent a node that is moving in.
+  if (insertAt === undefined || insertAt === "top") {
+    parent.appendChild(node);
+    return;
+  }
+  if (insertAt === "bottom") {
+    parent.insertChild(0, node);
+    return;
+  }
   // Ids of the parent's current children EXCLUDING node (it may be moving in).
   const childIds = parent.children
     .filter((c) => c.id !== node.id)

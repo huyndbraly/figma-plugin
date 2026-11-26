@@ -20,9 +20,9 @@
  *    closed is put right by the `reflow_diagram` op.
  */
 import {
-  diagramFrames,
+  diagramFrameCandidates,
+  diagramKindOf,
   isDiagramFrame,
-  liveRouteOn,
   owningDiagram,
   reflowAnyFrame,
 } from "./diagram-reflow.js";
@@ -57,6 +57,24 @@ let paused = 0;
  * and a draw never gets here mid-write, because it holds `paused`.
  */
 const deletedIn = new Set<string>();
+/**
+ * How many layers each diagram frame held when this module last looked.
+ *
+ * A DELETE arrives with no parent, so the sweep used to queue EVERY diagram on
+ * the page for a full re-route — deleting a stray rectangle beside ten
+ * diagrams re-scanned all ten. A box that left a diagram leaves its frame one
+ * child short, so only a frame whose count dropped is queued. A frame with no
+ * count yet (drawn since the page was attached) is queued once, to be safe.
+ */
+const childCounts = new Map<string, number>();
+
+function noteCount(frame: FrameNode): void {
+  try {
+    if (!frame.removed) childCounts.set(frame.id, frame.children.length);
+  } catch {
+    // A frame that cannot be read now is simply queued on the next delete.
+  }
+}
 
 export function installDiagramLive(): void {
   attach(figma.currentPage);
@@ -73,6 +91,12 @@ function attach(page: PageNode): void {
     }
   }
   watched = page;
+  childCounts.clear();
+  try {
+    for (const f of diagramFrameCandidates(page)) noteCount(f);
+  } catch {
+    // No baseline: the first delete re-checks every diagram, as it always did.
+  }
   try {
     page.on("nodechange", onNodeChange);
   } catch {
@@ -124,10 +148,14 @@ function onNodeChange(event: NodeChangeEvent): void {
     if (frame) frames.set(frame.id, frame);
     // A deleted node arrives with no parent to walk up from, so every
     // diagram on the page — at any depth, including one inside a plain
-    // frame — is re-checked; each one hides the arrows whose box has gone.
+    // frame — is looked at; the ones that lost a layer since the last look
+    // are re-checked, and each hides the arrows whose box has gone.
     if (change.type === "DELETE" && !sweptForDeletes) {
       sweptForDeletes = true;
-      for (const f of diagramFrames(figma.currentPage)) {
+      for (const f of diagramFrameCandidates(figma.currentPage)) {
+        const last = childCounts.get(f.id);
+        const now = f.children.length;
+        if (last !== undefined && now >= last) continue;
         frames.set(f.id, f);
         deletedIn.add(f.id);
       }
@@ -164,8 +192,14 @@ async function drain(): Promise<void> {
         try {
           const deleted = deletedIn.delete(frame.id);
           if (frame.removed) continue;
-          if (!liveRouteOn(frame)) continue;
-          await reflowAnyFrame(frame, { onlyIfMoved: true, deleted });
+          // One parse answers both "is it ours" and "does it route live", and
+          // the kind is handed on so the dispatch does not parse again.
+          const info = diagramKindOf(frame);
+          if (info && info.liveRoute) await reflowAnyFrame(frame, { onlyIfMoved: true, deleted }, info.kind);
+          // The count later sweeps compare against is the one after this pass
+          // — which also absorbs layers the re-route itself removed (a stale
+          // arrow head), so its own DELETE does not queue the frame again.
+          noteCount(frame);
         } catch {
           // A live re-route must never take the plugin (and with it the bridge)
           // down. The op path reports failures properly.

@@ -28,6 +28,7 @@ import { findFreeSpot } from "../shared/diagram/place.js";
 import type { Rect } from "../shared/diagram/place.js";
 import type { HandlerContext } from "./context.js";
 import { getNodeByIdSafe } from "./context.js";
+import { loadFontCached } from "./fonts.js";
 import type { DrawEdge } from "../shared/diagram/types.js";
 
 /** Frame padding the layout pass leaves around a diagram. */
@@ -112,6 +113,28 @@ export function findShape(frame: FrameNode, prefix: string, id: string): SceneNo
     if (child.name === exact || child.name.indexOf(withLabel) === 0) return child;
   }
   return null;
+}
+
+/**
+ * findShape for every box at once: one walk of the frame's children instead
+ * of one per box. A re-route looks up every box of the graph, and a
+ * 200-box diagram with 600 layers was 120 000 name comparisons per pass —
+ * on every drag. Each child is filed under its full name and under every
+ * prefix of it that ends at a space, which is exactly findShape's rule
+ * (`<prefix><id>` or `<prefix><id> …`), and the FIRST child wins a key, as
+ * findShape's front-to-back scan did.
+ */
+export function shapeIndex(frame: FrameNode): Map<string, SceneNode> {
+  const index = new Map<string, SceneNode>();
+  for (const child of frame.children) {
+    const name = child.name;
+    for (let at = name.indexOf(" "); at > 0; at = name.indexOf(" ", at + 1)) {
+      const key = name.slice(0, at);
+      if (!index.has(key)) index.set(key, child);
+    }
+    if (!index.has(name)) index.set(name, child);
+  }
+  return index;
 }
 
 export type EdgeApply = "moved" | "pinned" | "missing";
@@ -442,7 +465,7 @@ export async function preloadDiagramFonts(
   const failed: string[] = [];
   for (const style of styles) {
     try {
-      await figma.loadFontAsync({ family: font, style });
+      await loadFontCached({ family: font, style });
     } catch {
       failed.push(style);
     }
@@ -753,8 +776,9 @@ export function scanBoxes<T extends { id: string }>(
   const placed = new Map<string, Placement>();
   const shapes = new Map<string, SceneNode>();
   const goneBoxes: string[] = [];
+  const index = shapeIndex(frame);
   for (const n of nodes) {
-    const node = findShape(frame, typeof prefix === "string" ? prefix : prefix(n), n.id);
+    const node = index.get(`${typeof prefix === "string" ? prefix : prefix(n)}${n.id}`) ?? null;
     if (!node) {
       goneBoxes.push(n.id);
       continue;

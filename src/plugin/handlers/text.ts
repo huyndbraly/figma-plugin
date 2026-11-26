@@ -144,25 +144,15 @@ async function loadAllRangeFonts(
     return;
   }
 
-  // Walk contiguous ranges by their font to substitute per-range if needed.
-  let i = 0;
-  while (i < len) {
-    const rangeFont = text.getRangeFontName(i, i + 1);
-    // Extend the run while the font is identical.
-    let j = i + 1;
-    while (j < len) {
-      const f = text.getRangeFontName(j, j + 1);
-      if (
-        f === figma.mixed ||
-        rangeFont === figma.mixed ||
-        (f as FontName).family !== (rangeFont as FontName).family ||
-        (f as FontName).style !== (rangeFont as FontName).style
-      ) {
-        break;
-      }
-      j++;
-    }
-
+  // Contiguous runs by font, from ONE call: the old walk asked the editor for
+  // each character's font in turn, so replacing a 5 000-character mixed text
+  // made 5 000 round trips before writing anything.
+  for (const seg of text.getStyledTextSegments(["fontName"])) {
+    const i = seg.start;
+    const j = seg.end;
+    // Typed as possibly-mixed on purpose: a segment never is, but the
+    // defensive branch below stays for any runtime that disagrees.
+    const rangeFont = seg.fontName as FontName | PluginAPI["mixed"];
     if (rangeFont !== figma.mixed) {
       const fn = rangeFont as FontName;
       const res = await loadFontWithFallback(fn);
@@ -179,10 +169,9 @@ async function loadAllRangeFonts(
         text.setRangeFontName(i, j, res.resolvedFont);
       }
     } else {
-      // Shouldn't happen for a 1-char slice, but be defensive.
+      // A styled segment is uniform by definition, but be defensive.
       const res = await loadFontWithFallback(DEFAULT_FONT);
       text.setRangeFontName(i, j, res.resolvedFont);
     }
-    i = j;
   }
 }

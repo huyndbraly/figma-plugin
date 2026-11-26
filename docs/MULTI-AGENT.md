@@ -33,6 +33,8 @@ pkill -f "figma-plugin/dist/server/index.js"
 
 Editor mở MCP **đầu tiên** sau lệnh trên sẽ elect leader với build vừa build.
 
+Leader chết → follower đầu tiên thấy (forward bị refused, hoặc `/health` refused) **takeover ngay trên đúng port đó** và plugin tìm lại trong ~0,5 s. Leader chỉ *bận* (process còn sống, `/health` trả chậm) thì vẫn được follow — không ai nhảy sang port+1 làm leader thứ hai.
+
 ### Sửa plugin (`src/plugin/`) — reload plugin trong Figma
 
 Server-side fix áp ngay; plugin-side fix cần **chạy lại** plugin: Figma → Plugins → Development → Figma Plugin MCP.
@@ -52,6 +54,8 @@ Agent **không** hỏi user bấm Connect. Đọc `figma_status.channels` (file,
 - **Cùng file + cùng page** → xếp hàng trên một cửa sổ (Plugin API không chịu hai mutation chồng).
 
 Cửa sổ user vừa click (`focused`) là default cho session mới chưa truyền `file`. `channel` id vẫn dùng được, không bắt buộc.
+
+**Cửa sổ reload / mất kết nối.** Op của session đang gắn với cửa sổ đó (hoặc truyền `file`/`page` khớp nó) **chờ tối đa 15 s** cho cửa sổ quay lại — không tự nhảy sang file khác. Quá 15 s: nếu cửa sổ quay lại với channel mới (cùng file) thì session đi theo; nếu không, lỗi `CHANNEL_NOT_FOUND` nêu tên file/page cũ — truyền `file` để đổi mục tiêu. Hai cửa sổ cùng một file không còn giành channel của nhau: cửa sổ mở sau nhận channel riêng.
 
 ### Nhiều agent, một cửa sổ
 

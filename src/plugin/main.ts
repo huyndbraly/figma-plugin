@@ -6,7 +6,6 @@ import {
   OPERATIONS,
   ErrorCode,
   PROTOCOL_VERSION,
-  BATCH_CHUNK_SIZE,
 } from "../shared/protocol.js";
 import { makeContext } from "./context.js";
 import { toBridgeError, err } from "./errors.js";
@@ -183,8 +182,7 @@ interface BatchResult {
 
 /**
  * batch: sequential execution with per-item try/catch, partial commit, and a
- * progress ping at every BATCH_CHUNK_SIZE boundary + at completion of each
- * chunk. Returns per-index {ok, result|error}.
+ * progress ping after every item. Returns per-index {ok, result|error}.
  */
 async function runBatch(
   req: BridgeRequest,
@@ -241,10 +239,11 @@ async function runBatch(
       failCount++;
     }
 
-    // progress at each chunk boundary and at the very end of a chunk.
-    if ((i + 1) % BATCH_CHUNK_SIZE === 0 || i === items.length - 1) {
-      progress(i + 1, items.length, `batch ${i + 1}/${items.length}`);
-    }
+    // Progress after EVERY item: each ping resets the server's timer, so one
+    // slow item (instantiate, an audit) is timed on its own instead of the
+    // whole chunk sharing one budget — a trip there reported every item
+    // failed although the plugin went on to commit them.
+    progress(i + 1, items.length, `batch ${i + 1}/${items.length}`);
   }
 
   return { items: results, okCount, failCount };
@@ -318,6 +317,21 @@ const channelLoaded: Promise<void> = figma.clientStorage
     /* first run / storage unavailable — server will assign a channel */
   });
 
+/**
+ * Requests run one at a time, in arrival order. The server sends one op per
+ * window at a time — but only per CONNECTION: after a reconnect the new
+ * connection's first op arrived while the op from the old connection was
+ * still running here, and two handlers interleaved on one document (the
+ * Plugin API corrupts its own transient state when mutations overlap). A
+ * `batch` is one request, so its items stay inside its turn.
+ */
+let turn: Promise<void> = Promise.resolve();
+function runInTurn(work: () => Promise<void>): Promise<void> {
+  const next = turn.then(work, work);
+  turn = next.catch(() => undefined);
+  return next;
+}
+
 figma.ui.onmessage = async (msg: UiToMain) => {
   if (!msg || typeof msg !== "object") return;
   switch (msg.kind) {
@@ -371,8 +385,11 @@ figma.ui.onmessage = async (msg: UiToMain) => {
       break;
     }
     case "request": {
-      const res = await dispatch(msg.payload);
-      post({ kind: "response", payload: res, op: msg.payload.op });
+      const req = msg.payload;
+      await runInTurn(async () => {
+        const res = await dispatch(req);
+        post({ kind: "response", payload: res, op: req.op });
+      });
       break;
     }
     case "local": {
@@ -390,26 +407,32 @@ figma.ui.onmessage = async (msg: UiToMain) => {
         });
         break;
       }
+      const op = msg.op;
+      const id = msg.id;
       const ctx = makeContext(msg.params ?? {}, () => {});
-      try {
-        const result = await HANDLERS[msg.op](ctx);
-        post({
-          kind: "local",
-          id: msg.id,
-          ok: true,
-          result,
-          ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
-        });
-      } catch (e) {
-        const bridgeError = toBridgeError(e);
-        post({
-          kind: "local",
-          id: msg.id,
-          ok: false,
-          error: bridgeError,
-          ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
-        });
-      }
+      // Same turn-taking as server requests: a panel click must not switch
+      // the page under an agent's op that is half done.
+      await runInTurn(async () => {
+        try {
+          const result = await HANDLERS[op](ctx);
+          post({
+            kind: "local",
+            id,
+            ok: true,
+            result,
+            ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+          });
+        } catch (e) {
+          const bridgeError = toBridgeError(e);
+          post({
+            kind: "local",
+            id,
+            ok: false,
+            error: bridgeError,
+            ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+          });
+        }
+      });
       break;
     }
     default:

@@ -40,6 +40,10 @@ persona thu "Thu Trang" primary
   app Shopee
 \`\`\`
 
+Persona ids may be in any script (\`persona thư "Thư"\`). A journey's
+\`persona\` matches a card by whole words of the name before its first comma:
+"Thu, 28" walks the journey of "Thu Trang".
+
 ### Fields
 
 | field | meaning |

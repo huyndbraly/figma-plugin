@@ -38,6 +38,7 @@ function node(type: string, name: string, extra: Record<string, unknown> = {}): 
   };
   if (n.children) {
     n.appendChild = (c: any) => {
+      if (c.parent) c.parent.children.splice(c.parent.children.indexOf(c), 1);
       n.children.push(c);
       c.parent = n;
     };
@@ -127,6 +128,77 @@ describe("a11y_audit", () => {
     expect(kinds.some((k: string) => k.endsWith(":Save"))).toBe(false); // white on blue passes
     expect(res.summary.errors).toBeGreaterThanOrEqual(2);
   });
+
+  it("still reads a control's own label, and a big 'menu' or 'search' region is a container", async () => {
+    const screen = node("FRAME", "Screen", { fills: solid("#ffffff") });
+    page.appendChild(screen);
+    // A button whose label is unreadable on its own fill.
+    const btn = node("INSTANCE", "Primary button", { width: 200, height: 48, fills: solid("#2563eb") });
+    btn.appendChild(textNode("Save", "#3b82f6"));
+    // Its icon is anatomy, not a second (too small) tap target.
+    btn.appendChild(node("FRAME", "Close", { width: 16, height: 16 }));
+    screen.appendChild(btn);
+    // "Settings menu" / "Search results" are panels — their contents count.
+    const menu = node("FRAME", "Settings menu", { width: 375, height: 600 });
+    menu.appendChild(textNode("Faint row", "#dddddd"));
+    menu.appendChild(node("FRAME", "Frame 3", { width: 20, height: 20, reactions: [{ trigger: { type: "ON_CLICK" } }] }));
+    screen.appendChild(menu);
+    const results = node("FRAME", "Search results", { width: 375, height: 500 });
+    results.appendChild(node("FRAME", "Row action", { width: 24, height: 24 }));
+    screen.appendChild(results);
+
+    const res = (await a11yAudit(ctx({ nodeId: screen.id }))) as any;
+    const kinds = res.findings.map((f: any) => `${f.kind}:${f.name}`);
+    expect(kinds).toContain("contrast:Save");
+    expect(kinds).not.toContain("touch-target:Close");
+    expect(kinds).toContain("contrast:Faint row");
+    expect(kinds).toContain("touch-target:Frame 3");
+    expect(kinds).toContain("unnamed-control:Frame 3");
+    expect(kinds).toContain("touch-target:Row action");
+    expect(kinds.some((k: string) => k.endsWith(":Settings menu") || k.endsWith(":Search results"))).toBe(false);
+  });
+
+  it("finds the background in an earlier sibling that covers the text, not only in ancestors", async () => {
+    const screen = node("FRAME", "Screen", { fills: solid("#ffffff"), absoluteBoundingBox: { x: 0, y: 0, width: 400, height: 800 } });
+    page.appendChild(screen);
+    const card = node("GROUP", "Card", { fills: [], absoluteBoundingBox: { x: 20, y: 20, width: 200, height: 80 } });
+    screen.appendChild(card);
+    card.appendChild(node("RECTANGLE", "Card bg", { fills: solid("#1e3a8a"), absoluteBoundingBox: { x: 20, y: 20, width: 200, height: 80 } }));
+    card.appendChild(textNode("On navy", "#ffffff", { absoluteBoundingBox: { x: 30, y: 30, width: 100, height: 20 } }));
+    // White text that only half overlaps the navy shape sits on the screen's white.
+    card.appendChild(textNode("Spills out", "#ffffff", { absoluteBoundingBox: { x: 150, y: 30, width: 150, height: 20 } }));
+
+    const res = (await a11yAudit(ctx({ nodeId: screen.id }))) as any;
+    const kinds = res.findings.map((f: any) => `${f.kind}:${f.name}`);
+    expect(kinds).not.toContain("contrast:On navy");
+    expect(kinds).toContain("contrast:Spills out");
+  });
+});
+
+describe("a11y_audit containers and nested tap targets", () => {
+  it("checks a tappable child of a short, control-named container", async () => {
+    const screen = node("FRAME", "Screen", { fills: solid("#ffffff") });
+    page.appendChild(screen);
+    // Hugs its rows, so it is short enough to look like a control by name.
+    const menu = node("FRAME", "Settings menu", { width: 370, height: 60 });
+    screen.appendChild(menu);
+    const close = node("FRAME", "Close", { width: 20, height: 20, reactions: [{ trigger: { type: "ON_CLICK" } }] });
+    menu.appendChild(close);
+    const res = (await a11yAudit(ctx({ nodeId: screen.id }))) as any;
+    const kinds = res.findings.map((f: any) => `${f.kind}:${f.name}`);
+    expect(kinds).toContain("touch-target:Close");
+    expect(kinds.some((k: string) => k.endsWith(":Settings menu"))).toBe(false);
+  });
+
+  it("still treats name-only anatomy inside a real control as part of it", async () => {
+    const screen = node("FRAME", "Screen", { fills: solid("#ffffff") });
+    page.appendChild(screen);
+    const btn = node("FRAME", "Share button", { width: 48, height: 48 });
+    screen.appendChild(btn);
+    btn.appendChild(node("FRAME", "Icon button", { width: 16, height: 16 }));
+    const res = (await a11yAudit(ctx({ nodeId: screen.id }))) as any;
+    expect(res.findings.some((f: any) => f.name === "Icon button")).toBe(false);
+  });
 });
 
 describe("design-system audit and apply", () => {
@@ -171,6 +243,24 @@ describe("design-system audit and apply", () => {
     expect(screen.boundVariables.paddingLeft.id).toBe("V:s16");
     expect(card.boundVariables.topLeftRadius.id).toBe("V:r8");
   });
+
+  it("calls a text style that would change line height or tracking 'near', and does not apply it", async () => {
+    (globalThis as any).figma.getLocalTextStylesAsync = vi.fn(async () => [
+      { id: "S:body", name: "body", fontName: { family: "Inter", style: "Regular" }, fontSize: 14, lineHeight: { unit: "PIXELS", value: 20 }, letterSpacing: { unit: "PERCENT", value: 0 }, textCase: "ORIGINAL", textDecoration: "NONE" },
+    ]);
+    const screen = node("FRAME", "Screen", { layoutMode: "NONE" });
+    page.appendChild(screen);
+    const auto = textNode("Auto leading", "#111111", { lineHeight: { unit: "AUTO" }, letterSpacing: { unit: "PIXELS", value: 0 } });
+    const same = textNode("Same leading", "#111111", { lineHeight: { unit: "PERCENT", value: 142.857142857 }, letterSpacing: { unit: "PIXELS", value: 0 } });
+    screen.appendChild(auto);
+    screen.appendChild(same);
+
+    const audit = (await auditDesignSystem(ctx({ nodeId: screen.id, kinds: ["text"] }))) as any;
+    expect(audit.byKind.text).toMatchObject({ bindable: 1, near: 1 });
+    await applyDesignSystem(ctx({ nodeId: screen.id, kinds: ["text"] }));
+    expect(same.textStyleId).toBe("S:body"); // 142.857% of 14px = 20px: nothing moves
+    expect(auto.textStyleId).toBe(""); // would reflow: only with includeNear
+  });
 });
 
 describe("responsive_audit", () => {
@@ -206,5 +296,52 @@ describe("responsive_audit", () => {
     const cloneIds = new Set(clones.flatMap((c) => [c.id, ...c.findAll(() => true).map((k: any) => k.id)]));
     for (const r of res.results) for (const m of [...r.issues, ...(r.hints ?? [])]) for (const id of cloneIds) expect(m).not.toContain(`${id}`);
     expect(page.children).toEqual([screen]);
+  });
+
+  it("audits the copy on the page, never inside base's auto-layout parent", async () => {
+    const stack = node("FRAME", "Stack", { layoutMode: "VERTICAL" });
+    page.appendChild(stack);
+    const screen = node("FRAME", "Home", { width: 402, height: 874, layoutMode: "VERTICAL", primaryAxisSizingMode: "FIXED", absoluteBoundingBox: { x: 500, y: 40, width: 402, height: 874 } });
+    stack.appendChild(screen);
+    const sibling = node("FRAME", "Footer");
+    stack.appendChild(sibling);
+    let parentAtAudit: any;
+    screen.clone = function () {
+      // Figma's clone lands next to the original — inside the auto-layout stack.
+      const copy = node("FRAME", this.name, { width: this.width, height: this.height, layoutMode: this.layoutMode });
+      stack.appendChild(copy);
+      copy.remove = function () {
+        this.parent.children.splice(this.parent.children.indexOf(this), 1);
+      };
+      const resize = copy.resize;
+      copy.resize = function (w: number, h: number) {
+        parentAtAudit = this.parent;
+        resize.call(this, w, h);
+      };
+      return copy;
+    };
+    const res = (await responsiveAudit(ctx({ nodeId: screen.id, sizes: [375], keep: true }))) as any;
+    expect(parentAtAudit).toBe(page);
+    expect(stack.children).toEqual([screen, sibling]);
+    const kept = nodes.get(res.kept[0]);
+    expect(kept.parent).toBe(page);
+    expect(kept.x).toBe(500 + 402 + 200); // beside the screen, in page coordinates
+  });
+
+  it("audits a variant through an instance, so its set never gains a variant", async () => {
+    const setNode = node("COMPONENT_SET", "Card");
+    page.appendChild(setNode);
+    const variant = node("COMPONENT", "Size=lg", { width: 402, height: 300, layoutMode: "NONE" });
+    setNode.appendChild(variant);
+    variant.clone = vi.fn();
+    variant.createInstance = function () {
+      const inst = node("INSTANCE", "Card", { width: this.width, height: this.height, layoutMode: "NONE" });
+      page.appendChild(inst);
+      return inst;
+    };
+    const res = (await responsiveAudit(ctx({ nodeId: variant.id, sizes: [375], keep: true }))) as any;
+    expect(variant.clone).not.toHaveBeenCalled();
+    expect(setNode.children).toEqual([variant]);
+    expect(nodes.get(res.kept[0]).type).toBe("INSTANCE");
   });
 });

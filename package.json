@@ -46,9 +46,9 @@
   "private": false,
   "dependencies": {
     "@dagrejs/dagre": "^3.1.1",
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "ws": "^8.18.0",
-    "zod": "^3.24.0"
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@dicebear/collection": "^9.4.2",
