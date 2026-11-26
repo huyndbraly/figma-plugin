@@ -400,7 +400,7 @@ export async function createServer(): Promise<ServerHandle> {
               ...(ctx?.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
             });
           },
-        });
+        }, signal ? { signal } : undefined);
       }
       const { op: validOp, params: validParams } = validateOperation(op, params);
       return dispatchLeader(validOp, validParams, sessionId, hint, signal);
@@ -495,7 +495,7 @@ export async function createServer(): Promise<ServerHandle> {
   }
 
   /** figma_write execution. On a follower, forward the whole code to the leader. */
-  async function runWrite(code: string, sessionId?: string, route?: RouteArg): Promise<WriteResult | unknown> {
+  async function runWrite(code: string, sessionId?: string, route?: RouteArg, signal?: AbortSignal): Promise<WriteResult | unknown> {
     const sid = resolveSession(sessionId);
     const hint = parseRouteArg(route);
     if (coordinator.role === "follower") {
@@ -506,6 +506,7 @@ export async function createServer(): Promise<ServerHandle> {
       return coordinator.forward("__write__", { code }, sid, hint.channel, undefined, {
         file: hint.file,
         page: hint.page,
+        ...(signal ? { signal } : {}),
       });
     }
     const session = sessions.get(sid);
@@ -528,7 +529,7 @@ export async function createServer(): Promise<ServerHandle> {
           ...(ctx?.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
         });
       },
-    });
+    }, signal ? { signal } : undefined);
   }
 
   /**
@@ -683,6 +684,7 @@ export async function createServer(): Promise<ServerHandle> {
       const callCtx: ToolContext = {
         ...ctx,
         runValidated: (op, params, sessionId, route) => runValidated(op, params, sessionId, route, extra.signal),
+        runWrite: (code, sessionId, route) => runWrite(code, sessionId, route, extra.signal),
       };
       const result = await callTool(callCtx, name, args as Record<string, unknown>);
       return toToolResult(result);

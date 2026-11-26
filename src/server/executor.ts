@@ -228,6 +228,12 @@ const writeChains = new WeakMap<Session, Promise<unknown>>();
 export interface ExecuteWriteOpts {
   /** Override the execution budget (tests use a short budget). */
   timeoutMs?: number;
+  /**
+   * The caller gave up (MCP cancellation, or the follower's /rpc request
+   * closed). Aborts the call's ops still waiting in a bridge queue, so an
+   * abandoned figma_write does not keep drawing into the file.
+   */
+  signal?: AbortSignal;
 }
 
 export function executeWrite(
@@ -268,6 +274,10 @@ async function executeWriteInner(
   // One listener per op still waiting; a Promise.all over a dozen reads is
   // normal, and the default cap of 10 printed MaxListenersExceededWarning.
   setMaxListeners(0, abort.signal);
+  if (opts?.signal) {
+    if (opts.signal.aborted) abort.abort();
+    else opts.signal.addEventListener("abort", () => abort.abort(), { once: true });
+  }
   const scopedDeps: ExecutorDeps = {
     ...deps,
     signal: abort.signal,
