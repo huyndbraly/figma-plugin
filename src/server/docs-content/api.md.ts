@@ -237,9 +237,11 @@ These change existing nodes rather than drawing new ones. See the
   matched, the result carries \`hasMore\`/\`totalMatched\` — narrow the query or
   raise \`limit\` rather than assuming the list is complete.
 - \`getSelection()\`, \`getDocumentInfo()\`, \`getDesignContext({nodeId?, detail?,
-  depth?})\` — a WHOLE-PAGE read (no nodeId) defaults to \`sparse\` because a page
-  can be tens of thousands of tokens; pass a nodeId to deep-read one subtree, or
-  detail:"compact"/"full" for more per-node data.
+  depth?, maxNodes?})\` — a WHOLE-PAGE read (no nodeId) defaults to \`sparse\`
+  because a page can be tens of thousands of tokens; pass a nodeId to deep-read
+  one subtree, or detail:"compact"/"full" for more per-node data. Capped at
+  \`maxNodes\` (3000) — \`truncated: true\` means read a subtree instead.
+  \`scanNodesByTypes(types, {limit?})\` returns 200 by default (\`hasMore\`).
 - \`readSelection({ detail?, depth? })\` — deep read of the CURRENT selection in
   one call (ids, types, bounds, text, fills). The entry point for editing what
   the user picked: readSelection → modify → layoutAudit.
@@ -267,7 +269,8 @@ These change existing nodes rather than drawing new ones. See the
 - \`screenshot({nodeId, scale})\`, \`exportNode({nodeId, format})\`. PNG/JPG come
   back as a real image the model can SEE (an MCP image block), not a base64 text
   blob — so a screenshot is a genuine visual check, not a token sink. Still take
-  ONE at the end, not repeatedly. SVG/PDF return as data.
+  ONE at the end, not repeatedly. SVG/PDF return as data. The scale is lowered
+  so the longest side stays ≤ 4096px.
 - \`layoutAudit(nodeId)\` — structured verify.
 
 ## Misc

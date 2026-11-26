@@ -95,12 +95,12 @@ Returns rich diagnostics — never a bare boolean:
 | `get_document_info` | — | Root document metadata. |
 | `get_selection` | — | Currently selected node(s) in Figma (shallow — id/name/type). |
 | `read_selection` | — (optional `detail`, `depth`) | **Deep**-read the current selection in one call — the selection-first editing entry point. Returns `{ count, nodes }`. |
-| `get_design_context` | — (optional `nodeId`, `detail`, `depth`) | `detail: "sparse" \| "compact" \| "full" \| "design"`. A whole-page read (no `nodeId`) defaults to `sparse` since a page can be huge; a scoped read (with `nodeId`) defaults to `compact`. Depth-limited traversal. At `design` detail, paints/effects/typography are compacted (solid fills as hex, Figma-default fields omitted, empty arrays dropped). |
+| `get_design_context` | — (optional `nodeId`, `detail`, `depth`, `maxNodes`) | `detail: "sparse" \| "compact" \| "full" \| "design"`. A whole-page read (no `nodeId`) defaults to `sparse` since a page can be huge; a scoped read (with `nodeId`) defaults to `compact`. Depth-limited traversal. At `design` detail, paints/effects/typography are compacted (solid fills as hex, Figma-default fields omitted, empty arrays dropped). At most `maxNodes` nodes (default 3000, breadth-first); a capped read sets `truncated` and marks the cut nodes `childrenTruncated`. |
 | `get_node` | `nodeId` (non-empty string) | Single node by id. |
 | `get_nodes` | `nodeIds` (array, min 1) | Batch node fetch. |
 | `search_nodes` | `query`, optional `nodeId`, `types`, `limit` | Search by name/type/text. Default `limit` is `50`; when more matched, the result carries `hasMore`/`totalMatched`. |
 | `scan_text_nodes` | — | Enumerate text nodes (e.g. for i18n or QA sweeps). |
-| `scan_nodes_by_types` | type filter params | Enumerate nodes matching given types. |
+| `scan_nodes_by_types` | `types` (optional `nodeId`, `limit`) | Enumerate nodes matching given types. Default `limit` 200; `hasMore` / `totalMatched` say when more matched. |
 | `get_styles` | — | Paint/text/effect styles. |
 | `get_variables` | — | Variable collections, modes, and variables. |
 | `get_components` | — (optional `detail`, `depth`, `includeAnatomy`) | Local components / component sets. Default keeps a compact `id/name/type/key` shape; `detail:"design"` includes properties, variants and text layers. Add `includeAnatomy:true` for bounded subtree anatomy. |
@@ -113,7 +113,7 @@ Returns rich diagnostics — never a bare boolean:
 | `check_component_map` | `map` | Does the map still describe the file? Errors for a missing component, variant, value or property, and for a `fixed` key or value Figma does not have; warnings for Figma values with no code value, Figma properties the map never sets, and a mapped name that several components share (the first in the file is checked). |
 | `get_library_component` | `key` | Import a component from a **published shared library** by key and read it richly — the serialization doubles as a reconstruction spec. The import races an internal timeout, with a hint pointing at library publish/permission issues. |
 | `get_design_system_kit` | — (same evidence/depth limits as `generate_design_md`) | Structured JSON source: file/pages, rich styles/variables, local and external components, usage, screen summaries, observed patterns and extraction coverage. |
-| `screenshot` | optional `nodeId`, `scale` | PNG returned as a real MCP **image block** the model can see (not a base64 text dump), so it counts as image tokens, not thousands of text tokens. `scale` defaults to `0.6` — tuned for cheap verification renders, not pixel-perfect export. |
+| `screenshot` | optional `nodeId`, `scale` | PNG returned as a real MCP **image block** the model can see (not a base64 text dump), so it counts as image tokens, not thousands of text tokens. `scale` defaults to `0.6` — tuned for cheap verification renders, not pixel-perfect export. The scale is lowered so the longest side stays within 4096px (a warning says so) — a whole-page capture of a large canvas no longer runs out of memory. |
 | `export_node` | `nodeId` | Export as PNG/SVG/JPG/PDF (format passed in params). |
 | `get_fonts` | families list | Availability check for a list of font families — use before assuming a font will render. |
 | `export_tokens` | — (optional `format`, `collection`, `mode`) | Export Figma Variables as design tokens: `format: "dtcg"` (default) \| `"css"` \| `"tailwind"`. The write-side twin is `import_tokens` (two-way tokens). |
