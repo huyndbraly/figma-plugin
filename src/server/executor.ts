@@ -51,6 +51,14 @@ import { validateOperation, isReadOp } from "./validate.js";
 import { loadIconSvg, searchIcons as searchIconsSvc, type Fetcher, type IconLibrary } from "./icons.js";
 import { runUserflow } from "./userflow.js";
 import { translateProps, type ComponentMap, type Translated } from "../shared/component-map.js";
+import {
+  restRenderer,
+  restTargets,
+  writeAssets,
+  type ExportAssetsOptions,
+  type ExportTarget,
+  type RestFetch,
+} from "./assets-export.js";
 
 /**
  * A single op runner: validate → dispatch → unwrap. This IS the leader-direct
@@ -85,6 +93,10 @@ export interface ExecutorDeps {
   imageFetch?: ImageFetch;
   /** Injectable for tests — DNS for loadImage's address check. */
   resolveHost?: HostResolver;
+  /** Injectable for tests — the transport exportAssets' REST fallback calls api.figma.com with. */
+  restFetch?: RestFetch;
+  /** Injectable for tests — the personal access token for the REST fallback (default: FIGMA_TOKEN). */
+  figmaToken?: string;
 }
 
 export interface WriteResult {
@@ -1121,6 +1133,88 @@ function buildFigmaProxy(
   // forwarding, matching the documented loadImage(url|base64) contract.
   proxy["loadImage"] = async (source: unknown, opts?: Record<string, unknown>) =>
     call("load_image", { base64: await resolveImageSource(source, deps), ...(isObj(opts) ? opts : {}) });
+
+  // exportAssets: render many nodes and write them into the codebase. The
+  // plugin renders (exportAsync — local, no rate limit); the SERVER writes the
+  // files, so the bytes never cross the agent's context — it gets paths back.
+  // With no window connected, a fileKey + FIGMA_TOKEN switch it to REST.
+  proxy["exportAssets"] = async (targets: unknown, opts?: Record<string, unknown>) => {
+    const o = (isObj(opts) ? opts : {}) as unknown as ExportAssetsOptions & { selection?: boolean; childrenOf?: string };
+    const t = isObj(targets) ? (targets as Record<string, unknown>) : {};
+    const ids: string[] = Array.isArray(targets)
+      ? targets.map((x) => (isObj(x) && typeof (x as { id?: unknown }).id === "string" ? (x as { id: string }).id : String(x)))
+      : typeof targets === "string" && targets !== "selection"
+        ? [targets]
+        : Array.isArray(t.nodeIds)
+          ? (t.nodeIds as unknown[]).map(String)
+          : [];
+    const selection = targets === "selection" || t.selection === true || o.selection === true;
+    const childrenOf = typeof t.childrenOf === "string" ? t.childrenOf : typeof o.childrenOf === "string" ? o.childrenOf : undefined;
+    if (!ids.length && !selection && !childrenOf) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        "exportAssets needs something to export.",
+        'Pass node ids (["12:3", "12:4"]), "selection", or { childrenOf: frameId } — e.g. exportAssets({ childrenOf: iconsFrameId }, { dir: "/abs/path/assets", formats: ["SVG"] }).',
+      );
+    }
+    let source = o.source ?? "auto";
+    if (source === "auto") {
+      const channels = (await call("list_channels", {})) as unknown[] | { channels?: unknown[] };
+      const n = Array.isArray(channels) ? channels.length : Array.isArray(channels?.channels) ? channels.channels.length : 0;
+      source = n > 0 ? "plugin" : "rest";
+    }
+    if (source === "rest") {
+      const token = deps.figmaToken ?? process.env.FIGMA_TOKEN;
+      if (!o.fileKey || !token) {
+        throw new OpError(
+          ErrorCode.NOT_CONNECTED,
+          "No Figma window is connected, and the REST fallback is not set up.",
+          !o.fileKey
+            ? "Open the file and run the plugin — or pass { fileKey } (from the file URL) with FIGMA_TOKEN set on the MCP server to export through the REST API."
+            : "Set FIGMA_TOKEN (a personal access token) in the MCP server's environment, or open the file and run the plugin.",
+        );
+      }
+      if (selection || childrenOf) {
+        throw new OpError(ErrorCode.INVALID_PARAMS, "The REST fallback needs explicit node ids.", "Selection and childrenOf need the plugin; pass ids instead (?node-id=1-2 in a URL is 1:2).");
+      }
+      const restFetch: RestFetch = deps.restFetch ?? ((u, init) => fetch(u, init));
+      const list = await restTargets(o.fileKey, ids, token, restFetch, deps.signal);
+      const download = async (url: string): Promise<Uint8Array> => {
+        const res = await fetchImageFollowingSafeRedirects(url, deps.imageFetch, deps.resolveHost, deps.signal);
+        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
+        return new Uint8Array(await res.arrayBuffer());
+      };
+      return writeAssets(list, o, restRenderer(o.fileKey, token, ids, download, restFetch, deps.signal), "rest");
+    }
+    // Plugin: resolve names (one round trip), then render one file at a time.
+    let list: ExportTarget[];
+    if (selection) {
+      const r = (await call("get_selection", { detail: "sparse" })) as { selection?: Array<{ id: string; name: string; set?: string }> };
+      list = (r.selection ?? []).map((n) => ({ nodeId: n.id, name: n.set ? `${n.set}/${n.name}` : n.name }));
+      if (!list.length) throw new OpError(ErrorCode.INVALID_PARAMS, "Nothing is selected in Figma.", "Select the layers to export, or pass their ids.");
+    } else if (childrenOf) {
+      const r = (await call("get_node", { nodeId: childrenOf, includeChildren: true, detail: "sparse" })) as { children?: Array<{ id: string; name: string; set?: string; visible?: boolean }> };
+      list = (r.children ?? []).filter((c) => c.visible !== false).map((c) => ({ nodeId: c.id, name: c.set ? `${c.set}/${c.name}` : c.name }));
+      if (!list.length) throw new OpError(ErrorCode.INVALID_PARAMS, `"${childrenOf}" has no visible children to export.`, "Pass the frame that holds the icons, or ids.");
+    } else {
+      const r = (await call("get_nodes", { nodeIds: ids, detail: "sparse" })) as { nodes?: Array<{ id: string; name?: string; set?: string; missing?: boolean }> };
+      const missing = (r.nodes ?? []).filter((n) => n.missing).map((n) => n.id);
+      if (missing.length) throw new OpError(ErrorCode.NODE_NOT_FOUND, `No node with id ${missing.map((m) => `"${m}"`).join(", ")}.`, "Ids change between files and sessions; read them again (get_selection / search_nodes).");
+      // A variant is named after its set too: "Button/Size=sm" — on its own,
+      // "size-sm" from two sets would collide and say nothing.
+      list = (r.nodes ?? []).map((n) => ({ nodeId: n.id, name: n.set ? `${n.set}/${n.name ?? n.id}` : (n.name ?? n.id) }));
+    }
+    return writeAssets(
+      list,
+      o,
+      async (target, format, scale) => {
+        const r = (await call("export_node", { nodeId: target.nodeId, format, ...(scale !== undefined ? { scale } : {}) })) as { base64?: string };
+        if (typeof r?.base64 !== "string") throw new Error("the plugin returned no image data");
+        return new Uint8Array(Buffer.from(r.base64, "base64"));
+      },
+      "plugin",
+    );
+  };
 
   // Code ↔ Figma component map. The map lives in the CODEBASE (the agent reads
   // it and hands it over once per session); render() translates code props to

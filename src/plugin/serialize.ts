@@ -54,6 +54,9 @@ export function serializeNode(
     type: node.type,
     ...geom(node),
   };
+  // A variant's own name ("Size=sm, State=hover") does not say WHICH component
+  // it is; the set's name does. Cheap, and every reader wants it.
+  if (node.type === "COMPONENT" && node.parent?.type === "COMPONENT_SET") base.set = node.parent.name;
   if (detail === "sparse") return base;
 
   if ("visible" in node && !(node as SceneNode).visible) base.visible = false;

@@ -372,10 +372,15 @@ await figma.setupTokens({ colors: { surface: { light: "#FFFFFF", dark: "#0B0B0F"
 | `searchIcons` | `searchIcons(query)` | Resolves candidate canonical names across icon libraries via a cross-library alias map. **Never fetches an SVG** — cheap, use it to pick before paying for a `loadIcon` call. |
 | `loadIcon` | `loadIcon(name, { library, size, color, parentId, x?, y?, inset?, align?, insertAt? })` | Fetches the SVG server-side (from unpkg, 15 s timeout), caches it on disk, and hands it to the plugin to draw as vector nodes; the placement options are the same as `create`'s. Libraries: `lucide` (default), `ionicons`, `tabler`, `bootstrap-icons`. |
 | `loadImage` | `loadImage(urlOrBase64)` | Load an image (URL or base64) onto the canvas. |
+| `exportAssets` | `exportAssets(targets, { dir, formats?, scales?, scaleNaming?, kebab?, folders?, overwrite?, source?, fileKey? })` | Render many nodes and **write them into a folder of your codebase**; the result is only paths and sizes, so the image bytes never enter the agent's context. `targets`: ids, `"selection"`, or `{ childrenOf: frameId }` (its visible children — an icons frame). `dir` must be ABSOLUTE (the server's working directory is not your project). `formats`: `PNG` (default) / `JPG` / `SVG` / `PDF`. `scales` (raster only, ≤ 4): `[1, 2, 3]`, named `name@2x.png` (`scaleNaming: "ios"`, default), `drawable-xhdpi/name.png` (`"android"`) or `name-2x.png` (`"web"`). File names come from layer names (`"Icon/Arrow Left"` → `icon-arrow-left`; `folders: true` keeps `icon/arrow-left`); clashes get `-2`. Existing files are skipped unless `overwrite: true`. Rendering is done by the plugin (`exportAsync`): local, no API rate limit. With no window connected, `{ fileKey }` plus `FIGMA_TOKEN` on the server exports through the REST API instead (`/v1/images`, batched, `429` retried). Limits: 1000 files / 500 MB per call. |
 
 ```js
 const candidates = await figma.searchIcons("visibility"); // → [{ name: "eye", alias: "visibility", libraries: [...] }]
 await figma.loadIcon("visibility", { library: "lucide", size: 24, color: "#F5F5F7", parentId: btn.id });
+
+// Every icon in the "Icons" frame as SVG, and the illustrations at 1x/2x/3x for iOS:
+await figma.exportAssets({ childrenOf: iconsFrameId }, { dir: "/Users/me/app/src/assets/icons", formats: ["SVG"] });
+await figma.exportAssets(["12:3", "12:9"], { dir: "/Users/me/app/ios/Assets", formats: ["PNG"], scales: [1, 2, 3] });
 ```
 
 Common aliases: `visibility → eye`, `delete → trash`, `done`/`checkmark → check`, `close`/`cancel → x`, `add → plus`, `edit → pencil`, `settings → gear`, `more → more-horizontal`, `back → arrow-left`, `logout → log-out`, and roughly 40 more. Unknown names pass through unchanged. A miss throws `NODE_NOT_FOUND` with a hint to retry `searchIcons` or try a different `library`.
