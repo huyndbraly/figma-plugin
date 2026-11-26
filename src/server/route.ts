@@ -35,6 +35,14 @@ export type RouteArg =
       page?: string;
     };
 
+/** A window that disconnected, as it looked when it left. */
+export interface GoneWindow {
+  channel: string;
+  fileName: string;
+  pageName: string;
+  goneAt: number;
+}
+
 export interface RouteInput {
   channel?: string;
   file?: string;
@@ -42,7 +50,17 @@ export interface RouteInput {
   sessionId?: string;
   sessionBoundChannel?: string;
   sessionBoundSource?: "user" | "auto";
+  /** What the session's bound window showed when it was last connected. */
+  sessionBoundLast?: { fileName: string; pageName: string };
   windows: RouteWindow[];
+  /**
+   * Windows that disconnected recently. One that left less than `graceMs` ago
+   * is most likely reconnecting (plugin reload, server takeover, a sleeping
+   * laptop): an op that would have gone there waits for it instead of landing
+   * on whichever window happens to still be connected.
+   */
+  gone?: GoneWindow[];
+  graceMs?: number;
   now?: number;
 }
 
@@ -70,10 +88,23 @@ export type RouteDecision =
       code: typeof ErrorCode.AMBIGUOUS_CHANNEL | typeof ErrorCode.CHANNEL_NOT_FOUND;
       message: string;
       hint: string;
+      /**
+       * Not final: the window this op belongs to disconnected moments ago.
+       * Hold the op until this time (epoch ms) and resolve again when a
+       * window says hello; only then is the failure the answer.
+       */
+      waitUntil?: number;
     };
 
 /** User activity older than this is not "the window they are working in". */
 export const USER_ACTIVITY_FRESH_MS = 5 * 60 * 1000;
+
+/**
+ * How long a disconnected window keeps its claim on the ops meant for it. A
+ * plugin reload, a server takeover or a woken laptop reconnects well inside
+ * this; a window still missing after it has really gone.
+ */
+export const RECONNECT_GRACE_MS = 15_000;
 
 export function parseRouteArg(route?: RouteArg): {
   channel?: string;
@@ -199,8 +230,78 @@ function filePageNotice(w: RouteWindow): string {
   return `This session now targets "${w.fileName || "untitled"}" · "${w.pageName || "?"}". Later calls stay here unless you pass a different file/page. Other agents on other files or pages (separate windows) run in parallel.`;
 }
 
+/** The routing steps that guess rather than follow an instruction. */
+const GUESSES = new Set<RouteReason>(["single", "same-file", "focus"]);
+
 export function resolveRoute(input: RouteInput): RouteDecision {
   const now = input.now ?? Date.now();
+  const grace = input.graceMs ?? RECONNECT_GRACE_MS;
+  const live = new Set(input.windows.map((w) => w.channel));
+  const recent = (input.gone ?? []).filter((g) => !live.has(g.channel) && now - g.goneAt < grace);
+  const explicit = Boolean(input.channel?.trim() || input.file?.trim() || input.page?.trim());
+
+  // A session pinned to a window that is reconnecting waits for THAT window.
+  // Falling through to "single"/"focus" here silently re-pinned the session
+  // to another file for good the moment its own window blinked.
+  const bound = input.sessionBoundChannel;
+  if (!explicit && bound && !live.has(bound)) {
+    const g = recent.find((x) => x.channel === bound);
+    if (g) {
+      return {
+        ok: false,
+        code: ErrorCode.CHANNEL_NOT_FOUND,
+        message: `This session's Figma window (${describeGone(g)}) is reconnecting.`,
+        hint: "Wait a few seconds and retry; figma_status shows when it is back.",
+        waitUntil: g.goneAt + grace,
+      };
+    }
+  }
+
+  const decision = resolveCore({ ...input, now });
+  if (recent.length === 0) return decision;
+
+  // Would a window that left moments ago have changed the answer? Then the
+  // answer is not ready yet: an explicit target may be that window, and a
+  // guess ("the only window", "the focused one") made while it is away may
+  // be the wrong file.
+  if (decision.ok && !GUESSES.has(decision.reason)) return decision;
+  const withGone = resolveCore({
+    ...input,
+    now,
+    windows: [
+      ...input.windows,
+      ...recent.map((g) => ({
+        channel: g.channel,
+        fileName: g.fileName,
+        pageName: g.pageName,
+        lastUserActivityAt: 0,
+        queueLength: 0,
+      })),
+    ],
+  });
+  if (decision.ok) {
+    if (withGone.ok && withGone.channel === decision.channel) return decision;
+    return {
+      ok: false,
+      code: ErrorCode.AMBIGUOUS_CHANNEL,
+      message: `A Figma window (${recent.map(describeGone).join("; ")}) disconnected moments ago — waiting for it before guessing which window this op is for.`,
+      hint: "Pass file (and page) to target a window directly.",
+      waitUntil: Math.max(...recent.map((g) => g.goneAt + grace)),
+    };
+  }
+  if (withGone.ok) {
+    const g = recent.find((x) => x.channel === withGone.channel);
+    if (g) return { ...decision, waitUntil: g.goneAt + grace };
+  }
+  return decision;
+}
+
+function describeGone(g: GoneWindow): string {
+  return `"${g.fileName || "untitled"}" · "${g.pageName || "?"}", channel ${g.channel}`;
+}
+
+function resolveCore(input: RouteInput & { now: number }): RouteDecision {
+  const now = input.now;
   const windows = input.windows;
   const channel = input.channel?.trim() ?? "";
   const file = input.file?.trim() ?? "";
@@ -350,6 +451,35 @@ export function resolveRoute(input: RouteInput): RouteDecision {
             : undefined,
       };
     }
+    // The bound window is gone (past the reconnect grace — resolveRoute
+    // waits inside it). If it came back under a new channel — the only
+    // window of that file, or the one on its page — follow it there.
+    // Anything else would be a guess at another file: refuse, and say which
+    // file the session was on.
+    const last = input.sessionBoundLast;
+    const fileKey = last ? normalizeName(last.fileName) : "";
+    if (last && fileKey) {
+      const sameFile = windows.filter((x) => normalizeName(x.fileName) === fileKey);
+      const onPage = sameFile.filter((x) => normalizeName(x.pageName) === normalizeName(last.pageName));
+      const back =
+        sameFile.length === 1 ? sameFile[0] : onPage.length > 0 ? collapseSamePage(onPage) : undefined;
+      if (back) {
+        return {
+          ok: true,
+          channel: back.channel,
+          reason: "session",
+          notice: `This session's Figma window ("${last.fileName}") reconnected as channel "${back.channel}"; the session now targets "${back.fileName || "untitled"}" · "${back.pageName || "?"}".`,
+        };
+      }
+    }
+    return {
+      ok: false,
+      code: ErrorCode.CHANNEL_NOT_FOUND,
+      message: last
+        ? `The Figma window this session was working in ("${last.fileName || "untitled"}" · "${last.pageName || "?"}", channel ${input.sessionBoundChannel}) is no longer connected.`
+        : `The Figma window this session was working in (channel ${input.sessionBoundChannel}) is no longer connected.`,
+      hint: `Connected: ${describeWindows(windows) || "none"}. Reopen the plugin in that file, or pass file (and page) to point this session at another window — it will not guess a different file.`,
+    };
   }
 
   // 5. Single window.

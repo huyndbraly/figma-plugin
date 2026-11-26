@@ -55,6 +55,46 @@ export interface HealthPayload {
   pendingCount?: number;
 }
 
+/**
+ * What answers on a port. Election and failover need more than "healthy or
+ * not": `refused` means nobody listens (the leader is dead — take over now),
+ * `busy` means something accepted the connection but did not answer in time
+ * (a leader whose event loop is blocked by a long op is NOT dead, and moving
+ * to the next port made a second leader with no plugin behind it), and
+ * `foreign` means something answered that is not a Figma Plugin MCP leader.
+ */
+export type PortState = "ok" | "refused" | "busy" | "foreign";
+
+/**
+ * The leader could not be reached before it sent a single byte back.
+ * `refused`: nothing was listening, so the request never reached anyone and
+ * is safe to send again. `reset`: the connection died under it — the
+ * leader may have started on it.
+ */
+export class LeaderUnreachable extends OpError {
+  constructor(
+    readonly kind: "refused" | "reset",
+    message: string,
+  ) {
+    super(
+      ErrorCode.NOT_CONNECTED,
+      message,
+      "Could not reach the leader server on /rpc — it may have died; takeover will be attempted.",
+    );
+  }
+}
+
+/** Is a process with this pid running (on this machine, any owner)? */
+export function pidAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as { code?: string }).code === "EPERM";
+  }
+}
+
 export class Follower {
   constructor(public readonly info: LeaderInfo) {}
 
@@ -62,6 +102,42 @@ export class Follower {
   static async checkHealth(port: number, timeoutMs = 1500): Promise<boolean> {
     const payload = await Follower.fetchHealth(port, timeoutMs);
     return payload?.ok === true;
+  }
+
+  /** GET /health, classified — see PortState. */
+  static probe(port: number, timeoutMs = 1500): Promise<PortState> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (state: PortState) => {
+        if (done) return;
+        done = true;
+        resolve(state);
+      };
+      const req = httpRequest(
+        { host: "127.0.0.1", port, path: "/health", method: "GET", timeout: timeoutMs },
+        (res) => {
+          let data = "";
+          res.setEncoding("utf8");
+          res.on("data", (c) => (data += c));
+          res.on("error", () => finish("busy"));
+          res.on("end", () => {
+            try {
+              finish((JSON.parse(data) as HealthPayload)?.ok === true ? "ok" : "foreign");
+            } catch {
+              finish("foreign");
+            }
+          });
+        },
+      );
+
+      // Refused, or reset before any answer: nothing usable listens here.
+      req.on("error", () => finish("refused"));
+      req.on("timeout", () => {
+        finish("busy");
+        req.destroy();
+      });
+      req.end();
+    });
   }
 
   /**
@@ -119,6 +195,8 @@ export class Follower {
       extendWhileAlive?: boolean;
       file?: string;
       page?: string;
+      /** The caller stopped waiting: close the request so the leader drops the op. */
+      signal?: AbortSignal;
     },
   ): Promise<unknown> {
     const body = JSON.stringify({
@@ -143,7 +221,25 @@ export class Follower {
     return new Promise((resolve, reject) => {
       let watchdog: NodeJS.Timeout | undefined;
       let checking = false;
+      let answered = false;
+      let settled = false;
+      const signal = opts?.signal;
+      const onAbort = () => {
+        req.destroy();
+        settle(() =>
+          reject(
+            new OpError(
+              ErrorCode.PLUGIN_TIMEOUT,
+              `Forward of "${op}" was cancelled — the call stopped waiting.`,
+              "If it was still queued on the leader it was dropped; one already sent to Figma may have run.",
+            ),
+          ),
+        );
+      };
       const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
         if (watchdog) {
           clearInterval(watchdog);
           watchdog = undefined;
@@ -163,6 +259,7 @@ export class Follower {
           },
         },
         (res) => {
+          answered = true;
           let data = "";
           res.setEncoding("utf8");
           res.on("data", (c) => (data += c));
@@ -221,7 +318,30 @@ export class Follower {
           });
         },
       );
-      req.on("error", (err) => settle(() => reject(toOpError(err))));
+      req.on("error", (err) =>
+        settle(() => {
+          const code = (err as { code?: string }).code;
+          // Tagged so the coordinator can take over at once instead of
+          // waiting 3–5s for the health monitor to notice.
+          if (!answered && (code === "ECONNREFUSED" || code === "ECONNRESET")) {
+            reject(
+              new LeaderUnreachable(
+                code === "ECONNREFUSED" ? "refused" : "reset",
+                `Leader on port ${this.info.port} is unreachable (${code}).`,
+              ),
+            );
+            return;
+          }
+          reject(toOpError(err));
+        }),
+      );
+      if (signal) {
+        if (signal.aborted) {
+          queueMicrotask(onAbort);
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+      }
       const timeoutError = (hint: string) =>
         new OpError(
           ErrorCode.PLUGIN_TIMEOUT,
