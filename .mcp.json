@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "figma-plugin": {
+      "type": "stdio",
+      "command": "./scripts/figma-plugin-mcp.sh",
+      "args": []
+    }
+  }
+}
