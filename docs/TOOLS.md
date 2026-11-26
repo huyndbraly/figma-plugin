@@ -88,6 +88,21 @@ Returns rich diagnostics — never a bare boolean:
 
 `op` must be one of the read operations below. `params` is passed through to the plugin; unknown/extra keys are tolerated (schemas are permissive on shape, strict on identity fields like `nodeId`).
 
+#### Reading from a Figma link
+
+Pass `params.url` — the link from Figma's right-click → **Copy link to selection** — instead of a `nodeId`:
+
+```json
+{ "op": "get_design_context", "params": { "url": "https://www.figma.com/design/AbC123/My-App?node-id=12-345", "detail": "compact" } }
+```
+
+- The node id comes from the link (`12-345` → `12:345`).
+- **The file is open in a connected window** (matched by the file name in the link): the read goes through the plugin, as any other read, and the session moves to that window.
+- **It is not open** and the MCP server has `FIGMA_TOKEN` (a personal access token in its environment — never paste a token into the chat): the read goes through the REST API and comes back in the **same compact shape** as a plugin read (x/y relative to the parent, colours as hex, defaults dropped, `maxNodes` 3000), not the raw REST JSON. Responses are cached for 60 s; `429` is retried. REST answers `get_document_info`, `get_node`, `get_nodes`, `get_design_context`, `screenshot` and `export_node`; every other op says it needs the plugin.
+- Neither: the error says which file the link names and how to open it or set the token.
+
+`figma.exportAssets(link, { dir })` takes a link too: the plugin renders when this call's window is that file, otherwise the REST API does (with `FIGMA_TOKEN`).
+
 ### Read operations
 
 | Operation | Required params | Notes |

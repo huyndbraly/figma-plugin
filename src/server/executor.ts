@@ -51,6 +51,7 @@ import { validateOperation, isReadOp } from "./validate.js";
 import { loadIconSvg, searchIcons as searchIconsSvc, type Fetcher, type IconLibrary } from "./icons.js";
 import { runUserflow } from "./userflow.js";
 import { translateProps, type ComponentMap, type Translated } from "../shared/component-map.js";
+import { fileNameKey, parseFigmaLink } from "../shared/figma-url.js";
 import {
   restRenderer,
   restTargets,
@@ -1139,7 +1140,27 @@ function buildFigmaProxy(
   // files, so the bytes never cross the agent's context — it gets paths back.
   // With no window connected, a fileKey + FIGMA_TOKEN switch it to REST.
   proxy["exportAssets"] = async (targets: unknown, opts?: Record<string, unknown>) => {
-    const o = (isObj(opts) ? opts : {}) as unknown as ExportAssetsOptions & { selection?: boolean; childrenOf?: string };
+    const o = { ...(isObj(opts) ? opts : {}) } as unknown as ExportAssetsOptions & { selection?: boolean; childrenOf?: string; url?: string };
+    // A Figma link (Copy link to selection) names the file and the node.
+    const link = parseFigmaLink(typeof targets === "string" ? targets : o.url);
+    let linkFileMatches: boolean | undefined;
+    if (link) {
+      if (!link.nodeId) {
+        throw new OpError(ErrorCode.INVALID_PARAMS, "This Figma link points at a file, not a layer.", "Right-click the layer in Figma → Copy link to selection (the link then carries ?node-id=…).");
+      }
+      targets = [link.nodeId];
+      o.fileKey = o.fileKey ?? link.fileKey;
+      if ((o.source ?? "auto") === "auto") {
+        // Plugin only if THIS call's window is the linked file; another open
+        // file would happily export a node with the same id from the wrong file.
+        const channels = (await call("list_channels", {})) as unknown[];
+        if (Array.isArray(channels) && channels.length) {
+          const info = (await call("get_document_info", {})) as { fileName?: string };
+          linkFileMatches = !!link.slug && fileNameKey(info?.fileName ?? "") === fileNameKey(link.slug);
+        } else linkFileMatches = false;
+        o.source = linkFileMatches ? "plugin" : "rest";
+      }
+    }
     const t = isObj(targets) ? (targets as Record<string, unknown>) : {};
     const ids: string[] = Array.isArray(targets)
       ? targets.map((x) => (isObj(x) && typeof (x as { id?: unknown }).id === "string" ? (x as { id: string }).id : String(x)))
@@ -1165,6 +1186,13 @@ function buildFigmaProxy(
     }
     if (source === "rest") {
       const token = deps.figmaToken ?? process.env.FIGMA_TOKEN;
+      if (link && linkFileMatches === false && !token) {
+        throw new OpError(
+          ErrorCode.NOT_CONNECTED,
+          "The file in this link is not the one this call is working in, and the REST fallback is not set up.",
+          "Pass file: \"<that file's name>\" to figma_write (with the file open and the plugin running), or set FIGMA_TOKEN on the MCP server.",
+        );
+      }
       if (!o.fileKey || !token) {
         throw new OpError(
           ErrorCode.NOT_CONNECTED,
