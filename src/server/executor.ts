@@ -48,6 +48,7 @@ import type { Session } from "./session.js";
 import { validateOperation, isReadOp } from "./validate.js";
 import { loadIconSvg, searchIcons as searchIconsSvc, type Fetcher, type IconLibrary } from "./icons.js";
 import { runUserflow } from "./userflow.js";
+import { translateProps, type ComponentMap, type Translated } from "../shared/component-map.js";
 
 /**
  * A single op runner: validate → dispatch → unwrap. This IS the leader-direct
@@ -145,6 +146,14 @@ const METHOD_TO_OP: Record<string, AnyOperation> = {
   exposeNestedInstance: "expose_nested_instance",
   detachInstance: "detach_instance",
   resetInstanceOverrides: "reset_instance_overrides",
+  // Quality audits.
+  a11yAudit: "a11y_audit",
+  auditDesignSystem: "audit_design_system",
+  applyDesignSystem: "apply_design_system",
+  responsiveAudit: "responsive_audit",
+  // Code ↔ Figma component map (render/useComponentMap are custom below).
+  exportComponentMap: "export_component_map",
+  checkComponentMap: "check_component_map",
   // read ops usable from write code
   readSelection: "read_selection",
   getNodeById: "get_node",
@@ -968,6 +977,50 @@ function buildFigmaProxy(
     return call("load_image", { base64, ...opts });
   };
 
+  // Code ↔ Figma component map. The map lives in the CODEBASE (the agent reads
+  // it and hands it over once per session); render() translates code props to
+  // the Figma variant/properties and instantiates — same component, same
+  // variant, same property keys as the code says.
+  proxy["useComponentMap"] = (map: unknown) => {
+    if (!isObj(map) || !isObj((map as Record<string, unknown>).components)) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        "useComponentMap expects { components: { CodeName: { figma, props?, children? } } }.",
+        "Start one with figma.exportComponentMap(), save it in the codebase, then pass it here.",
+      );
+    }
+    session.state.componentMap = map;
+    stateOverlay["componentMap"] = map;
+    return { components: Object.keys((map as ComponentMap).components).length };
+  };
+  proxy["render"] = async (codeName: string, props: Record<string, unknown> = {}, opts: Record<string, unknown> = {}) => {
+    const { map: inline, ...rest } = isObj(opts) ? (opts as Record<string, unknown>) : {};
+    const map = (inline ?? session.state.componentMap) as ComponentMap | undefined;
+    if (!map || !isObj(map.components)) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        "No component map in this session.",
+        "Call figma.useComponentMap(map) first (or pass { map } as the third argument).",
+      );
+    }
+    let t: Translated;
+    try {
+      t = translateProps(map, codeName, isObj(props) ? props : {});
+    } catch (e) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, (e as Error).message, "Add it to the map, or render a name the map has.");
+    }
+    if (t.unmapped.length) {
+      const w = `render(${codeName}): props not in the map, ignored — ${t.unmapped.join(", ")}.`;
+      if (!warnings.includes(w)) warnings.push(w);
+    }
+    return call("instantiate", {
+      component: t.component,
+      ...(Object.keys(t.variant).length ? { variant: t.variant } : {}),
+      ...(Object.keys(t.properties).length ? { properties: t.properties } : {}),
+      ...rest,
+    });
+  };
+
   // Official-plugin-API muscle memory → the sandbox equivalent. Each entry is
   // a method agents reach for reflexively; calling it explains the mapping
   // instead of dying with a bare "not a function".
@@ -1347,6 +1400,28 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
         : Array.isArray(second)
           ? { nodeId: first, overrides: second }
           : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "a11y_audit":
+    case "audit_design_system":
+    case "apply_design_system":
+    case "responsive_audit":
+      // auditX(nodeId?, opts?) or auditX({nodeId, ...})
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : first === undefined
+          ? {}
+          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "export_component_map":
+      // exportComponentMap("button") / (["Button", "Card"]) / ({query|names})
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : Array.isArray(first)
+          ? { names: first, ...(isObj(second) ? (second as object) : {}) }
+          : first === undefined
+            ? {}
+            : { query: first, ...(isObj(second) ? (second as object) : {}) };
+    case "check_component_map":
+      // checkComponentMap(map) — the map itself, or {map}
+      return isObj(first) && "map" in (first as object) ? (first as Record<string, unknown>) : { map: first };
     case "add_component_property":
     case "componentize":
     case "create_variants":

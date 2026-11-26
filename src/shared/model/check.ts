@@ -34,7 +34,32 @@ export function checkConsistency(diagrams: StoredDiagram[]): ConsistencyFinding[
     ...policyDrift(facts),
     ...nameDrift(facts),
     ...iaDrift(facts),
+    ...personaDrift(facts),
   ];
+}
+
+/**
+ * A journey walked by someone the persona cards on the page do not describe.
+ * Matched by name, loosely: "Thu" walks the journey of the card "Thu Trang".
+ * Silent when the page has no persona cards — there is nothing to disagree with.
+ */
+function personaDrift(facts: PageFacts): ConsistencyFinding[] {
+  const cards = facts.who.filter((w) => w.where === "persona card");
+  const walkers = facts.who.filter((w) => w.where === "journey persona");
+  if (!cards.length || !walkers.length) return [];
+  const names = cards.map((c) => normalize(c.name));
+  const out: ConsistencyFinding[] = [];
+  for (const w of walkers) {
+    const n = normalize(w.name);
+    const hit = names.some((c) => c === n || c.startsWith(`${n} `) || n.startsWith(`${c} `) || n.startsWith(`${c},`) || n.includes(c));
+    if (hit) continue;
+    out.push({
+      rule: "persona-drift",
+      message: `"${w.frame}" is walked by "${w.name}", but no persona card on this page describes them (cards: ${cards.map((c) => `"${c.name}"`).join(", ")}). Name the journey after a card, or add the card.`,
+      frames: [w.frame, ...new Set(cards.map((c) => c.frame))],
+    });
+  }
+  return out;
 }
 
 /**

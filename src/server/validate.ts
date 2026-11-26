@@ -86,6 +86,7 @@ const needsNodeId: Record<string, true> = {
   expose_nested_instance: true,
   detach_instance: true,
   reset_instance_overrides: true,
+  responsive_audit: true,
 };
 
 /** Per-op refinements layered on top of the base params object. */
@@ -545,6 +546,64 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   expose_nested_instance: z.object({ nodeId, expose: z.boolean().optional() }).passthrough(),
   detach_instance: z.object({ nodeId }).passthrough(),
   reset_instance_overrides: z.object({ nodeId }).passthrough(),
+
+  // ---- quality audits ----
+  a11y_audit: z
+    .object({
+      nodeId: nodeId.optional(),
+      minTouch: z.number().positive().optional(),
+      minFontSize: z.number().positive().optional(),
+      maxFindings: z.number().int().positive().optional(),
+    })
+    .passthrough(),
+  audit_design_system: z
+    .object({
+      nodeId: nodeId.optional(),
+      kinds: z.array(z.enum(["color", "text", "radius", "spacing"])).optional(),
+      includeInstances: z.boolean().optional(),
+      maxFindings: z.number().int().positive().optional(),
+    })
+    .passthrough(),
+  apply_design_system: z
+    .object({
+      nodeId: nodeId.optional(),
+      kinds: z.array(z.enum(["color", "text", "radius", "spacing"])).optional(),
+      includeInstances: z.boolean().optional(),
+      includeNear: z.boolean().optional(),
+      dryRun: z.boolean().optional(),
+    })
+    .passthrough(),
+  responsive_audit: z
+    .object({
+      nodeId,
+      sizes: z
+        .array(z.union([z.number().positive(), z.string(), z.object({ width: z.number().positive(), height: z.number().positive().optional(), name: z.string().optional() })]))
+        .optional(),
+      presets: z.array(z.string()).optional(),
+      keep: z.boolean().optional(),
+    })
+    .passthrough(),
+  // ---- code ↔ Figma component map ----
+  export_component_map: z
+    .object({
+      query: z.string().optional(),
+      names: z.array(z.string()).optional(),
+      limit: z.number().int().positive().optional(),
+      scope: z.enum(["page", "file"]).optional(),
+    })
+    .passthrough(),
+  check_component_map: z
+    .object({ map: z.object({ components: z.record(z.object({ figma: z.string().trim().min(1) }).passthrough()) }).passthrough() })
+    .passthrough(),
+  // Laid out by the server (figma_diagram); the plugin only draws.
+  create_board: z
+    .object({
+      kind: z.enum(["usecase", "journey", "persona"]),
+      children: z.array(z.record(z.unknown())),
+      w: z.number().positive(),
+      h: z.number().positive(),
+    })
+    .passthrough(),
 };
 
 export interface ValidatedOp {

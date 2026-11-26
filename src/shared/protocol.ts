@@ -7,7 +7,8 @@
  */
 
 // v5: component and instance operations (find_component … swap_component).
-export const PROTOCOL_VERSION = 5;
+// v6: quality audits, component map, create_board (usecase/journey/persona).
+export const PROTOCOL_VERSION = 6;
 
 /** Default bridge port; server falls back to +1..+9 when busy. */
 export const DEFAULT_PORT = 38470;
@@ -48,6 +49,11 @@ export const READ_OPERATIONS = [
   // Components: search by name, and what an instance changed.
   "find_component",
   "get_instance_overrides",
+  // Quality audits and the code ↔ Figma component map.
+  "a11y_audit",
+  "audit_design_system",
+  "export_component_map",
+  "check_component_map",
 ] as const;
 
 /** Write operations executed by the plugin. */
@@ -112,6 +118,12 @@ export const WRITE_OPERATIONS = [
   "expose_nested_instance",
   "detach_instance",
   "reset_instance_overrides",
+  // Bind literal values to the tokens they equal.
+  "apply_design_system",
+  // Clones a screen to other viewports, audits each, removes the clones.
+  "responsive_audit",
+  // Static diagram kinds drawn from server-side layout (use case, journey, persona).
+  "create_board",
 ] as const;
 
 export type ReadOperation = (typeof READ_OPERATIONS)[number];
@@ -314,6 +326,13 @@ export const OP_TIMEOUTS: Partial<Record<Operation, number>> = {
   instantiate: 60_000,
   componentize: 60_000,
   create_variants: 60_000,
+  a11y_audit: 60_000,
+  audit_design_system: 90_000,
+  apply_design_system: 120_000,
+  responsive_audit: 120_000,
+  export_component_map: 60_000,
+  check_component_map: 60_000,
+  create_board: 60_000,
 };
 
 /** Batch requests are split into chunks of this size and streamed. */

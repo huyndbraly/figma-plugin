@@ -90,3 +90,63 @@ describe("component op validation", () => {
     expect(() => validateOperation("detach_instance", {})).toThrow();
   });
 });
+
+describe("code ↔ Figma component map in the sandbox", () => {
+  const MAP = {
+    components: {
+      Button: {
+        figma: "UI/Button",
+        props: { tone: { figma: "Tone", type: "VARIANT", values: { primary: "Primary" } }, showIcon: { figma: "Show icon", type: "BOOLEAN" } },
+        children: "Label",
+      },
+    },
+  };
+
+  it("render() translates code props and instantiates; the map persists across calls", async () => {
+    const r = runner();
+    const session = new SessionRegistry().get();
+    const first = await executeWrite(`figma.useComponentMap(${JSON.stringify(MAP)}); return true;`, session, { runOp: r.runOp });
+    expect(first.ok, JSON.stringify(first.error)).toBe(true);
+    const res = await executeWrite(
+      `return await figma.render("Button", { tone: "primary", showIcon: false, children: "Save", onClick: 1 }, { parentId: "5:5" });`,
+      session,
+      { runOp: r.runOp },
+    );
+    expect(res.ok, JSON.stringify(res.error)).toBe(true);
+    expect(r.calls.at(-1)).toEqual({
+      op: "instantiate",
+      params: expect.objectContaining({
+        component: "UI/Button",
+        variant: { Tone: "Primary" },
+        properties: { "Show icon": false, Label: "Save" },
+        parentId: "5:5",
+      }),
+    });
+    expect(res.warnings.join("\n")).toMatch(/not in the map, ignored — onClick/);
+  });
+
+  it("render() without a map says how to give it one", async () => {
+    const { res } = await run(`return await figma.render("Button", {});`);
+    expect(res.ok).toBe(false);
+    expect(res.error?.hint).toMatch(/useComponentMap/);
+  });
+
+  it("maps the audit and map read ops", async () => {
+    const { calls } = await run(`
+      await figma.a11yAudit("1:1", { minTouch: 48 });
+      await figma.auditDesignSystem();
+      await figma.applyDesignSystem("1:1", { dryRun: true });
+      await figma.responsiveAudit("1:1", { presets: ["ipad"] });
+      await figma.exportComponentMap(["Button"]);
+      await figma.checkComponentMap(${JSON.stringify(MAP)});
+    `);
+    expect(calls.map((c) => [c.op, c.params])).toEqual([
+      ["a11y_audit", { nodeId: "1:1", minTouch: 48 }],
+      ["audit_design_system", {}],
+      ["apply_design_system", { nodeId: "1:1", dryRun: true }],
+      ["responsive_audit", { nodeId: "1:1", presets: ["ipad"] }],
+      ["export_component_map", { names: ["Button"] }],
+      ["check_component_map", { map: MAP }],
+    ]);
+  });
+});

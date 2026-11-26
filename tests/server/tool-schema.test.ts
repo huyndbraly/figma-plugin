@@ -21,16 +21,17 @@ const props = (name: string) => {
 describe("the declared shape of each tool", () => {
   it("figma_diagram is the one that can change a drawing", () => {
     expect(props("figma_diagram")).toEqual([
-      "channel", "diagrams", "edges", "entities", "file", "fragments", "gap", "lanes", "mermaid", "messages",
-      "nodes", "options", "page", "pages", "parentId", "participants", "patch", "place", "relations", "states",
-      "subtitle", "text", "title", "transitions", "type", "update", "x", "y",
+      "actors", "channel", "diagrams", "edges", "entities", "file", "fragments", "gap", "lanes", "links",
+      "mermaid", "messages", "nodes", "options", "page", "pages", "parentId", "participants", "patch", "persona",
+      "personas", "phases", "place", "relations", "source", "states", "subtitle", "system", "text", "title",
+      "transitions", "type", "update", "useCases", "x", "y",
     ]);
   });
 
   it("draws all ten kinds, userflow included", () => {
     const t = TOOLS.find((x) => x.name === "figma_diagram")!;
     const type = (t.inputSchema as any).properties.type;
-    expect(type.enum).toEqual(["activity", "erd", "sequence", "sitemap", "state", "userflow"]);
+    expect(type.enum).toEqual(["activity", "erd", "sequence", "sitemap", "state", "userflow", "usecase", "journey", "persona"]);
     // figma_userflow was folded in: one tool description instead of two, and
     // the second one was 4,314 bytes every session for a kind most sessions
     // never draw.
@@ -80,10 +81,12 @@ describe("the declared shape of each tool", () => {
 describe("what the tool list costs to load", () => {
   it("stays within the budget the token diet set", () => {
     const bytes = JSON.stringify(TOOLS).length;
-    // Six tools and six diagram kinds. 18,425B after
+    // Six tools and nine diagram kinds. Raised from 18,600 to 20,600 when
+    // usecase / journey / persona landed: their per-kind arrays must be
+    // declared (additionalProperties is false), ~1.4KB together. 18,425B after
     // file/page routing: agents were stuck asking the user to click Connect
     // whenever two Figma windows were open. Raise this deliberately, with the
     // reason in the commit message — never to make a red test green.
-    expect(bytes).toBeLessThan(18_600);
+    expect(bytes).toBeLessThan(20_600);
   });
 });

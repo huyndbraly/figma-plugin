@@ -123,6 +123,8 @@ export function isDiagramLayerName(name: string): boolean {
     "ring:",
     "actor:",
     "uc:",
+    "usecase:",
+    "journey:",
     "phase:",
     "persona:",
     "rail:",
