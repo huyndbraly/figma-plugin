@@ -28,7 +28,7 @@ const OP_SET = new Set<string>([...OPERATIONS, ...SERVER_OPERATIONS]);
  *  require a non-empty trimmed string; the plugin resolves the real node. */
 const nodeId = z.string().trim().min(1, "nodeId must be a non-empty string");
 
-const params = z.record(z.unknown());
+const params = z.record(z.string(), z.unknown());
 
 const styleKind = z
   .string()
@@ -111,7 +111,7 @@ function liftComponentKey<T extends z.ZodTypeAny>(schema: T) {
 const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   get_node: z.object({ nodeId }).passthrough(),
   get_nodes: z.object({ nodeIds: z.array(nodeId).min(1) }).passthrough(),
-  modify: z.object({ nodeId, props: z.record(z.unknown()).optional() }).passthrough(),
+  modify: z.object({ nodeId, props: z.record(z.string(), z.unknown()).optional() }).passthrough(),
   delete: z.object({ nodeId }).passthrough(),
   clone: z.object({ nodeId }).passthrough(),
   move: z.object({ nodeId }).passthrough(),
@@ -129,9 +129,9 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .passthrough(),
   import_tokens: z
     .object({
-      tokens: z.record(z.unknown()).optional(),
-      dtcg: z.record(z.unknown()).optional(),
-      modes: z.record(z.unknown()).optional(),
+      tokens: z.record(z.string(), z.unknown()).optional(),
+      dtcg: z.record(z.string(), z.unknown()).optional(),
+      modes: z.record(z.string(), z.unknown()).optional(),
       collection: z.string().trim().min(1).optional(),
       mode: z.string().trim().min(1).optional(),
     })
@@ -144,7 +144,7 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       name: z.string().trim().min(1),
       type: z.enum(["COLOR", "FLOAT", "STRING", "BOOLEAN"]).optional(),
       value: z.unknown().optional(),
-      valuesByMode: z.record(z.unknown()).optional(),
+      valuesByMode: z.record(z.string(), z.unknown()).optional(),
       collection: z.string().trim().min(1).optional(),
       description: z.string().optional(),
     })
@@ -224,9 +224,9 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       title: z.string(),
       w: z.number().positive(),
       h: z.number().positive(),
-      boxes: z.array(z.record(z.unknown())),
-      diamonds: z.array(z.record(z.unknown())),
-      edges: z.array(z.record(z.unknown())),
+      boxes: z.array(z.record(z.string(), z.unknown())),
+      diamonds: z.array(z.record(z.string(), z.unknown())),
+      edges: z.array(z.record(z.string(), z.unknown())),
     })
     .passthrough(),
   // Everything is optional: with no frameId every diagram on the page is
@@ -246,9 +246,9 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       title: z.string(),
       w: z.number().positive(),
       h: z.number().positive(),
-      lanes: z.array(z.record(z.unknown())),
-      steps: z.array(z.record(z.unknown())),
-      edges: z.array(z.record(z.unknown())),
+      lanes: z.array(z.record(z.string(), z.unknown())),
+      steps: z.array(z.record(z.string(), z.unknown())),
+      edges: z.array(z.record(z.string(), z.unknown())),
     })
     .passthrough(),
   // Draw data from the server's own ERD layout pass.
@@ -258,9 +258,9 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       title: z.string(),
       w: z.number().positive(),
       h: z.number().positive(),
-      entities: z.array(z.record(z.unknown())),
-      edges: z.array(z.record(z.unknown())),
-      markers: z.array(z.record(z.unknown())),
+      entities: z.array(z.record(z.string(), z.unknown())),
+      edges: z.array(z.record(z.string(), z.unknown())),
+      markers: z.array(z.record(z.string(), z.unknown())),
     })
     .passthrough(),
   // Draw data from the server's own sequence layout pass.
@@ -270,8 +270,8 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       title: z.string(),
       w: z.number().positive(),
       h: z.number().positive(),
-      participants: z.array(z.record(z.unknown())),
-      messages: z.array(z.record(z.unknown())),
+      participants: z.array(z.record(z.string(), z.unknown())),
+      messages: z.array(z.record(z.string(), z.unknown())),
     })
     .passthrough(),
   // Draw data from the server's own state layout pass.
@@ -281,8 +281,8 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       title: z.string(),
       w: z.number().positive(),
       h: z.number().positive(),
-      states: z.array(z.record(z.unknown())),
-      edges: z.array(z.record(z.unknown())),
+      states: z.array(z.record(z.string(), z.unknown())),
+      edges: z.array(z.record(z.string(), z.unknown())),
     })
     .passthrough(),
   // Draw data from the server's own sitemap tidy-tree pass.
@@ -292,8 +292,8 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       title: z.string(),
       w: z.number().positive(),
       h: z.number().positive(),
-      pages: z.array(z.record(z.unknown())),
-      edges: z.array(z.record(z.unknown())),
+      pages: z.array(z.record(z.string(), z.unknown())),
+      edges: z.array(z.record(z.string(), z.unknown())),
     })
     .passthrough(),
   apply_variable: z
@@ -332,7 +332,7 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   load_icon: z.object({ svg: z.string().min(1), name: z.string().optional() }).passthrough(),
   load_image: z.object({}).passthrough(),
   batch: z
-    .object({ ops: z.array(z.object({ op: z.string(), params: z.record(z.unknown()) })).min(1) })
+    .object({ ops: z.array(z.object({ op: z.string(), params: z.record(z.string(), z.unknown()) })).min(1) })
     .passthrough(),
   screenshot: params,
   get_components: params,
@@ -449,7 +449,7 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .passthrough(),
   get_instance_overrides: z.object({ nodeId }).passthrough(),
   find_or_create_component: z
-    .object({ name: z.string().trim().min(1, "name is required"), spec: z.record(z.unknown()).optional() })
+    .object({ name: z.string().trim().min(1, "name is required"), spec: z.record(z.string(), z.unknown()).optional() })
     .passthrough(),
   componentize: z
     .object({
@@ -466,8 +466,8 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
         .array(
           z
             .object({
-              props: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
-              spec: z.record(z.unknown()).optional(),
+              props: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+              spec: z.record(z.string(), z.unknown()).optional(),
               componentId: nodeId.optional(),
             })
             .passthrough(),
@@ -532,8 +532,8 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
         componentId: nodeId.optional(),
         name: z.string().trim().min(1).optional(),
         key: z.string().trim().min(1).optional(),
-        variant: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
-        properties: z.record(z.unknown()).optional(),
+        variant: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+        properties: z.record(z.string(), z.unknown()).optional(),
         parentId: nodeId.optional(),
       })
       .passthrough()
@@ -543,7 +543,7 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   ),
   // The handler reads properties ?? props; accept the same.
   set_instance_properties: z
-    .object({ nodeId, properties: z.record(z.unknown()).optional(), props: z.record(z.unknown()).optional() })
+    .object({ nodeId, properties: z.record(z.string(), z.unknown()).optional(), props: z.record(z.string(), z.unknown()).optional() })
     .passthrough()
     .refine((p) => p.properties || p.props, {
       message: "set_instance_properties requires properties (or props): { name: value }.",
@@ -552,10 +552,10 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .object({
       nodeId,
       overrides: z
-        .array(z.object({ target: z.string().trim().min(1).optional(), props: z.record(z.unknown()).optional() }).passthrough())
+        .array(z.object({ target: z.string().trim().min(1).optional(), props: z.record(z.string(), z.unknown()).optional() }).passthrough())
         .optional(),
       from: nodeId.optional(),
-      properties: z.record(z.unknown()).optional(),
+      properties: z.record(z.string(), z.unknown()).optional(),
     })
     .passthrough()
     .refine((p) => p.overrides || p.from || p.properties, {
@@ -619,13 +619,13 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     })
     .passthrough(),
   check_component_map: z
-    .object({ map: z.object({ components: z.record(z.object({ figma: z.string().trim().min(1) }).passthrough()) }).passthrough() })
+    .object({ map: z.object({ components: z.record(z.string(), z.object({ figma: z.string().trim().min(1) }).passthrough()) }).passthrough() })
     .passthrough(),
   // Laid out by the server (figma_diagram); the plugin only draws.
   create_board: z
     .object({
       kind: z.enum(["usecase", "journey", "persona"]),
-      children: z.array(z.record(z.unknown())),
+      children: z.array(z.record(z.string(), z.unknown())),
       w: z.number().positive(),
       h: z.number().positive(),
     })
@@ -766,7 +766,7 @@ export const userflowSpecSchema = z
         checkFirst: z.boolean().optional(),
         verify: z.boolean().optional(),
         crossCheck: z.boolean().optional(),
-        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        policies: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
         liveRoute: z.boolean().optional(),
       })
       .passthrough()
@@ -879,7 +879,7 @@ export const activitySpecSchema = z
         checkFirst: z.boolean().optional(),
         verify: z.boolean().optional(),
         crossCheck: z.boolean().optional(),
-        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        policies: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
@@ -956,7 +956,7 @@ export const stateSpecSchema = z
         checkFirst: z.boolean().optional(),
         verify: z.boolean().optional(),
         crossCheck: z.boolean().optional(),
-        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        policies: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
@@ -1040,7 +1040,7 @@ export const erdSpecSchema = z
         checkFirst: z.boolean().optional(),
         verify: z.boolean().optional(),
         crossCheck: z.boolean().optional(),
-        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        policies: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
@@ -1121,7 +1121,7 @@ export const sequenceSpecSchema = z
         checkFirst: z.boolean().optional(),
         verify: z.boolean().optional(),
         crossCheck: z.boolean().optional(),
-        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        policies: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
@@ -1200,7 +1200,7 @@ export const sitemapSpecSchema = z
         checkFirst: z.boolean().optional(),
         verify: z.boolean().optional(),
         crossCheck: z.boolean().optional(),
-        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        policies: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
