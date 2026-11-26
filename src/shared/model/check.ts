@@ -38,21 +38,38 @@ export function checkConsistency(diagrams: StoredDiagram[]): ConsistencyFinding[
   ];
 }
 
+/** "Thu, 28, đặt vé lần đầu" → ["thu"]: the name is what comes before the first comma, in words. */
+function nameWords(s: string): string[] {
+  return normalize(s.split(",")[0] ?? "")
+    .split(" ")
+    .filter(Boolean);
+}
+
+/** Does one list of words appear, whole and in order, inside the other? */
+function wordsWithin(a: string[], b: string[]): boolean {
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  if (!short.length) return false;
+  for (let i = 0; i + short.length <= long.length; i++) {
+    if (short.every((w, k) => long[i + k] === w)) return true;
+  }
+  return false;
+}
+
 /**
  * A journey walked by someone the persona cards on the page do not describe.
- * Matched by name, loosely: "Thu" walks the journey of the card "Thu Trang".
+ * Matched by name, in whole words: "Thu" (or "Thu, 28, first booking") walks
+ * the journey of the card "Thu Trang", but "An" is not "Thanh".
  * Silent when the page has no persona cards — there is nothing to disagree with.
  */
 function personaDrift(facts: PageFacts): ConsistencyFinding[] {
   const cards = facts.who.filter((w) => w.where === "persona card");
   const walkers = facts.who.filter((w) => w.where === "journey persona");
   if (!cards.length || !walkers.length) return [];
-  const names = cards.map((c) => normalize(c.name));
+  const names = cards.map((c) => nameWords(c.name));
   const out: ConsistencyFinding[] = [];
   for (const w of walkers) {
-    const n = normalize(w.name);
-    const hit = names.some((c) => c === n || c.startsWith(`${n} `) || n.startsWith(`${c} `) || n.startsWith(`${c},`) || n.includes(c));
-    if (hit) continue;
+    const n = nameWords(w.name);
+    if (names.some((c) => wordsWithin(n, c))) continue;
     out.push({
       rule: "persona-drift",
       message: `"${w.frame}" is walked by "${w.name}", but no persona card on this page describes them (cards: ${cards.map((c) => `"${c.name}"`).join(", ")}). Name the journey after a card, or add the card.`,

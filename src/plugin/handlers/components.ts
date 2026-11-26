@@ -71,21 +71,77 @@ interface Listed {
   node: AnyComponent;
 }
 
+function listedName(n: AnyComponent): string {
+  return isVariant(n) ? `${n.parent!.name}/${n.name}` : n.name;
+}
+
 /**
  * Every local component a caller can name: component sets, plain components,
  * and each variant as "<Set>/<Size=sm, State=default>" so a variant can be
  * found directly too.
  */
-async function listLocalComponents(scope: "page" | "file"): Promise<Listed[]> {
+async function scanLocalComponents(scope: "page" | "file"): Promise<Listed[]> {
   if (scope === "file") await figma.loadAllPagesAsync?.();
   const root: DocumentNode | PageNode = scope === "file" ? figma.root : figma.currentPage;
   const found = root.findAllWithCriteria({ types: ["COMPONENT", "COMPONENT_SET"] }) as AnyComponent[];
-  const out: Listed[] = [];
-  for (const n of found) {
-    if (isVariant(n)) out.push({ id: n.id, name: `${n.parent!.name}/${n.name}`, node: n });
-    else out.push({ id: n.id, name: n.name, node: n });
+  return found.map((n) => ({ id: n.id, name: listedName(n), node: n }));
+}
+
+interface NameIndex {
+  all: Listed[];
+  /** normalizeName(name) → every component with that name, in tree order. */
+  byName: Map<string, Listed[]>;
+}
+
+/**
+ * The scan above walks a whole page (or, after loading every page, the whole
+ * file), and a script that instantiates fifty buttons — or one op that names
+ * a dozen preferredValues — asks for it again and again. So the index is kept
+ * for a few seconds. It cannot go stale silently: a hit is re-checked against
+ * the live node (still there, same name, same page) and a miss rebuilds the
+ * index once before anything is reported missing.
+ */
+const INDEX_TTL_MS = 10_000;
+let indexCache: { root: BaseNode; page: BaseNode; at: number; indexes: Partial<Record<"page" | "file", NameIndex>> } | null = null;
+
+function cacheFor(): NonNullable<typeof indexCache> {
+  const now = Date.now();
+  if (!indexCache || indexCache.root !== figma.root || indexCache.page !== figma.currentPage || now - indexCache.at > INDEX_TTL_MS) {
+    indexCache = { root: figma.root, page: figma.currentPage, at: now, indexes: {} };
   }
-  return out;
+  return indexCache;
+}
+
+async function componentIndex(scope: "page" | "file", rebuild = false): Promise<{ index: NameIndex; fresh: boolean }> {
+  const cache = cacheFor();
+  const have = cache.indexes[scope];
+  if (have && !rebuild) return { index: have, fresh: false };
+  const all = await scanLocalComponents(scope);
+  const byName = new Map<string, Listed[]>();
+  for (const c of all) {
+    const k = normalizeName(c.name);
+    const list = byName.get(k);
+    if (list) list.push(c);
+    else byName.set(k, [c]);
+  }
+  const index = { all, byName };
+  cache.indexes[scope] = index;
+  return { index, fresh: true };
+}
+
+/**
+ * A full listing (find_component, the component map) always rescans: an index
+ * can prove a hit still holds, but not that nothing was added since.
+ */
+async function listLocalComponents(scope: "page" | "file"): Promise<Listed[]> {
+  return (await componentIndex(scope, true)).index.all;
+}
+
+/** Exact (normalized) hits for `want` in an index, checked against the live nodes. */
+function exactHits(index: NameIndex, scope: "page" | "file", want: string): Listed[] {
+  return (index.byName.get(want) ?? []).filter(
+    (c) => !c.node.removed && normalizeName(listedName(c.node)) === want && (scope === "file" || pageOf(c.node) === figma.currentPage),
+  );
 }
 
 /** Names within a couple of typos of `want` (already normalized), closest first. */
@@ -119,28 +175,40 @@ function editDistance(a: string, b: string, cap: number): number {
 
 async function findByName(name: string): Promise<{ exact: Listed | null; near: string[] }> {
   const want = normalizeName(name);
-  for (const scope of ["page", "file"] as const) {
-    const all = await listLocalComponents(scope);
-    const exact = all.filter((c) => normalizeName(c.name) === want);
-    if (exact.length > 0) {
-      // A set and its own default variant never collide (variants carry the
-      // set prefix), so several exact hits are genuinely distinct components.
-      return { exact: exact[0]!, near: exact.length > 1 ? exact.map((c) => `${c.name} (${c.id})`) : [] };
-    }
-    if (scope === "file") {
-      // Variants only crowd the hint ("Button/Size=sm, …" four times over)
-      // unless the caller was asking for one.
-      const pool = name.includes("=") ? all : all.filter((c) => !isVariant(c.node));
-      // Closest spelling first: "Buton" is one letter from "Button", while the
-      // word overlap ranks every "SmokeTest/…" alike and then by length.
-      const ranked = rankCandidates(name, pool, 8)
-        .map((s) => s.candidate.name)
-        .sort((a, b) => editDistance(want, normalizeName(a), 99) - editDistance(want, normalizeName(b), 99))
-        .slice(0, 5);
-      return { exact: null, near: ranked.length ? ranked : closeSpellings(want, pool) };
-    }
+  // A set and its own default variant never collide (variants carry the set
+  // prefix), so several exact hits are genuinely distinct components.
+  const found = (exact: Listed[]) => ({ exact: exact[0]!, near: exact.length > 1 ? exact.map((c) => `${c.name} (${c.id})`) : [] });
+  const onPage = (exact: Listed[]) => {
+    const here = exact.filter((c) => pageOf(c.node) === figma.currentPage);
+    return here.length ? here : exact;
+  };
+  // Cached indexes first — this page, then the file — and only a miss in
+  // both pays for a rescan, so a name looked up again costs a map lookup.
+  const page = await componentIndex("page");
+  let hits = exactHits(page.index, "page", want);
+  if (hits.length) return found(hits);
+  const cachedFile = cacheFor().indexes.file;
+  if (cachedFile) {
+    hits = exactHits(cachedFile, "file", want);
+    if (hits.length) return found(onPage(hits));
   }
-  return { exact: null, near: [] };
+  if (!page.fresh) {
+    hits = exactHits((await componentIndex("page", true)).index, "page", want);
+    if (hits.length) return found(hits);
+  }
+  const all = (await componentIndex("file", !!cachedFile)).index.all;
+  hits = all.filter((c) => normalizeName(c.name) === want);
+  if (hits.length) return found(hits);
+  // Variants only crowd the hint ("Button/Size=sm, …" four times over)
+  // unless the caller was asking for one.
+  const pool = name.includes("=") ? all : all.filter((c) => !isVariant(c.node));
+  // Closest spelling first: "Buton" is one letter from "Button", while the
+  // word overlap ranks every "SmokeTest/…" alike and then by length.
+  const ranked = rankCandidates(name, pool, 8)
+    .map((s) => s.candidate.name)
+    .sort((a, b) => editDistance(want, normalizeName(a), 99) - editDistance(want, normalizeName(b), 99))
+    .slice(0, 5);
+  return { exact: null, near: ranked.length ? ranked : closeSpellings(want, pool) };
 }
 
 /**
@@ -234,6 +302,17 @@ function pickVariant(set: ComponentSetNode, wanted: unknown): ComponentNode {
   );
 }
 
+/** `base` with `wanted` on top; { size: "lg" } replaces Size, whatever the case. */
+function mergeVariant(base: Record<string, string>, wanted: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [k, v] of Object.entries(wanted)) {
+    const same = Object.keys(out).find((b) => b.toLowerCase() === k.trim().toLowerCase());
+    if (same !== undefined) delete out[same];
+    out[same ?? k] = v;
+  }
+  return out;
+}
+
 /** Component or set that owns property definitions for `node`. */
 function propertyOwner(node: BaseNode, ctx: HandlerContext): AnyComponent {
   if (node.type === "COMPONENT_SET") return node as ComponentSetNode;
@@ -271,14 +350,26 @@ async function requireInstance(id: unknown): Promise<InstanceNode> {
  * Find a layer inside `root` by id, by "A/B/C" name path, or by name anywhere
  * in the subtree (first match, warned when ambiguous).
  */
-function findLayer(root: BaseNode, target: string, ctx: HandlerContext): SceneNode | null {
-  const all = "findAll" in root ? (root as ChildrenMixin).findAll(() => true) : [];
+function findLayer(root: BaseNode, target: string, ctx: HandlerContext, opts: { intoInstances?: boolean } = {}): SceneNode | null {
+  // Binding a property needs the component's OWN layers: a "Label" inside a
+  // nested instance cannot carry a reference, so with intoInstances: false a
+  // nested instance is a candidate itself but its insides are not searched.
+  const into = opts.intoInstances !== false;
+  const all: SceneNode[] = [];
+  const collect = (n: BaseNode) => {
+    for (const k of (n as Partial<ChildrenMixin>).children ?? []) {
+      all.push(k);
+      if (into || k.type !== "INSTANCE") collect(k);
+    }
+  };
+  collect(root);
   const byId = all.find((n) => n.id === target || n.id.endsWith(`;${target}`));
   if (byId) return byId;
   if (target.includes("/") && "children" in root) {
     let cur: BaseNode | undefined = root;
     for (const part of target.split("/").map((s) => s.trim())) {
-      const kids: readonly SceneNode[] = cur && "children" in cur ? (cur as ChildrenMixin).children : [];
+      const kids: readonly SceneNode[] =
+        cur && "children" in cur && (into || cur === root || cur.type !== "INSTANCE") ? (cur as ChildrenMixin).children : [];
       cur = kids.find((k) => k.name === part) ?? kids.find((k) => k.name.toLowerCase() === part.toLowerCase());
       if (!cur) break;
     }
@@ -356,7 +447,7 @@ export async function findComponent(ctx: HandlerContext): Promise<unknown> {
   // A variant query ("Button/Size=lg") is worth answering even when variants
   // were not asked for.
   if (ranked.length === 0 && !includeVariants && query.includes("=")) {
-    const variants = (await listLocalComponents("file")).filter((c) => isVariant(c.node));
+    const variants = (await componentIndex("file", p.scope === "page")).index.all.filter((c) => isVariant(c.node));
     ranked.push(...rankCandidates(query, variants, limit));
   }
   return {
@@ -556,10 +647,24 @@ export async function createVariants(ctx: HandlerContext): Promise<unknown> {
   const parent = await resolveParent(p.parentId);
   const components: ComponentNode[] = [];
   const createdHere: ComponentNode[] = [];
+  // Components the caller passed in get variant names; a failure gives them
+  // their own names back, as it removes the ones built here.
+  const originalNames = new Map<ComponentNode, string>();
+  const rename = (c: ComponentNode, name: string) => {
+    if (!originalNames.has(c) && !createdHere.includes(c)) originalNames.set(c, c.name);
+    c.name = name;
+  };
   const fail = (e: unknown): never => {
     for (const c of createdHere) {
       try {
         c.remove();
+      } catch {
+        /* gone */
+      }
+    }
+    for (const [c, name] of originalNames) {
+      try {
+        if (!c.removed) c.name = name;
       } catch {
         /* gone */
       }
@@ -592,7 +697,7 @@ export async function createVariants(ctx: HandlerContext): Promise<unknown> {
         if (!c || c.type !== "COMPONENT" || isVariant(c)) {
           throw err(ErrorCode.INVALID_PARAMS, `variants[${i}].componentId is not a free COMPONENT.`, "Pass a component that is not in a set yet.");
         }
-        c.name = name;
+        rename(c as ComponentNode, name);
         components.push(c as ComponentNode);
         continue;
       }
@@ -608,7 +713,7 @@ export async function createVariants(ctx: HandlerContext): Promise<unknown> {
     // Names given for componentIds-only input become variant names when they
     // are not already "Prop=value".
     for (const c of components) {
-      if (!c.name.includes("=")) c.name = `Variant=${c.name.replace(/[=,]/g, " ").trim() || "Default"}`;
+      if (!c.name.includes("=")) rename(c, `Variant=${c.name.replace(/[=,]/g, " ").trim() || "Default"}`);
     }
     const names = components.map((c) => c.name);
     const dup = names.find((n, i) => names.indexOf(n) !== i);
@@ -617,11 +722,16 @@ export async function createVariants(ctx: HandlerContext): Promise<unknown> {
     fail(e);
   }
 
-  const set = figmaCall(
-    "combineAsVariants",
-    () => figma.combineAsVariants(components, parent),
-    "All variants must be COMPONENTs that can be reparented (not inside instances).",
-  );
+  let set: ComponentSetNode;
+  try {
+    set = figmaCall(
+      "combineAsVariants",
+      () => figma.combineAsVariants(components, parent),
+      "All variants must be COMPONENTs that can be reparented (not inside instances).",
+    );
+  } catch (e) {
+    return fail(e);
+  }
   if (typeof p.name === "string" && p.name.trim()) set.name = p.name.trim();
   if (typeof p.description === "string") set.description = p.description;
   if (typeof p.x === "number") set.x = p.x;
@@ -764,41 +874,56 @@ function bindProperty(
   const list = Array.isArray(bind) ? bind : bind === undefined ? [] : [bind];
   const bound: Array<{ id: string; name: string; field: string }> = [];
   const scopes: BaseNode[] = owner.type === "COMPONENT_SET" ? [...owner.children] : [owner];
-  for (const entry of list) {
-    const target =
-      typeof entry === "string" ? entry : String((entry as Record<string, unknown>)?.target ?? (entry as Record<string, unknown>)?.nodeId ?? "");
-    const field = (
-      typeof entry === "object" && entry && typeof (entry as Record<string, unknown>).field === "string"
-        ? (entry as Record<string, unknown>).field
-        : BIND_FIELD[type]
-    ) as "visible" | "characters" | "mainComponent" | undefined;
-    if (!target || !field) {
-      ctx.warn(`Skipped a bind entry with no target or field (${JSON.stringify(entry)}).`);
-      continue;
-    }
-    let hits = 0;
-    for (const scope of scopes) {
-      const layer = findLayer(scope, target, ctx);
-      if (!layer) continue;
-      if (field === "characters" && layer.type !== "TEXT") {
-        ctx.warn(`"${layer.name}" is a ${layer.type}; a TEXT property binds to TEXT layers.`);
+  // All or nothing: a layer that refuses the reference undoes the ones set before it.
+  const undo: Array<{ layer: SceneNode; prev: SceneNode["componentPropertyReferences"] }> = [];
+  try {
+    for (const entry of list) {
+      const target =
+        typeof entry === "string" ? entry : String((entry as Record<string, unknown>)?.target ?? (entry as Record<string, unknown>)?.nodeId ?? "");
+      const field = (
+        typeof entry === "object" && entry && typeof (entry as Record<string, unknown>).field === "string"
+          ? (entry as Record<string, unknown>).field
+          : BIND_FIELD[type]
+      ) as "visible" | "characters" | "mainComponent" | undefined;
+      if (!target || !field) {
+        ctx.warn(`Skipped a bind entry with no target or field (${JSON.stringify(entry)}).`);
         continue;
       }
-      if (field === "mainComponent" && layer.type !== "INSTANCE") {
-        ctx.warn(`"${layer.name}" is a ${layer.type}; an INSTANCE_SWAP property binds to INSTANCE layers.`);
-        continue;
+      let hits = 0;
+      for (const scope of scopes) {
+        const layer = findLayer(scope, target, ctx, { intoInstances: false });
+        if (!layer) continue;
+        if (field === "characters" && layer.type !== "TEXT") {
+          ctx.warn(`"${layer.name}" is a ${layer.type}; a TEXT property binds to TEXT layers.`);
+          continue;
+        }
+        if (field === "mainComponent" && layer.type !== "INSTANCE") {
+          ctx.warn(`"${layer.name}" is a ${layer.type}; an INSTANCE_SWAP property binds to INSTANCE layers.`);
+          continue;
+        }
+        const prev = layer.componentPropertyReferences;
+        figmaCall(
+          "componentPropertyReferences",
+          () => {
+            layer.componentPropertyReferences = { ...(prev ?? {}), [field]: key };
+          },
+          "The layer must be inside this component (not inside a nested instance).",
+        );
+        undo.push({ layer, prev });
+        bound.push({ id: layer.id, name: layer.name, field });
+        hits++;
       }
-      figmaCall(
-        "componentPropertyReferences",
-        () => {
-          layer.componentPropertyReferences = { ...(layer.componentPropertyReferences ?? {}), [field]: key };
-        },
-        "The layer must be inside this component (not inside a nested instance).",
-      );
-      bound.push({ id: layer.id, name: layer.name, field });
-      hits++;
+      if (hits === 0) ctx.warn(`bind: no layer "${target}" found in "${owner.name}" (layers inside nested instances cannot be bound).`);
     }
-    if (hits === 0) ctx.warn(`bind: no layer "${target}" found in "${owner.name}".`);
+  } catch (e) {
+    for (const { layer, prev } of undo.reverse()) {
+      try {
+        layer.componentPropertyReferences = prev ?? {};
+      } catch {
+        /* best effort */
+      }
+    }
+    throw e;
   }
   return bound;
 }
@@ -828,7 +953,18 @@ export async function addComponentProperty(ctx: HandlerContext): Promise<unknown
       ? "VARIANT properties can only be added to a COMPONENT_SET."
       : "Check the default value matches the type (TEXT: string, BOOLEAN: true/false, INSTANCE_SWAP: a component).",
   );
-  const bound = bindProperty(owner, key, type, p.bind, ctx);
+  let bound: Array<{ id: string; name: string; field: string }>;
+  try {
+    bound = bindProperty(owner, key, type, p.bind, ctx);
+  } catch (e) {
+    // Never half-done: a property nobody could bind is taken back out.
+    try {
+      owner.deleteComponentProperty(key);
+    } catch {
+      ctx.warn(`Property "${key}" was added but could not be removed after the bind failed; delete it with deleteComponentProperty.`);
+    }
+    throw e;
+  }
   return { id: owner.id, key, type, bound };
 }
 
@@ -971,6 +1107,15 @@ const COPYABLE_FIELDS = [
   "fontName",
 ] as const;
 
+/**
+ * What an instance's sublayer ids start with: "I1:2;" for instance 1:2, but a
+ * nested instance's id already is a path ("I1:2;3:4"), so its layers are
+ * "I1:2;3:4;…" — no second "I".
+ */
+function sublayerPrefix(instanceId: string): string {
+  return `${instanceId.startsWith("I") ? instanceId : `I${instanceId}`};`;
+}
+
 /** Copy every directly overridden field from a sibling instance of the same component. */
 async function copyOverridesFrom(inst: InstanceNode, fromId: string, ctx: HandlerContext): Promise<number> {
   const src = await requireInstance(fromId);
@@ -981,13 +1126,13 @@ async function copyOverridesFrom(inst: InstanceNode, fromId: string, ctx: Handle
   const props = flattenComponentProperties(src.componentProperties as unknown as Record<string, { value?: unknown }>);
   const res = await applyProperties(inst, props, ctx);
   let count = Object.keys(res.applied).length;
-  const prefix = `I${src.id};`;
+  const prefix = sublayerPrefix(src.id);
   for (const o of src.overrides ?? []) {
-    if (o.id === src.id) continue;
-    const rel = o.id.startsWith(prefix) ? o.id.slice(prefix.length) : null;
-    if (!rel) continue;
-    const from = await getNodeByIdSafe(o.id);
-    const to = await getNodeByIdSafe(`I${inst.id};${rel}`);
+    // The instance's own fills / opacity are overrides too, on the root.
+    const rel = o.id === src.id ? "" : o.id.startsWith(prefix) ? o.id.slice(prefix.length) : null;
+    if (rel === null) continue;
+    const from = rel ? await getNodeByIdSafe(o.id) : src;
+    const to = rel ? await getNodeByIdSafe(`${sublayerPrefix(inst.id)}${rel}`) : inst;
     if (!from || !to) continue;
     if (to.type === "TEXT") await loadNodeFonts(to as TextNode);
     for (const f of o.overriddenFields) {
@@ -1016,12 +1161,14 @@ export async function instantiate(ctx: HandlerContext): Promise<unknown> {
   const p = ctx.params;
   const ref = p.component ?? p.componentId ?? p.name;
   let comp = await resolveComponentRef(ref, ctx, { key: p.key });
-  const variantAsked = p.variant && typeof p.variant === "object" ? (p.variant as Record<string, unknown>) : undefined;
-  const target: ComponentNode =
-    comp.type === "COMPONENT_SET" ? pickVariant(comp as ComponentSetNode, variantAsked) : (comp as ComponentNode);
+  let variantAsked = p.variant && typeof p.variant === "object" ? (p.variant as Record<string, unknown>) : undefined;
   if (variantAsked && comp.type === "COMPONENT" && isVariant(comp)) {
+    // "Button/Size=sm, State=hover" + { Size: "lg" }: that variant, but large.
+    variantAsked = mergeVariant(parseVariantName(comp.name), variantAsked);
     comp = comp.parent as ComponentSetNode;
   }
+  const target: ComponentNode =
+    comp.type === "COMPONENT_SET" ? pickVariant(comp as ComponentSetNode, variantAsked) : (comp as ComponentNode);
   const inst = target.createInstance();
   try {
     if (p.parentId !== undefined) {
@@ -1177,7 +1324,7 @@ export async function swapComponent(ctx: HandlerContext): Promise<unknown> {
   const current = await inst.getMainComponentAsync();
   let wanted = ctx.params.variant as Record<string, unknown> | undefined;
   if (c.type === "COMPONENT_SET" && current && isVariant(current) && current.parent!.id === c.id && wanted && typeof wanted === "object") {
-    wanted = { ...parseVariantName(current.name), ...wanted };
+    wanted = mergeVariant(parseVariantName(current.name), wanted);
   }
   const target = c.type === "COMPONENT_SET" ? pickVariant(c as ComponentSetNode, wanted) : (c as ComponentNode);
   figmaCall("swapComponent", () => inst.swapComponent(target), "The instance must not be a nested instance inside another instance.");
@@ -1240,11 +1387,26 @@ export async function checkComponentMap(ctx: HandlerContext): Promise<unknown> {
     throw err(ErrorCode.INVALID_PARAMS, "check_component_map needs { map: { components: { … } } }.", "Pass the map JSON from your codebase, or start one with export_component_map.");
   }
   const all = (await listLocalComponents("file")).filter((c) => !isVariant(c.node));
-  const byName = new Map(all.map((c) => [normalizeName(c.name), c.node]));
+  const byName = new Map<string, AnyComponent[]>();
+  for (const c of all) {
+    const k = normalizeName(c.name);
+    byName.set(k, [...(byName.get(k) ?? []), c.node]);
+  }
+  // The first in file order — the one a name lookup in the file finds.
   const findings = checkMap(map, (name) => {
-    const c = byName.get(normalizeName(name));
+    const c = byName.get(normalizeName(name))?.[0];
     return c ? infoOf(c) : undefined;
   });
+  for (const [codeName, m] of Object.entries(map.components)) {
+    const same = typeof m?.figma === "string" ? (byName.get(normalizeName(m.figma)) ?? []) : [];
+    if (same.length > 1) {
+      findings.push({
+        component: codeName,
+        severity: "warning",
+        message: `"${m.figma}" names ${same.length} components (${same.map((c) => `${c.id} on "${pageOf(c)?.name ?? "?"}"`).join(", ")}); checked the first. Rename the others so the map means one component.`,
+      });
+    }
+  }
   return {
     components: Object.keys(map.components).length,
     errors: findings.filter((f) => f.severity === "error").length,

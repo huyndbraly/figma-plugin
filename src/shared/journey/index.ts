@@ -87,7 +87,8 @@ export function parseJourneyText(src: string): { persona?: string; phases: Journ
       continue;
     }
     if (word === "phase" || word === "stage") {
-      const m = /^\w+\s+([\w.-]+)\s*(.*)$/.exec(t);
+      // Ids in any script: `phase tìm "Tìm phim"` is "tìm", not "t".
+      const m = /^\w+\s+([\p{L}\p{M}\p{N}_.-]+)\s*(.*)$/u.exec(t);
       if (!m) {
         warnings.push(`journey text, line ${l.no}: a phase needs an id — \`phase pay "Thanh toán"\`.`);
         continue;
@@ -221,10 +222,29 @@ export function buildJourney(spec: JourneySpec): BoardBuild<JourneyModel> {
   });
   y += chipH + 10;
 
+  // The emotion curve: notes sit above a bad dot and below a good one, and
+  // the row grows (above the scale and below it) until the tallest note fits.
+  const NOTE_W = COL_W - 24;
+  const SCALE_H = CURVE_H - 48;
+  const noteText = (p: JourneyPhase) => `${FACE[Math.round(p.feeling ?? 0) + 2] ?? ""} ${p.feelingNote ?? ""}`.trim();
+  const along = (f: number) => ((2 - f) / 4) * SCALE_H;
+  let curveTop = 18;
+  let curveH = CURVE_H;
+  for (const p of drawn) {
+    if (typeof p.feeling !== "number") continue;
+    const h = textHeight(noteText(p), NOTE_W, 11);
+    if (p.feeling < 0) curveTop = Math.max(curveTop, 14 + h - along(p.feeling));
+  }
+  for (const p of drawn) {
+    if (typeof p.feeling !== "number" || p.feeling < 0) continue;
+    curveH = Math.max(curveH, curveTop + along(p.feeling) + 12 + textHeight(noteText(p), NOTE_W, 11) + 16);
+  }
+  curveH = Math.max(curveH, curveTop + SCALE_H + 30);
+
   for (const row of ROWS) {
     const cellW = COL_W - 8 - CELL_PAD * 2;
     let rowH: number;
-    if (row.key === "feeling") rowH = CURVE_H;
+    if (row.key === "feeling") rowH = curveH;
     else {
       const hs = drawn.map((p) => textHeight(bullets(p[row.key] as string[] | undefined) || " ", cellW, 12));
       rowH = Math.max(56, ...hs.map((h) => h + CELL_PAD * 2));
@@ -233,9 +253,8 @@ export function buildJourney(spec: JourneySpec): BoardBuild<JourneyModel> {
     children.push(text(`row ${row.key}`, PAD, y + 12, LABEL_W - 16, rowLabel, { size: 12, weight: "Semi Bold", color: INK }));
     children.push(line(`row ${row.key} rule`, [[PAD, y - 5], [frameW - PAD, y - 5]], { color: RULE, weight: 1 }));
     if (row.key === "feeling") {
-      const top = y + 18;
-      const bottom = y + CURVE_H - 30;
-      const yFor = (f: number) => top + ((2 - f) / 4) * (bottom - top);
+      const top = y + curveTop;
+      const yFor = (f: number) => top + along(f);
       children.push(line("feeling neutral", [[gridX, yFor(0)], [gridX + n * COL_W, yFor(0)]], { color: RULE, dashed: true, weight: 1 }));
       const pts: Pt[] = [];
       drawn.forEach((p, i) => {
@@ -249,8 +268,9 @@ export function buildJourney(spec: JourneySpec): BoardBuild<JourneyModel> {
         const cy = yFor(p.feeling);
         const bad = p.feeling < 0;
         children.push(ellipse(`journey:${p.id} feeling`, cx - 7, cy - 7, 14, 14, { fill: bad ? "#e03131" : p.feeling > 0 ? "#2f9e44" : "#868e96", stroke: "#ffffff", strokeWeight: 2 }));
-        const face = FACE[Math.round(p.feeling) + 2] ?? "";
-        children.push(text(`journey:${p.id} feeling note`, cx - COL_W / 2 + 12, cy + (bad ? -34 : 12), COL_W - 24, `${face} ${p.feelingNote ?? ""}`.trim(), { size: 11, color: MUTED, align: "CENTER" }));
+        const note = noteText(p);
+        const noteY = bad ? cy - 10 - textHeight(note, NOTE_W, 11) : cy + 12;
+        children.push(text(`journey:${p.id} feeling note`, cx - COL_W / 2 + 12, noteY, NOTE_W, note, { size: 11, color: MUTED, align: "CENTER" }));
       });
     } else {
       drawn.forEach((p, i) => {

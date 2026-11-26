@@ -28,6 +28,13 @@ describe("names", () => {
     expect(camelCase("Show icon")).toBe("showIcon");
     expect(codeValue("Extra Large")).toBe("extra-large");
   });
+
+  it("drops accents instead of letters, and never starts an identifier with a digit", () => {
+    expect(pascalCase("Nút bấm")).toBe("NutBam");
+    expect(camelCase("Kích thước")).toBe("kichThuoc");
+    expect(codeValue("Đường dẫn")).toBe("duong-dan");
+    expect(pascalCase("2FA Banner")).toBe("_2FABanner");
+  });
 });
 
 describe("mapFromFigma", () => {
@@ -49,6 +56,16 @@ describe("mapFromFigma", () => {
   it("never gives two components the same code name", () => {
     const map = mapFromFigma([button, { ...button, id: "2:1", name: "Legacy/Button" }]);
     expect(Object.keys(map.components)).toHaveLength(2);
+  });
+
+  it("keeps two Figma values that fold to one code value, and types a digit-led name", () => {
+    const map = mapFromFigma([
+      { id: "3:1", name: "Nút bấm", type: "COMPONENT_SET", variantOptions: { "Kích thước": ["Nhỏ", "Nhớ", "Lớn"] } },
+      { id: "4:1", name: "2FA Banner", type: "COMPONENT" },
+    ]);
+    expect(map.components.NutBam!.props!.kichThuoc!.values).toEqual({ nho: "Nhỏ", "nho-2": "Nhớ", lon: "Lớn" });
+    expect(Object.keys(map.components)).toContain("_2FABanner");
+    expect(mapToTypeScript(map)).toContain("export interface _2FABannerProps {");
   });
 });
 
@@ -92,5 +109,16 @@ describe("checkMap", () => {
     expect(text).toMatch(/no code value for "Secondary"/);
     expect(text).toMatch(/property "Loading"/);
     expect(text).toMatch(/Figma has no component "Ghost"/);
+  });
+
+  it("checks fixed keys and values against Figma too", () => {
+    const map = mapFromFigma([button]);
+    map.components.Button!.fixed = { Tone: "Danger", Size: "Small", State: "Default", "Show icon": "no", Label: "Go" };
+    const f = checkMap(map, (n) => (n === "UI/Button" ? button : undefined)).filter((x) => x.severity === "error");
+    const text = f.map((x) => x.message).join("\n");
+    expect(text).toMatch(/fixed\.Tone="Danger" is not a value of "Tone"/);
+    expect(text).toMatch(/fixed\.State: "UI\/Button" has no property "State"/);
+    expect(text).toMatch(/fixed\.Show icon is BOOLEAN/);
+    expect(text).not.toMatch(/fixed\.(Size|Label)/);
   });
 });

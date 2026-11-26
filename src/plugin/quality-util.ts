@@ -14,6 +14,23 @@ const DEFAULT_NAME = /^(frame|group|rectangle|ellipse|vector|instance|component|
 /** Words that name a kind of control, not what it does. */
 const GENERIC_CONTROL = /^(button|btn|icon|icon ?button|cta|link|chip|tab|toggle|switch|control|action|item|cell|fab)( ?\d+)?$/i;
 
+/**
+ * Taller than this, a layer whose NAME says "menu" / "search" / "tab" is the
+ * region that holds controls ("Settings menu", "Search results"), not one.
+ */
+export const NAMED_CONTROL_MAX_HEIGHT = 120;
+
+/**
+ * Is a layer a control? A tap reaction says so outright; a name only when the
+ * layer is control-sized, so a "Tab bar" or "Search results" panel is a
+ * container whose contents still get audited.
+ */
+export function isControlLike(name: string, height: number | undefined, hasTapReaction: boolean): boolean {
+  if (hasTapReaction) return true;
+  if (!looksLikeControl(name)) return false;
+  return typeof height !== "number" || height <= NAMED_CONTROL_MAX_HEIGHT;
+}
+
 export function looksLikeControl(name: string): boolean {
   // Path-style names ("Button/Primary/Large") describe the component; any
   // segment that is a control word counts.
@@ -101,7 +118,25 @@ export function matchColor(
   return {};
 }
 
-export interface TypeStyle {
+/** Line height / letter spacing as Figma stores them ({ unit, value }). */
+export interface TypeLength {
+  unit: string;
+  value?: number;
+}
+
+/**
+ * Everything a text style sets besides the font. Applying a style applies
+ * these too, so a style that matches the font but not these reflows the text.
+ * `null` = mixed on the node (a style would make it uniform).
+ */
+export interface TypeMetrics {
+  lineHeight?: TypeLength | null;
+  letterSpacing?: TypeLength | null;
+  textCase?: string | null;
+  textDecoration?: string | null;
+}
+
+export interface TypeStyle extends TypeMetrics {
   id: string;
   name: string;
   family: string;
@@ -109,18 +144,53 @@ export interface TypeStyle {
   size: number;
 }
 
-/** A text style whose family, style and size all equal the node's. */
+/** A length in px at `size` ("auto" for AUTO line height); undefined = Figma's default. */
+function lengthPx(l: TypeLength | undefined, size: number, def: "auto" | number): "auto" | number {
+  if (!l) return def;
+  if (l.unit === "AUTO") return "auto";
+  const v = typeof l.value === "number" ? l.value : 0;
+  return l.unit === "PERCENT" ? (size * v) / 100 : v;
+}
+
+function sameLength(a: TypeLength | null | undefined, b: TypeLength | null | undefined, size: number, def: "auto" | number): boolean {
+  if (a === null || b === null) return false;
+  const x = lengthPx(a, size, def);
+  const y = lengthPx(b, size, def);
+  if (x === "auto" || y === "auto") return x === y;
+  return Math.abs(x - y) < 0.01;
+}
+
+/** Would applying style `s` leave the node's line height, tracking, case and decoration as they are? */
+export function sameMetrics(node: TypeMetrics, s: TypeMetrics, size: number): boolean {
+  const word = (v: string | null | undefined, def: string) => (v === null ? null : (v ?? def));
+  return (
+    sameLength(node.lineHeight, s.lineHeight, size, "auto") &&
+    sameLength(node.letterSpacing, s.letterSpacing, size, 0) &&
+    word(node.textCase, "ORIGINAL") === word(s.textCase, "ORIGINAL") &&
+    word(node.textDecoration, "NONE") === word(s.textDecoration, "NONE")
+  );
+}
+
+/**
+ * The text style for a node's type. `exact` also matches line height, letter
+ * spacing, case and decoration — binding it changes nothing on the canvas.
+ * `near` matches family, style and size only: binding it would reflow the
+ * text, so it is a suggestion and never applied unless asked (includeNear).
+ */
 export function matchTextStyle(
   family: string,
   style: string,
   size: number,
   styles: readonly TypeStyle[],
-): TypeStyle | undefined {
-  const hits = styles.filter(
-    (s) => s.family.toLowerCase() === family.toLowerCase() && s.style.toLowerCase() === style.toLowerCase() && Math.abs(s.size - size) < 0.01,
-  );
-  // Shortest name first: "body" over "body/legacy-copy".
-  return hits.sort((a, b) => a.name.length - b.name.length)[0];
+  metrics: TypeMetrics = {},
+): { exact?: TypeStyle; near?: TypeStyle } {
+  const hits = styles
+    .filter((s) => s.family.toLowerCase() === family.toLowerCase() && s.style.toLowerCase() === style.toLowerCase() && Math.abs(s.size - size) < 0.01)
+    // Shortest name first: "body" over "body/legacy-copy".
+    .sort((a, b) => a.name.length - b.name.length);
+  const exact = hits.find((s) => sameMetrics(metrics, s, size));
+  if (exact) return { exact };
+  return hits[0] ? { near: hits[0] } : {};
 }
 
 export interface NumberToken {

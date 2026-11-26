@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   hex,
+  isControlLike,
   isDefaultLayerName,
   isGenericControlName,
   looksLikeControl,
@@ -51,8 +52,29 @@ describe("matching literal values to tokens", () => {
       { id: "s1", name: "body", family: "Inter", style: "Regular", size: 14 },
       { id: "s2", name: "body/strong", family: "Inter", style: "Semi Bold", size: 14 },
     ];
-    expect(matchTextStyle("inter", "regular", 14, styles)?.id).toBe("s1");
-    expect(matchTextStyle("Inter", "Regular", 15, styles)).toBeUndefined();
+    expect(matchTextStyle("inter", "regular", 14, styles).exact?.id).toBe("s1");
+    expect(matchTextStyle("Inter", "Regular", 15, styles)).toEqual({});
+  });
+
+  it("calls a style exact only when line height, tracking, case and decoration match too", () => {
+    const styles = [
+      { id: "s1", name: "body", family: "Inter", style: "Regular", size: 16, lineHeight: { unit: "PIXELS", value: 24 }, letterSpacing: { unit: "PERCENT", value: 0 } },
+      { id: "s2", name: "body/caps", family: "Inter", style: "Regular", size: 16, lineHeight: { unit: "PERCENT", value: 150 }, letterSpacing: { unit: "PIXELS", value: 1 }, textCase: "UPPER" },
+    ];
+    // 150% of 16px is the same 24px.
+    expect(matchTextStyle("Inter", "Regular", 16, styles, { lineHeight: { unit: "PERCENT", value: 150 }, letterSpacing: { unit: "PIXELS", value: 0 } }).exact?.id).toBe("s1");
+    expect(matchTextStyle("Inter", "Regular", 16, styles, { lineHeight: { unit: "PIXELS", value: 24 }, letterSpacing: { unit: "PIXELS", value: 1 }, textCase: "UPPER" }).exact?.id).toBe("s2");
+    // Font matches, leading does not: a suggestion only.
+    expect(matchTextStyle("Inter", "Regular", 16, styles, { lineHeight: { unit: "AUTO" } })).toEqual({ near: styles[0] });
+    // Mixed on the node: the style would flatten it.
+    expect(matchTextStyle("Inter", "Regular", 16, styles, { lineHeight: null }).exact).toBeUndefined();
+  });
+
+  it("treats a name-only control as a control only at control size", () => {
+    expect(isControlLike("Tab", 48, false)).toBe(true);
+    expect(isControlLike("Tab bar", 600, false)).toBe(false);
+    expect(isControlLike("Search results", 500, false)).toBe(false);
+    expect(isControlLike("Hero", 600, true)).toBe(true); // a tap reaction always counts
   });
 
   it("keeps radius and spacing tokens apart by scope or name", () => {

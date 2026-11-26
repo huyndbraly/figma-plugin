@@ -51,8 +51,20 @@ export function baseKey(key: string): string {
   return i < 0 ? key : key.slice(0, i);
 }
 
-function words(s: string): string[] {
+/** "Kích thước" → "Kich thuoc": code names are ASCII, so accents go, letters stay. */
+export function stripDiacritics(s: string): string {
   return s
+    .normalize("NFD")
+    // Combining marks (Vietnamese tones, horns, dots below all live here); a
+    // range rather than \p{M}, so the es2017 plugin bundle needs no Unicode
+    // property escapes from the Figma sandbox.
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D");
+}
+
+function words(s: string): string[] {
+  return stripDiacritics(s)
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .split(/[^A-Za-z0-9]+/)
     .filter(Boolean);
@@ -65,12 +77,22 @@ export function camelCase(s: string): string {
   return w[0]! + w.slice(1).map((x) => x[0]!.toUpperCase() + x.slice(1)).join("");
 }
 
-/** "P/Nav/TopBar" → "TopBar", "icon button" → "IconButton". */
+/** "P/Nav/TopBar" → "TopBar", "icon button" → "IconButton", "2FA Banner" → "_2FABanner". */
 export function pascalCase(s: string): string {
   const last = s.split("/").pop() ?? s;
-  return words(last)
+  const name = words(last)
     .map((x) => x[0]!.toUpperCase() + x.slice(1))
     .join("");
+  // An identifier cannot start with a digit.
+  return /^\d/.test(name) ? `_${name}` : name;
+}
+
+/** `key`, or `key-2`, `key-3`… — the first not taken. */
+function unique(key: string, taken: (k: string) => boolean, sep = "-"): string {
+  if (!taken(key)) return key;
+  let i = 2;
+  while (taken(`${key}${sep}${i}`)) i++;
+  return `${key}${sep}${i}`;
 }
 
 /** "Primary" → "primary", "Extra Large" → "extra-large". */
@@ -91,10 +113,13 @@ export function mapFromFigma(infos: readonly FigmaComponentInfo[]): ComponentMap
     if (components[codeName]) codeName = `${codeName}${info.id.replace(/\W/g, "")}`;
     const props: Record<string, PropMapping> = {};
     let children: string | undefined;
+    // Two Figma words can fold to one code word ("Nhỏ" and "Nhớ" are both
+    // "nho"): the second gets "-2" rather than silently replacing the first.
+    const propKey = (s: string) => unique(camelCase(s) || s, (k) => k in props, "");
     for (const [prop, values] of Object.entries(info.variantOptions ?? {})) {
       const map: Record<string, string> = {};
-      for (const v of values) map[codeValue(v) || v] = v;
-      props[camelCase(prop) || prop] = { figma: prop, type: "VARIANT", values: map };
+      for (const v of values) map[unique(codeValue(v) || v, (k) => k in map)] = v;
+      props[propKey(prop)] = { figma: prop, type: "VARIANT", values: map };
     }
     for (const [key, def] of Object.entries(info.properties ?? {})) {
       const name = baseKey(key);
@@ -104,7 +129,7 @@ export function mapFromFigma(infos: readonly FigmaComponentInfo[]): ComponentMap
         children = name;
         continue;
       }
-      props[camelCase(name) || name] = { figma: name, type: t as PropMapping["type"] };
+      props[propKey(name)] = { figma: name, type: t as PropMapping["type"] };
     }
     components[codeName] = { figma: info.name, ...(Object.keys(props).length ? { props } : {}), ...(children ? { children } : {}) };
   }
@@ -218,6 +243,20 @@ export function checkMap(map: ComponentMap, figmaByName: (name: string) => Figma
         const t = props.get(pm.figma.toLowerCase());
         if (!t) out.push({ component: codeName, severity: "error", message: `${codeName}.${prop} → property "${pm.figma}", which "${m.figma}" does not have.` });
         else if (pm.type && pm.type !== t) out.push({ component: codeName, severity: "warning", message: `${codeName}.${prop} is mapped as ${pm.type} but "${pm.figma}" is ${t}.` });
+      }
+    }
+    // `fixed` is set on every instance, so a stale key fails every instantiate.
+    for (const [k, v] of Object.entries(m.fixed ?? {})) {
+      const options = Object.entries(variants).find(([vk]) => vk.toLowerCase() === k.toLowerCase())?.[1];
+      const t = props.get(k.toLowerCase());
+      if (options) {
+        if (!options.includes(String(v))) out.push({ component: codeName, severity: "error", message: `${codeName}.fixed.${k}="${String(v)}" is not a value of "${k}" (${options.join(" | ")}).` });
+      } else if (!t) {
+        out.push({ component: codeName, severity: "error", message: `${codeName}.fixed.${k}: "${m.figma}" has no property "${k}".` });
+      } else if (t === "BOOLEAN" && typeof v !== "boolean") {
+        out.push({ component: codeName, severity: "error", message: `${codeName}.fixed.${k} is BOOLEAN in Figma; use true/false, not ${JSON.stringify(v)}.` });
+      } else if (t !== "BOOLEAN" && typeof v === "boolean") {
+        out.push({ component: codeName, severity: "error", message: `${codeName}.fixed.${k} is ${t} in Figma; a boolean cannot set it.` });
       }
     }
     if (m.children && props.get(m.children.toLowerCase()) !== "TEXT") {
