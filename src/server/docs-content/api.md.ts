@@ -85,6 +85,25 @@ separators; a near miss throws with the closest names — never a guess.
   (props + variants + anatomy = reconstruction spec). Instantiate the result
   via its id.
 
+## Quality audits
+- \`a11yAudit(nodeId?, {minTouch?: 44, minFontSize?: 11})\` → findings per node:
+  contrast below WCAG AA, tap targets under 44×44 (controls = reactions or a
+  control word in the layer name), small text, controls with no name.
+- \`auditDesignSystem(nodeId?, {kinds?})\` → \`compliance\` %, \`autoFixable\`,
+  per-kind bound/bindable/near/off counts, top off-palette colours.
+- \`applyDesignSystem(nodeId?, {dryRun?, kinds?, includeNear?})\` — bind every
+  literal that EQUALS a token (colour → variable per paint, text → style,
+  radius/spacing → number variable). Run with \`dryRun: true\` first.
+- \`responsiveAudit(nodeId, {presets?: ["iphone-se","ipad"], sizes?, keep?})\`
+  — layout_audit of a resized copy per viewport; copies are removed.
+
+## Code ↔ Figma component map
+- \`exportComponentMap(query? | names[])\` → \`{map, typescript}\`: a starting
+  map (code name → Figma component, props ↔ variants/properties). Save it in
+  the codebase; \`checkComponentMap(map)\` reports drift.
+- \`useComponentMap(map)\` once, then \`render("Button", {tone: "primary",
+  children: "Save"}, {parentId})\` instantiates the exact variant.
+
 ## Tokens & variables
 - \`setupTokens(tokensJson)\` — DTCG-ish {colors, numbers, strings} → Variables,
   idempotent, stored in \`state.tokens\`. Sets ALL modes explicitly.

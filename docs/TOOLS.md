@@ -37,7 +37,7 @@ The six tools split by *intent* — diagnose, read, write, learn:
 | Check the diagrams **agree with each other** | Nothing to call: `figma_diagram` cross-checks every draw against its page and returns `consistency`. |
 | **Verify** what you just drew | `figma_read` op `layout_audit` (structural facts: overflow, clipping, truncation) — then `screenshot` once for human review. |
 | Move tokens in/out of the file | `export_tokens` (read) / `importTokens`, `setupTokens` (write). |
-| Learn the safe-default semantics, layout math, or recipes | `figma_docs` (`rules` \| `layout` \| `api` \| `tokens` \| `icons` \| `recipes` \| `style` \| `userflow` \| `activity` \| `erd` \| `sequence` \| `sitemap` \| `state`). |
+| Learn the safe-default semantics, layout math, or recipes | `figma_docs` (`rules` \| `layout` \| `api` \| `tokens` \| `icons` \| `recipes` \| `style` \| `userflow` \| `activity` \| `erd` \| `sequence` \| `sitemap` \| `state` \| `usecase` \| `journey` \| `persona`). |
 
 The typical session: `figma_status` → `figma_rules` → (for a feature rather than a single screen, `figma_diagram` type:`"userflow"` first, once the user has agreed to map the flow) → `figma_write` (draw, reusing what the rule sheet showed) → `layout_audit` → fix → `screenshot` for the human.
 
@@ -107,6 +107,10 @@ Returns rich diagnostics — never a bare boolean:
 | `get_component` | `componentId` or `nodeId` or `key` | Rich single-component read: component property definitions, variants, text layers, slots, usage hints and anatomy by default. |
 | `find_component` | — (optional `query`, `limit`, `scope`, `includeVariants`) | Rank local components and component sets by name (case/separator-insensitive, then prefix, contains, shared words). Each match carries `id`, `key`, `variantOptions`, non-variant `properties` and `page`. No `query` lists them all. Variants are searched as `"<Set>/<Size=sm, State=default>"`. |
 | `get_instance_overrides` | `nodeId` (an INSTANCE) | What an instance changed: `mainComponent`, `componentProperties` (name → value), `propertyTypes`, `overrides` (`[{id, fields}]`) and `exposedInstanceIds`. Feed it to `setInstanceOverrides(other, {from})` to copy the look. |
+| `a11y_audit` | — (optional `nodeId`, `minTouch` (44), `minFontSize` (11), `maxFindings`) | Accessibility findings per node: text contrast below WCAG AA, tap targets under `minTouch`×`minTouch` (controls are recognised by their reactions or their layer name — button, tab, toggle, chip, field…), text below `minFontSize`, and controls with no accessible name (a default layer name, or an icon-only control called just "Button"). Scope: `nodeId`, else the selection, else the page. |
+| `audit_design_system` | — (optional `nodeId`, `kinds` (`color`/`text`/`radius`/`spacing`), `includeInstances`, `maxFindings`) | Which fills/strokes, text, corner radii and auto-layout spacing are bound to a token, which literally **equal** one (auto-fixable), which are within a hair of one (`near`), and which are off-system. Returns `compliance` (% bound), `autoFixable`, counts per kind, the most-used off-palette colours (candidates for new tokens) and the findings. Instance internals are skipped by default — fix the main component. |
+| `export_component_map` | — (optional `query`, `names`, `limit`, `scope`) | A starting **code ↔ Figma component map** from the file's components: one entry per component (PascalCase code name → Figma name), variant properties as code props with value maps, TEXT/BOOLEAN/INSTANCE_SWAP properties, and the label property as `children`. Also returns matching TypeScript prop interfaces. Save the map in the codebase and edit the names to match your code. |
+| `check_component_map` | `map` | Does the map still describe the file? Errors for a missing component, variant, value or property; warnings for Figma values with no code value and Figma properties the map never sets. |
 | `get_library_component` | `key` | Import a component from a **published shared library** by key and read it richly — the serialization doubles as a reconstruction spec. The import races an internal timeout, with a hint pointing at library publish/permission issues. |
 | `get_design_system_kit` | — (same evidence/depth limits as `generate_design_md`) | Structured JSON source: file/pages, rich styles/variables, local and external components, usage, screen summaries, observed patterns and extraction coverage. |
 | `screenshot` | optional `nodeId`, `scale` | PNG returned as a real MCP **image block** the model can see (not a base64 text dump), so it counts as image tokens, not thousands of text tokens. `scale` defaults to `0.6` — tuned for cheap verification renders, not pixel-perfect export. |
@@ -224,6 +228,44 @@ const btn = await figma.createVariants({
 await figma.addComponentProperty(btn.id, { name: "Label", type: "TEXT", defaultValue: "Button", bind: "Label" });
 const save = await figma.instantiate("Button", { variant: { Size: "lg" }, properties: { Label: "Save" }, parentId: state.formId });
 ```
+
+#### Quality audits
+
+| Method | Signature | Notes |
+|---|---|---|
+| `a11yAudit` | `a11yAudit(nodeId?, { minTouch?, minFontSize? })` | Same as the `a11y_audit` read op. |
+| `auditDesignSystem` | `auditDesignSystem(nodeId?, { kinds?, includeInstances? })` | Same as the `audit_design_system` read op. |
+| `applyDesignSystem` | `applyDesignSystem(nodeId?, { kinds?, dryRun?, includeNear?, includeInstances? })` | Bind every literal value that **equals** a token: colours → color variables (per paint, other paints untouched), text → the text style with the same family/style/size, radius → a radius number variable (all four corners), spacing → a spacing number variable. `dryRun: true` lists the changes without making them; `includeNear` also binds colours within 3/255 per channel. Returns `planned`, `applied` per kind and any `failed`. |
+| `responsiveAudit` | `responsiveAudit(nodeId, { sizes?, presets?, keep? })` | Clone the screen, resize the clone to each viewport (presets: `iphone-se`, `iphone`, `iphone-max`, `iphone-landscape`, `ipad`, `ipad-landscape`, `android`, `tablet`, `laptop`, `desktop`; or `sizes: [375, { width: 834, height: 1194 }]`), run `layout_audit` on it, and remove the clone. Issues name the ORIGINAL node ids. Default viewports follow the frame's width. `keep: true` leaves the clones beside the screen. A frame without auto-layout gets a note: its children only follow constraints. |
+
+#### Code ↔ Figma component map
+
+The map is JSON that lives in your codebase (e.g. `figma.components.json`):
+
+```json
+{
+  "version": 1,
+  "components": {
+    "Button": {
+      "figma": "Button",
+      "props": {
+        "tone": { "figma": "Tone", "type": "VARIANT", "values": { "primary": "Primary", "secondary": "Secondary" } },
+        "size": { "figma": "Size", "type": "VARIANT", "values": { "sm": "Small", "lg": "Large" } },
+        "showIcon": { "figma": "Show icon", "type": "BOOLEAN" }
+      },
+      "children": "Label",
+      "fixed": { "State": "Default" }
+    }
+  }
+}
+```
+
+| Method | Signature | Notes |
+|---|---|---|
+| `exportComponentMap` | `exportComponentMap(query? \| names[], { limit? })` | Same as the `export_component_map` read op. |
+| `checkComponentMap` | `checkComponentMap(map)` | Same as the `check_component_map` read op. |
+| `useComponentMap` | `useComponentMap(map)` | Keep the map for this session (stored in `state.componentMap`). |
+| `render` | `render(codeName, codeProps, { map?, parentId?, x?, y?, … })` | Translate code props through the map and `instantiate` the Figma component: `render("Button", { tone: "primary", size: "lg", children: "Save" }, { parentId })`. Props the map does not know come back as a warning, never guessed. |
 
 #### Edit-in-place (modify existing designs)
 
@@ -378,7 +420,7 @@ Auto-layout sizing: setting `layoutMode: "VERTICAL" | "HORIZONTAL"` turns a fram
 
 ## `figma_diagram`
 
-**Seven** diagram kinds behind one tool with a `type`, because every tool description is paid for in tokens in every session and the shapes differ far more than the call does. `figma_userflow` was a separate tool up to 0.1.0; it is `type: "userflow"` here, with the same fields.
+**Nine** diagram kinds behind one tool with a `type`, because every tool description is paid for in tokens in every session and the shapes differ far more than the call does. `figma_userflow` was a separate tool up to 0.1.0; it is `type: "userflow"` here, with the same fields.
 
 Pick by the question you are trying to settle:
 
@@ -390,8 +432,11 @@ Pick by the question you are trying to settle:
 | What do we store, and how do the pieces refer to each other? | `"erd"` |
 | Which screens does the user move through? | `"userflow"` |
 | What pages exist, and where does each one live? | `"sitemap"` |
+| Who uses the system for what? | `"usecase"` |
+| Where does one persona's experience hurt, phase by phase? | `"journey"` |
+| Who is the product for? | `"persona"` |
 
-Every kind takes a model **you** derived from the spec, returns `warnings` about that model rather than about the drawing, and keeps its lines attached when a shape is dragged. None of them invents content: an empty answer means the spec did not say.
+Every kind takes a model **you** derived from the spec, returns `warnings` about that model rather than about the drawing. The six graph kinds keep their lines attached when a shape is dragged; the three board kinds (`usecase`, `journey`, `persona`) are static drawings — change them with `update` + `patch`. None of them invents content: an empty answer means the spec did not say.
 
 One call does the lot — check, draw, render-audit, and cross-check against the other diagrams on the page:
 
@@ -737,6 +782,58 @@ Returns `{ frameId, name, nodes: { id: figmaNodeId }, box, warnings, stats }`.
 **The findings**: a state nothing can reach from the initial one; a state with **no way out** that is not marked `final`; **two transitions leaving one state on the same event with no guard to choose between them** — whichever the implementation checks first wins; a `final` state with a way out; a transition into the initial dot; a `choice` that does not branch or whose branches are unlabelled; a `fork` with no `join`; a transition that never says what triggers it.
 
 The last one has a deliberate exemption: a state with a `do` activity may leave by an unlabelled transition, because that is exactly what UML's *completion transition* means. One unguarded branch of a `choice` is likewise fine — it reads as the `else`.
+
+### `type: "usecase"` — who uses the system for what
+
+Actors outside a system boundary, use cases (ellipses) inside it; association lines, dashed «include» / «extend» arrows and hollow-triangle generalizations. Humans stand on the left, `kind: "system"` actors on the right. Use cases only pulled in by «include»/«extend» get their own column beside the case they serve.
+
+```text
+system "Ticketing app"
+actor visitor "Khách"
+actor pay "Cổng thanh toán" system
+uc book "Đặt vé"
+uc hold "Giữ ghế"
+visitor - book
+book => hold        # «include»
+voucher +> book     # «extend»
+member :> visitor   # generalization
+book - pay
+```
+
+Arrays: `actors[]` (`id`, `name`, `kind`, `side`, `detail`), `useCases[]` (`id`, `label`, `detail`), `links[]` (`from`, `to`, `kind`, `label`), `system`. Findings: an actor that uses nothing, a use case nobody can start, an association between two use cases, an «include» touching an actor, an «include» cycle. Full reference: `figma_docs(section="usecase")`.
+
+### `type: "journey"` — one persona, one scenario, an emotion curve
+
+Phases as columns; rows for doing, touchpoints, thinking, feeling (a curve from -2 to 2), pain points and opportunities.
+
+```text
+persona "Thu Trang"
+phase find "Tìm phim"
+  do Mở app, lướt danh sách
+  feel 1 Tò mò
+phase pay "Thanh toán"
+  do Nhập thẻ
+  feel -2 Lo lắng
+  pain Không rõ phí dịch vụ
+  fix Hiện tổng tiền trước bước nhập thẻ
+```
+
+Arrays: `persona`, `phases[]` (`id`, `label`, `actions[]`, `touchpoints[]`, `thoughts[]`, `feeling`, `feelingNote`, `pains[]`, `ideas[]`). Findings: no persona, fewer than two phases, a phase with no action, a low point with no pain, a pain with no opportunity, phases missing from the curve. Full reference: `figma_docs(section="journey")`.
+
+### `type: "persona"` — the people the product is for
+
+One card per persona — initials avatar, name, tag, quote, bio, facts, goals, pain points, needs, wants, behaviours, 1–5 levels and apps — primary first, outlined in its colour.
+
+```text
+source "4 phỏng vấn, 120 khảo sát"
+persona thu "Thu Trang" primary
+  tag Nhân viên văn phòng, 28
+  goal Chọn ghế đẹp thật nhanh
+  pain Phí ẩn khi thanh toán
+  level "Thành thạo công nghệ" 4
+```
+
+Arrays: `source`, `personas[]`. Findings: no source, no primary (or several), a persona with no goal or no pain, a level outside 1–5. Cross-check: a journey on the same page walked by someone no card describes (`persona-drift`). Full reference: `figma_docs(section="persona")`.
 
 ### Drawing a whole set in one call
 

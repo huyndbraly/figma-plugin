@@ -88,7 +88,11 @@ import {
   exposeNestedInstance,
   detachInstance,
   resetInstanceOverrides,
+  exportComponentMap,
+  checkComponentMap,
 } from "./components.js";
+import { a11yAudit, auditDesignSystem, applyDesignSystem, responsiveAudit } from "./quality.js";
+import { createBoard } from "./board.js";
 
 export type Handler = (ctx: HandlerContext) => Promise<unknown>;
 
@@ -151,6 +155,10 @@ export const HANDLERS: Record<Operation, Handler> = {
   read_selection: readSelection,
   find_component: findComponent,
   get_instance_overrides: getInstanceOverrides,
+  a11y_audit: a11yAudit,
+  audit_design_system: auditDesignSystem,
+  export_component_map: exportComponentMap,
+  check_component_map: checkComponentMap,
   // writes
   create: create,
   modify: modify,
@@ -213,6 +221,9 @@ export const HANDLERS: Record<Operation, Handler> = {
   expose_nested_instance: exposeNestedInstance,
   detach_instance: detachInstance,
   reset_instance_overrides: resetInstanceOverrides,
+  apply_design_system: applyDesignSystem,
+  responsive_audit: responsiveAudit,
+  create_board: whileDrawing(createBoard),
 };
 
 /** Compile-time-ish safety net: every declared op has a handler. */

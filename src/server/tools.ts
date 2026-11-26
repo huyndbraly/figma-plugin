@@ -18,6 +18,7 @@ import type { RouteArg } from "./route.js";
 import { validateOperation, isReadOp } from "./validate.js";
 import { runUserflow } from "./userflow.js";
 import { runActivity, type OpCall } from "./activity.js";
+import { runBoard, BOARD_KINDS, type BoardKind } from "./board.js";
 import { runErd } from "./erd.js";
 import { runSequence } from "./sequence.js";
 import { runState } from "./state.js";
@@ -919,6 +920,9 @@ function runDiagramType(
   if (type === "state") return runState(spec, call, undefined, into);
   if (type === "sitemap") return runSitemap(spec, call, undefined, into);
   if (type === "userflow") return runUserflow(spec, call, undefined, into);
+  if (typeof type === "string" && (BOARD_KINDS as readonly string[]).includes(type)) {
+    return runBoard(type as BoardKind, spec, call, undefined, into);
+  }
   const supported = [
     'type:"activity" (a business process)',
     'type:"erd" (a data model)',
@@ -926,6 +930,9 @@ function runDiagramType(
     'type:"sitemap" (the product\'s pages and which one contains which)',
     'type:"state" (the lifecycle of one entity)',
     'type:"userflow" (the screens a user moves through)',
+    'type:"usecase" (who uses the system for what)',
+    'type:"journey" (one persona through one scenario, with an emotion curve)',
+    'type:"persona" (the people the product is for)',
   ];
   throw new OpError(
     ErrorCode.INVALID_PARAMS,

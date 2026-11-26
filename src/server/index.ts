@@ -135,7 +135,7 @@ export const TOOLS: Tool[] = [
   {
     name: "figma_diagram",
     description:
-      "Draw a UML/BA diagram that is not a userflow, from a model YOU derived — the tool lays it out, draws it, and proof-reads the model. Pick `type` by the question it answers — its own description lists all six. Read figma_docs(section=\"activity\"|\"erd\"|\"sequence\"|\"sitemap\"|\"state\"|\"userflow\") for the field tables and the notation traps; the /figma-* skills carry the interview and the DO/DON'T tables. `warnings` are findings about the MODEL, not the drawing — an unlabelled handoff, a table with no primary key, a call nobody answers, a state nothing can leave — and they are the deliverable: act on each one, never fill a field to silence one. Compare `stats` with what you sent: anything a diagram of that kind cannot mean is DROPPED. One call does the lot: options.checkFirst proof-reads and draws only if clean, `audit` (render-side: overflow/clipping/truncation) comes back with the draw, and `diagrams: [...]` draws and places a whole set. For type:\"activity\", ASK the user LR (horizontal lanes) or TB before drawing. Arrows follow their boxes: dragging a shape re-routes live, dragging an arrow's END reconnects it, and figma.reflowDiagram() fixes one rearranged with the plugin closed.",
+      "Draw a UML/BA diagram that is not a userflow, from a model YOU derived — the tool lays it out, draws it, and proof-reads the model. Pick `type` by the question it answers — its own description lists all nine. Read figma_docs(section=<type>) for the field tables and the notation traps; the /figma-* skills carry the interview and the DO/DON'T tables. `warnings` are findings about the MODEL, not the drawing — an unlabelled handoff, a table with no primary key, a call nobody answers, a state nothing can leave — and they are the deliverable: act on each one, never fill a field to silence one. Compare `stats` with what you sent: anything a diagram of that kind cannot mean is DROPPED. One call does the lot: options.checkFirst proof-reads and draws only if clean, `audit` (render-side: overflow/clipping/truncation) comes back with the draw, and `diagrams: [...]` draws and places a whole set. For type:\"activity\", ASK the user LR (horizontal lanes) or TB before drawing. Arrows follow their boxes: dragging a shape re-routes live, dragging an arrow's END reconnects it, and figma.reflowDiagram() fixes one rearranged with the plugin closed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -152,8 +152,8 @@ export const TOOLS: Tool[] = [
         gap: { type: "number", description: "Gap between batched frames in px (default 250)." },
         type: {
           type: "string",
-          enum: ["activity", "erd", "sequence", "sitemap", "state", "userflow"],
-          description: "Which diagram to draw. activity = a business process (with or without swimlanes); erd = a data model of tables, columns and the keys that join them; sequence = the exchange between systems over time; sitemap = the product's PAGES and which page contains which — containment, NOT navigation; state = the lifecycle of ONE entity, the values it can hold and what moves it between them; userflow = the screens a user moves through, which alone takes `mermaid` rather than `text`.",
+          enum: ["activity", "erd", "sequence", "sitemap", "state", "userflow", "usecase", "journey", "persona"],
+          description: "Which diagram to draw. activity = a business process (with or without swimlanes); erd = a data model of tables, columns and the keys that join them; sequence = the exchange between systems over time; sitemap = the product's PAGES and which page contains which — containment, NOT navigation; state = the lifecycle of ONE entity, the values it can hold and what moves it between them; userflow = the screens a user moves through, which alone takes `mermaid` rather than `text`; usecase = who uses the system for what (actors, use cases, include/extend); journey = one persona through one scenario with an emotion curve; persona = the people it is for, one card each.",
         },
         title: { type: "string", description: "Heading drawn on the frame, e.g. \"Purchase order approval\"." },
         subtitle: { type: "string", description: "Optional one-line context under the title." },
@@ -199,6 +199,14 @@ export const TOOLS: Tool[] = [
         transitions: arrayOf(
           "state — every change allowed, as `event [guard] / action`. from, to, event?, guard? (two transitions on one event NEED guards), action?, kind?(return for a way back), cls?, fromSide?/toSide?/fromAt?/toAt?",
         ),
+        system: { type: "string", description: "usecase — the system boundary's name." },
+        actors: arrayOf("usecase — id, name, kind?(human|system), side?(left|right)"),
+        useCases: arrayOf("usecase — id, label, detail?"),
+        links: arrayOf("usecase — from, to, kind?(association|include|extend|generalization), label?"),
+        persona: { type: "string", description: "journey — who walks it." },
+        phases: arrayOf("journey — id, label, actions[], touchpoints[], thoughts[], feeling(-2..2), feelingNote?, pains[], ideas[]"),
+        source: { type: "string", description: "persona — the research behind the cards." },
+        personas: arrayOf("persona — id, name, primary?, tag?, quote?, bio?, facts[{label,value}], goals[], pains[], needs[], wants[], behaviors[], levels[{label,value 1-5}], apps[]"),
         lanes: arrayOf(
           "activity — one band per OWNER (a role/team/system that DOES something, never a system layer). id, label, detail?. Omit for a plain activity diagram",
         ),
@@ -257,7 +265,7 @@ export const TOOLS: Tool[] = [
   {
     name: "figma_docs",
     description:
-      "On-demand documentation for this API and its safe-by-default rules. Sections: rules | layout | api | tokens | icons | recipes | style | userflow | activity | erd | sequence | sitemap | state. Read `style` when drawing a screen with NO design.md / no existing design system — it is the default type scale, spacing grid, color palette and elevation to fall back on instead of inventing values (which reads as generic/lifeless).",
+      "On-demand documentation for this API and its safe-by-default rules. Sections: rules | layout | api | tokens | icons | recipes | style | userflow | activity | erd | sequence | sitemap | state | usecase | journey | persona. Read `style` when drawing a screen with NO design.md / no existing design system — it is the default type scale, spacing grid, color palette and elevation to fall back on instead of inventing values (which reads as generic/lifeless).",
     inputSchema: {
       type: "object",
       properties: {

@@ -197,6 +197,16 @@ export function collectFacts(diagrams: StoredDiagram[]): PageFacts {
       for (const p of arr(spec.participants)) add(p.id, p.name, "sequence participant");
     } else if (d.kind === "activity") {
       for (const l of arr(spec.lanes)) add(l.id, l.label, "activity lane");
+    } else if (d.kind === "usecase") {
+      for (const a of arr(spec.actors)) add(a.id, str(a.name) || str(a.id), "use case actor");
+    } else if (d.kind === "journey") {
+      const who = str(spec.persona);
+      if (who) out.who.push({ name: who, where: "journey persona", nodeId: d.nodeId, frame });
+    } else if (d.kind === "persona") {
+      for (const p of arr(spec.personas)) {
+        const name = str(p.name) || str(p.id);
+        if (name) out.who.push({ name, where: "persona card", nodeId: d.nodeId, frame });
+      }
     } else if (d.kind === "erd") {
       for (const e of arr(spec.entities)) {
         const entity = str(e.name) || str(e.id);

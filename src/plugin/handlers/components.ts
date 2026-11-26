@@ -30,6 +30,7 @@ import { layoutVariantGrid, parseVariantName, variantMatches, variantName } from
 import { create } from "./create.js";
 import { modify } from "./write.js";
 import { loadNodeFonts } from "../fonts.js";
+import { checkMap, mapFromFigma, mapToTypeScript, type ComponentMap, type FigmaComponentInfo } from "../../shared/component-map.js";
 
 type AnyComponent = ComponentNode | ComponentSetNode;
 
@@ -1135,4 +1136,69 @@ export async function swapComponent(ctx: HandlerContext): Promise<unknown> {
   const target = c.type === "COMPONENT_SET" ? pickVariant(c as ComponentSetNode, ctx.params.variant) : (c as ComponentNode);
   figmaCall("swapComponent", () => inst.swapComponent(target), "The instance must not be a nested instance inside another instance.");
   return { id: inst.id, componentId: target.id, componentName: target.name };
+}
+
+// ---------------------------------------------------------------------------
+// Code ↔ Figma component map
+// ---------------------------------------------------------------------------
+
+function infoOf(c: AnyComponent): FigmaComponentInfo {
+  const d = describeComponent(c) as {
+    id: string;
+    name: string;
+    type: "COMPONENT" | "COMPONENT_SET";
+    variantOptions?: Record<string, string[]>;
+    properties?: Record<string, { type: string; defaultValue?: unknown }>;
+  };
+  return {
+    id: d.id,
+    name: d.name,
+    type: d.type,
+    ...(d.variantOptions ? { variantOptions: d.variantOptions } : {}),
+    ...(d.properties ? { properties: d.properties } : {}),
+  };
+}
+
+/** export_component_map: a starting code↔Figma map (plus TS prop types) from the file's components. */
+export async function exportComponentMap(ctx: HandlerContext): Promise<unknown> {
+  const p = ctx.params;
+  const all = (await listLocalComponents(p.scope === "page" ? "page" : "file")).filter((c) => !isVariant(c.node));
+  let picked: Listed[];
+  if (Array.isArray(p.names) && p.names.length) {
+    picked = [];
+    for (const n of p.names) {
+      const want = normalizeName(String(n));
+      const hit = all.find((c) => normalizeName(c.name) === want);
+      if (hit) picked.push(hit);
+      else ctx.warn(`names: no component "${String(n)}".`);
+    }
+  } else if (typeof p.query === "string" && p.query.trim()) {
+    picked = rankCandidates(p.query, all, 200).map((s) => s.candidate);
+  } else {
+    picked = all;
+  }
+  const limit = typeof p.limit === "number" && p.limit > 0 ? Math.floor(p.limit) : 100;
+  if (picked.length > limit) ctx.warn(`${picked.length} components matched; mapped the first ${limit}. Narrow with query/names or raise limit.`);
+  const map = mapFromFigma(picked.slice(0, limit).map((c) => infoOf(c.node)));
+  return { count: Object.keys(map.components).length, map, typescript: mapToTypeScript(map) };
+}
+
+/** check_component_map: does the map still describe this file? */
+export async function checkComponentMap(ctx: HandlerContext): Promise<unknown> {
+  const map = ctx.params.map as ComponentMap | undefined;
+  if (!map || typeof map !== "object" || !map.components || typeof map.components !== "object") {
+    throw err(ErrorCode.INVALID_PARAMS, "check_component_map needs { map: { components: { … } } }.", "Pass the map JSON from your codebase, or start one with export_component_map.");
+  }
+  const all = (await listLocalComponents("file")).filter((c) => !isVariant(c.node));
+  const byName = new Map(all.map((c) => [normalizeName(c.name), c.node]));
+  const findings = checkMap(map, (name) => {
+    const c = byName.get(normalizeName(name));
+    return c ? infoOf(c) : undefined;
+  });
+  return {
+    components: Object.keys(map.components).length,
+    errors: findings.filter((f) => f.severity === "error").length,
+    warnings: findings.filter((f) => f.severity === "warning").length,
+    findings,
+  };
 }
