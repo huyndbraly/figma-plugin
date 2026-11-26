@@ -102,7 +102,7 @@ export const TOOLS: Tool[] = [
         },
         params: {
           type: "object",
-          description: "Operation parameters (e.g. { nodeId }, { nodeIds }, { detail: 'sparse'|'compact'|'full' }, read_selection: { detail?, depth? }).",
+          description: "Operation parameters (e.g. { nodeId }, { nodeIds }, { detail: 'sparse'|'compact'|'full' }, read_selection: { detail?, depth? }). { url } takes a Figma link (Copy link to selection) instead of nodeId.",
           additionalProperties: true,
         },
         ...ROUTE_TARGET,

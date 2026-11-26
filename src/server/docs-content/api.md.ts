@@ -169,6 +169,10 @@ separators; a near miss throws with the closest names — never a guess.
   WRITE them into the codebase (\`dir\` absolute); returns paths only, so use it
   instead of exportNode for assets. PNG/JPG scales ≤ 4 (\`name@2x.png\`); SVG/PDF.
   No window connected: pass \`{fileKey}\` with FIGMA_TOKEN set → REST API.
+  Also takes a Figma link: \`exportAssets("https://www.figma.com/design/…?node-id=1-2", {dir})\`.
+- Figma links: figma_read accepts \`params.url\` (Copy link to selection) instead of
+  nodeId. Open file → plugin; not open + FIGMA_TOKEN → REST, compacted to the same
+  shape. Never ask the user to paste a token into the chat.
 
 ## Userflow
 - \`userflow(spec)\` — draw a userflow: screen boxes, decision diamonds,

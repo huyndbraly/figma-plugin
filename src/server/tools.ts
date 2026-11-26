@@ -29,6 +29,9 @@ import { checkCoverage, type ArtboardRef } from "../shared/model/coverage.js";
 import { indexPage, type StoredDiagram } from "../shared/model/facts.js";
 import { getDoc, DOC_SECTION_NAMES, type DocLevel } from "./docs-content/index.js";
 import type { SessionRegistry } from "./session.js";
+import { fileNameKey, parseFigmaLink, type FigmaLink } from "../shared/figma-url.js";
+import { RestClient, restRead, type RestFetch } from "./rest-read.js";
+import { fetchImageFollowingSafeRedirects } from "./executor.js";
 
 /** Everything the tool handlers need from the running server. */
 export interface ToolContext {
@@ -38,6 +41,8 @@ export interface ToolContext {
   runWrite: (code: string, sessionId?: string, route?: RouteArg) => Promise<unknown>;
   sessions: SessionRegistry;
   diagnostics: () => Promise<Diagnostics>;
+  /** Injectable for tests — the REST fallback for Figma links (default: FIGMA_TOKEN + global fetch). */
+  rest?: { token?: string; fetch?: RestFetch; download?: (url: string) => Promise<Uint8Array> };
 }
 
 export interface ChannelDiagnostics {
@@ -284,6 +289,14 @@ export async function handleRead(
       "Use figma_write for mutations. Read ops: see figma_docs(section=\"api\").",
     );
   }
+  // A Figma link ("Copy link to selection") in params: read the node it names,
+  // in whichever place has the file — the open window, else the REST API.
+  if (params.url !== undefined || params.link !== undefined) {
+    const viaLink = await readViaLink(ctx, op, params, route);
+    if (viaLink.done) return viaLink.result;
+    params = viaLink.params;
+    route = viaLink.route;
+  }
   // validateOperation is applied inside runValidated (the choke point).
   const result = await ctx.runValidated(op, params, undefined, route);
 
@@ -315,6 +328,97 @@ export async function handleRead(
     };
   }
   return result;
+}
+
+// ---- Figma links ----
+
+const restClients = new Map<string, RestClient>();
+/** How long a link read waits for its file's window when there is no REST fallback. */
+export let LINK_WINDOW_GRACE_MS = 15_000;
+const LINK_POLL_MS = 500;
+/** Test seam. */
+export function setLinkWindowGraceMs(ms: number): void {
+  LINK_WINDOW_GRACE_MS = ms;
+}
+
+function restFor(ctx: ToolContext): { client: RestClient; download: (url: string) => Promise<Uint8Array> } | null {
+  const token = ctx.rest?.token ?? process.env.FIGMA_TOKEN;
+  if (!token) return null;
+  const key = ctx.rest?.fetch ? `${token}|injected` : token;
+  let client = restClients.get(key);
+  if (!client || ctx.rest?.fetch) {
+    client = new RestClient(token, ctx.rest?.fetch);
+    if (!ctx.rest?.fetch) restClients.set(key, client);
+  }
+  const download =
+    ctx.rest?.download ??
+    (async (url: string) => {
+      const res = await fetchImageFollowingSafeRedirects(url);
+      if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `Downloading the render failed: HTTP ${res.status}.`);
+      return new Uint8Array(await res.arrayBuffer());
+    });
+  return { client, download };
+}
+
+/** The open window whose file the link names, if any. */
+function windowFor(link: FigmaLink, channels: unknown, name?: string): string | undefined {
+  const list = (Array.isArray(channels) ? channels : (channels as { channels?: unknown[] } | null)?.channels ?? []) as Array<{ channel?: string; plugin?: { fileName?: string }; fileName?: string }>;
+  const want = fileNameKey(name ?? link.slug ?? "");
+  if (!want) return undefined;
+  return list.find((c) => fileNameKey(c.plugin?.fileName ?? c.fileName ?? "") === want)?.channel;
+}
+
+async function readViaLink(
+  ctx: ToolContext,
+  op: string,
+  raw: Record<string, unknown>,
+  route?: RouteArg,
+): Promise<{ done: true; result: unknown } | { done: false; params: Record<string, unknown>; route?: RouteArg }> {
+  const { url, link: linkParam, ...params } = raw;
+  const link = parseFigmaLink(url ?? linkParam);
+  if (!link) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      "`url` is not a Figma link.",
+      "Pass the link from Figma's right-click → Copy link to selection, e.g. https://www.figma.com/design/<fileKey>/<name>?node-id=12-345.",
+    );
+  }
+  if (link.nodeId) {
+    if (op === "get_nodes" && params.nodeIds === undefined) params.nodeIds = [link.nodeId];
+    else if (op !== "get_nodes" && op !== "get_document_info" && params.nodeId === undefined) params.nodeId = link.nodeId;
+  }
+  const rest = restFor(ctx);
+  // A link without the name slug can still be matched by asking REST for the name.
+  let name = link.slug;
+  if (!name && rest) {
+    try {
+      name = ((await restRead("get_document_info", {}, link.fileKey, rest)) as { fileName?: string }).fileName;
+    } catch {
+      /* fall through to REST reads below, which report properly */
+    }
+  }
+  let channel = windowFor(link, await ctx.runValidated("list_channels", {}).catch(() => []), name);
+  // No token to fall back on: the window may simply be reconnecting (a server
+  // restart, a plugin reload) — give it the same grace a file-hinted op gets
+  // instead of failing in 0 ms.
+  for (let waited = 0; !channel && !rest && waited < LINK_WINDOW_GRACE_MS; waited += LINK_POLL_MS) {
+    await new Promise((r) => setTimeout(r, LINK_POLL_MS));
+    channel = windowFor(link, await ctx.runValidated("list_channels", {}).catch(() => []), name);
+  }
+  if (channel) {
+    // Same file is open: the plugin path is faster, cheaper and sees more.
+    const base = route && typeof route === "object" ? route : {};
+    return { done: false, params, route: { ...base, channel, file: undefined } as RouteArg };
+  }
+  if (!rest) {
+    throw new OpError(
+      ErrorCode.NOT_CONNECTED,
+      `The file in this link${name ? ` ("${name}")` : ""} is not open in any connected Figma window.`,
+      "Open it in Figma Desktop and run Figma Plugin MCP (then call again with the same link) — or set FIGMA_TOKEN on the MCP server so links can be read through the REST API without the file open.",
+    );
+  }
+  // Ops REST cannot answer throw from restRead with a "needs the plugin" hint.
+  return { done: true, result: await restRead(op, params, link.fileKey, rest) };
 }
 
 // ---- figma_write ----
