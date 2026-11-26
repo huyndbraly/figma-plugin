@@ -164,6 +164,11 @@ separators; a near miss throws with the closest names — never a guess.
 - \`loadIcon(name, {library, size, color, parentId, x, y, inset, align,
   insertAt})\` — SVG fetched server-side, drawn by the plugin.
 - \`loadImage(urlOrBase64)\`.
+- \`exportAssets(ids | "selection" | {childrenOf}, {dir, formats?, scales?,
+  scaleNaming?: "ios"|"android"|"web", overwrite?})\` — render many nodes and
+  WRITE them into the codebase (\`dir\` absolute); returns paths only, so use it
+  instead of exportNode for assets. PNG/JPG scales ≤ 4 (\`name@2x.png\`); SVG/PDF.
+  No window connected: pass \`{fileKey}\` with FIGMA_TOKEN set → REST API.
 
 ## Userflow
 - \`userflow(spec)\` — draw a userflow: screen boxes, decision diamonds,
