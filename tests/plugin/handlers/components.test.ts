@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { makeContext } from "../../../src/plugin/context.js";
 import { resetKeepClearGroups } from "../../../src/plugin/keep-clear.js";
 import {
+  resetInstanceOverrides,
+  swapComponent,
   addComponentProperty,
   componentize,
   createVariants,
@@ -153,8 +155,11 @@ function makeComponentish(n: any): any {
       height: this.height,
       main: this,
       values: {} as Record<string, unknown>,
-      overrides: [],
+      overrides: [{ id: "x", overriddenFields: ["fills"] }],
       exposedInstances: [],
+      removeOverrides() {
+        this.overrides = [];
+      },
       getMainComponentAsync: async function () {
         return this.main;
       },
@@ -279,10 +284,10 @@ describe("instantiate", () => {
 
   it("names the closest components when the name does not exist", async () => {
     buttonSet();
-    await expect(instantiate(ctx({ component: "Buton" }))).rejects.toMatchObject({
-      code: "NODE_NOT_FOUND",
-      hint: expect.stringContaining("Button"),
-    });
+    const e = (await instantiate(ctx({ component: "Buton" })).catch((x: unknown) => x)) as { hint: string };
+    expect(e).toMatchObject({ code: "NODE_NOT_FOUND", hint: expect.stringContaining("Button") });
+    // The set, not each of its variants.
+    expect(e.hint).not.toContain("Size=");
   });
 
   it("lists the variants when the requested one does not exist", async () => {
@@ -316,6 +321,39 @@ describe("setInstanceProperties", () => {
       code: "INVALID_PARAMS",
       hint: expect.stringContaining("Show icon"),
     });
+  });
+});
+
+describe("resetInstanceOverrides", () => {
+  it("clears overrides AND puts property values back to their defaults, keeping the variant", async () => {
+    const s = buttonSet();
+    const key = s.addComponentProperty("Label", "TEXT", "Button");
+    const { id } = (await instantiate(ctx({ component: "Button", variant: { Size: "lg" }, properties: { Label: "Save" } }))) as any;
+    const res = (await resetInstanceOverrides(ctx({ nodeId: id }))) as any;
+    expect(res.cleared).toBe(1);
+    expect(res.restoredProperties).toEqual({ [key]: "Button" });
+    expect(nodes.get(id).main.name).toBe("Size=lg, State=default");
+  });
+
+  it("keepProperties leaves the values alone", async () => {
+    const s = buttonSet();
+    s.addComponentProperty("Label", "TEXT", "Button");
+    const { id } = (await instantiate(ctx({ component: "Button", properties: { Label: "Save" } }))) as any;
+    const res = (await resetInstanceOverrides(ctx({ nodeId: id, keepProperties: true }))) as any;
+    expect(res.restoredProperties).toBeUndefined();
+  });
+});
+
+describe("swapComponent", () => {
+  it("names the variant with its set", async () => {
+    buttonSet();
+    page.appendChild(component("Card"));
+    const { id } = (await instantiate(ctx({ component: "Card" }))) as any;
+    nodes.get(id).swapComponent = function (c: any) {
+      this.main = c;
+    };
+    const res = (await swapComponent(ctx({ nodeId: id, component: "Button", variant: { State: "hover" } }))) as any;
+    expect(res.componentName).toBe("Button/Size=sm, State=hover");
   });
 });
 

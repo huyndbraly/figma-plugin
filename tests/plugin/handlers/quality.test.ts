@@ -202,6 +202,9 @@ describe("responsive_audit", () => {
     // The hint names the ORIGINAL banner, not the throwaway copy.
     expect(res.results[0].hints?.[0]).toContain(`(${wide.id})`);
     expect(clones.every((c) => c.removed)).toBe(true);
+    // No id of a throwaway copy survives in any message.
+    const cloneIds = new Set(clones.flatMap((c) => [c.id, ...c.findAll(() => true).map((k: any) => k.id)]));
+    for (const r of res.results) for (const m of [...r.issues, ...(r.hints ?? [])]) for (const id of cloneIds) expect(m).not.toContain(`${id}`);
     expect(page.children).toEqual([screen]);
   });
 });

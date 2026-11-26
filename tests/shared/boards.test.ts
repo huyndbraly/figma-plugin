@@ -86,6 +86,35 @@ phase pay "Pay"
   pain Hidden fees
 `;
 
+describe("usecase layout", () => {
+  it("routes an actor's line around a use case standing in its way", () => {
+    // pay (right side) → book, with hold («include»d by book) between them.
+    const b = buildUsecase({ text: USECASE });
+    const link = b.draw.children.find((c) => c.name === "link pay association book")!;
+    const pts = link.points as number[][];
+    expect(pts.length).toBe(3);
+    const hold = b.draw.children.find((c) => c.name === "usecase:hold")!;
+    const [hx, hy, hw, hh] = [hold.x as number, hold.y as number, hold.width as number, hold.height as number];
+    const inside = (x: number, y: number) => ((x - (hx + hw / 2)) / (hw / 2)) ** 2 + ((y - (hy + hh / 2)) / (hh / 2)) ** 2 < 1;
+    for (let i = 0; i < pts.length - 1; i++) {
+      for (let t = 0; t <= 1; t += 0.02) {
+        const x = pts[i]![0]! + (pts[i + 1]![0]! - pts[i]![0]!) * t;
+        const y = pts[i]![1]! + (pts[i + 1]![1]! - pts[i]![1]!) * t;
+        expect(inside(x, y), `segment ${i} crosses hold at ${x},${y}`).toBe(false);
+      }
+    }
+  });
+
+  it("draws an actor generalization from the child's head to under the parent's name", () => {
+    const b = buildUsecase({ text: USECASE });
+    const gen = b.draw.children.find((c) => c.name === "link member generalization visitor")!;
+    const visitorName = b.draw.children.find((c) => c.name === "usecase:visitor name")!;
+    const pts = gen.points as number[][];
+    expect(pts[0]![0]).toBe(pts[1]![0]); // vertical
+    expect(pts[1]![1]!).toBeGreaterThanOrEqual(visitorName.y as number);
+  });
+});
+
 describe("journey", () => {
   it("parses phases with their rows and feeling", () => {
     const p = parseJourneyText(JOURNEY);
@@ -133,6 +162,8 @@ describe("persona", () => {
     expect(w).toMatch(/Nam has no pain/);
     expect(b.model.personas[0]!.levels![0]!.value).toBe(5);
     expect(b.draw.children.find((c) => c.name === "persona:thu")).toBeTruthy();
+    // "Persona · " is the prefix the screen checks know to skip.
+    expect(b.draw.name).toMatch(/^Persona · /);
   });
 
   it("asks for a source and a primary", () => {

@@ -16,7 +16,7 @@ loop, frame placement, verification. Field tables: `figma_docs(section="persona"
 Make the user concrete enough to settle arguments. A persona card says what one kind of
 person wants and what stops them; the primary persona is the tie-breaker when needs conflict.
 
-Output: one Figma frame `Personas · <title>`, plus the assumptions that still need research.
+Output: one Figma frame `Persona · <title>`, plus the assumptions that still need research.
 
 ## Constraints
 

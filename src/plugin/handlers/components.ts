@@ -128,8 +128,16 @@ async function findByName(name: string): Promise<{ exact: Listed | null; near: s
       return { exact: exact[0]!, near: exact.length > 1 ? exact.map((c) => `${c.name} (${c.id})`) : [] };
     }
     if (scope === "file") {
-      const ranked = rankCandidates(name, all, 5).map((s) => s.candidate.name);
-      return { exact: null, near: ranked.length ? ranked : closeSpellings(want, all) };
+      // Variants only crowd the hint ("Button/Size=sm, …" four times over)
+      // unless the caller was asking for one.
+      const pool = name.includes("=") ? all : all.filter((c) => !isVariant(c.node));
+      // Closest spelling first: "Buton" is one letter from "Button", while the
+      // word overlap ranks every "SmokeTest/…" alike and then by length.
+      const ranked = rankCandidates(name, pool, 8)
+        .map((s) => s.candidate.name)
+        .sort((a, b) => editDistance(want, normalizeName(a), 99) - editDistance(want, normalizeName(b), 99))
+        .slice(0, 5);
+      return { exact: null, near: ranked.length ? ranked : closeSpellings(want, pool) };
     }
   }
   return { exact: null, near: [] };
@@ -1120,22 +1128,64 @@ export async function detachInstance(ctx: HandlerContext): Promise<unknown> {
   return { id: frame.id, node: serializeNode(frame, "compact") };
 }
 
-/** reset_instance_overrides: back to the main component's values. */
+/**
+ * reset_instance_overrides: back to the main component's values.
+ *
+ * Figma's own reset leaves component PROPERTY values alone (a Label set to
+ * "Save" stays "Save"), which is not what "back to the main component" means
+ * to anybody reading the canvas. So TEXT / BOOLEAN / INSTANCE_SWAP values go
+ * back to their defaults too; the variant is kept (it is which component the
+ * instance IS, not an override). `keepProperties: true` skips that step.
+ */
 export async function resetInstanceOverrides(ctx: HandlerContext): Promise<unknown> {
   const inst = await requireInstance(ctx.params.nodeId);
   const before = (inst.overrides ?? []).length;
   const anyInst = inst as unknown as { removeOverrides?: () => void; resetOverrides: () => void };
   figmaCall("resetOverrides", () => (anyInst.removeOverrides ? anyInst.removeOverrides() : anyInst.resetOverrides()), "");
-  return { id: inst.id, cleared: before };
+  const restored: Record<string, unknown> = {};
+  if (ctx.params.keepProperties !== true) {
+    const main = await inst.getMainComponentAsync();
+    if (main) {
+      const owner = isVariant(main) ? (main.parent as ComponentSetNode) : main;
+      let defs: ComponentPropertyDefinitions | undefined;
+      try {
+        defs = owner.componentPropertyDefinitions;
+      } catch {
+        defs = undefined;
+      }
+      const current = inst.componentProperties;
+      const patch: Record<string, string | boolean> = {};
+      for (const [key, def] of Object.entries(defs ?? {})) {
+        if (def.type === "VARIANT" || def.type === "SLOT") continue;
+        if (current[key] && current[key]!.value !== def.defaultValue) patch[key] = def.defaultValue;
+      }
+      if (Object.keys(patch).length) {
+        figmaCall("setProperties", () => inst.setProperties(patch), "");
+        Object.assign(restored, patch);
+      }
+    }
+  }
+  return { id: inst.id, cleared: before, ...(Object.keys(restored).length ? { restoredProperties: restored } : {}) };
 }
 
 /** swap_component: point an instance at another component, keeping overrides where Figma can. */
 export async function swapComponent(ctx: HandlerContext): Promise<unknown> {
   const inst = await requireInstance(ctx.params.nodeId);
   const c = await resolveComponentRef(ctx.params.component ?? ctx.params.componentId, ctx, { key: ctx.params.key });
-  const target = c.type === "COMPONENT_SET" ? pickVariant(c as ComponentSetNode, ctx.params.variant) : (c as ComponentNode);
+  // Swapping within the SAME set changes only what was asked: { Tone: "x" }
+  // keeps the instance's current Size, rather than falling back to the default's.
+  const current = await inst.getMainComponentAsync();
+  let wanted = ctx.params.variant as Record<string, unknown> | undefined;
+  if (c.type === "COMPONENT_SET" && current && isVariant(current) && current.parent!.id === c.id && wanted && typeof wanted === "object") {
+    wanted = { ...parseVariantName(current.name), ...wanted };
+  }
+  const target = c.type === "COMPONENT_SET" ? pickVariant(c as ComponentSetNode, wanted) : (c as ComponentNode);
   figmaCall("swapComponent", () => inst.swapComponent(target), "The instance must not be a nested instance inside another instance.");
-  return { id: inst.id, componentId: target.id, componentName: target.name };
+  return {
+    id: inst.id,
+    componentId: target.id,
+    componentName: isVariant(target) ? `${target.parent!.name}/${target.name}` : target.name,
+  };
 }
 
 // ---------------------------------------------------------------------------

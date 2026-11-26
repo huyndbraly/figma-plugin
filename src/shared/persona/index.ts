@@ -330,7 +330,7 @@ export function buildPersona(spec: PersonaSpec): BoardBuild<PersonaModel> {
   return {
     draw: {
       kind: "persona",
-      name: `Personas · ${title}`,
+      name: `Persona · ${title}`,
       title,
       x: spec.x ?? 0,
       y: spec.y ?? 0,

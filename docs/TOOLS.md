@@ -214,7 +214,7 @@ Components are named by **name** as readily as by id (`"Button"`, `"Button/Size=
 | `swapComponent` | `swapComponent(instanceId, component, { variant? })` | Point an instance at another component; Figma keeps the overrides it can. |
 | `exposeNestedInstance` | `exposeNestedInstance(nestedInstanceId, { expose? })` | Surface a nested instance's properties on the component that contains it. |
 | `detachInstance` | `detachInstance(instanceId)` | Instance → plain frame. Returns the frame's `{ id }`. |
-| `resetInstanceOverrides` | `resetInstanceOverrides(instanceId)` | Back to the main component's values. |
+| `resetInstanceOverrides` | `resetInstanceOverrides(instanceId, { keepProperties? })` | Back to the main component's values: clears overrides AND puts TEXT/BOOLEAN/INSTANCE_SWAP property values back to their defaults (Figma's own reset leaves those). The variant is kept. `keepProperties: true` clears overrides only. |
 
 ```js
 const btn = await figma.createVariants({

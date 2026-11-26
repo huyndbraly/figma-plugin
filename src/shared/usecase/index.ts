@@ -406,41 +406,87 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
   const actorBlock = (list: UcActor[]) => list.length * ACTOR_H;
   const actorY0 = (list: UcActor[]) => boundY + Math.max(0, (boundH - actorBlock(list)) / 2);
   const anchors = new Map<string, Pt>();
+  /** Where each actor stands: figure centre x, top of the head, bottom of its name. */
+  const figures = new Map<string, { cx: number; top: number; bottom: number }>();
   const actorSpecsAll: Spec[] = [];
-  left.forEach((a, i) => {
-    const r = actorSpecs(a, PAD, actorY0(left) + i * ACTOR_H);
+  const place = (a: UcActor, x: number, y: number, side: "left" | "right") => {
+    const r = actorSpecs(a, x, y);
     actorSpecsAll.push(...r.specs);
-    anchors.set(a.id, r.anchor.right);
-  });
-  right.forEach((a, i) => {
-    const r = actorSpecs(a, boundX + boundW + 70, actorY0(right) + i * ACTOR_H);
-    actorSpecsAll.push(...r.specs);
-    anchors.set(a.id, r.anchor.left);
-  });
+    anchors.set(a.id, side === "left" ? r.anchor.right : r.anchor.left);
+    const nameH = textHeight(a.name ?? a.id, ACTOR_W, 12);
+    figures.set(a.id, { cx: x + ACTOR_W / 2, top: y, bottom: y + 74 + nameH + 4 });
+  };
+  left.forEach((a, i) => place(a, PAD, actorY0(left) + i * ACTOR_H, "left"));
+  right.forEach((a, i) => place(a, boundX + boundW + 70, actorY0(right) + i * ACTOR_H, "right"));
+
+  /**
+   * A straight line from an actor that passes through ANOTHER use case reads
+   * as a link to that one (the ellipse is painted over the line). Detour
+   * above or below the first ellipse in the way.
+   */
+  const blockedBy = (a: Pt, b: Pt, skip: string): Box | undefined => {
+    for (const [id, box] of boxes) {
+      if (id === skip) continue;
+      const rx = box.w / 2 + 6;
+      const ry = box.h / 2 + 6;
+      const cx = box.x + box.w / 2;
+      const cy = box.y + box.h / 2;
+      for (let t = 0.04; t < 0.96; t += 0.02) {
+        const x = a[0] + (b[0] - a[0]) * t;
+        const y = a[1] + (b[1] - a[1]) * t;
+        if (((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1) return box;
+      }
+    }
+    return undefined;
+  };
+  const routeTo = (from: Pt, target: Box, targetId: string): Pt[] => {
+    const direct = ellipsePoint(target, from);
+    const hit = blockedBy(from, direct, targetId);
+    if (!hit) return [from, direct];
+    const cx = hit.x + hit.w / 2;
+    const above: Pt = [cx, hit.y - 14];
+    const below: Pt = [cx, hit.y + hit.h + 14];
+    const targetCy = target.y + target.h / 2;
+    const wp = Math.abs(above[1] - targetCy) <= Math.abs(below[1] - targetCy) ? above : below;
+    return [from, wp, ellipsePoint(target, wp)];
+  };
 
   const children: Spec[] = [...head.specs];
   children.push(rect("system boundary", boundX, boundY, boundW, boundH, { fill: "#fbfcfd", stroke: RULE, radius: 12 }));
   if (drawn.system) children.push(text("system name", boundX + BOUND_PAD, boundY + 14, boundW - BOUND_PAD * 2, drawn.system, { size: 14, weight: "Bold", color: INK }));
 
   // Lines under the shapes.
-  const actorBox = (id: string): Box | undefined => {
-    const p = anchors.get(id);
-    return p ? { x: p[0] - 24, y: p[1] - 34, w: 48, h: 90 } : undefined;
-  };
   for (const l of drawn.links) {
     const name = `link ${l.from} ${l.kind} ${l.to}`;
     if (l.kind === "association") {
       const from = anchors.get(l.from);
       const to = boxes.get(l.to);
       if (!from || !to) continue;
-      children.push(line(name, [from, ellipsePoint(to, from)], { color: MUTED }));
+      children.push(line(name, routeTo(from, to, l.to), { color: MUTED }));
     } else if (l.kind === "generalization") {
       const isActorLink = anchors.has(l.from);
-      const a = isActorLink ? actorBox(l.from) : boxes.get(l.from);
-      const b = isActorLink ? actorBox(l.to) : boxes.get(l.to);
-      if (!a || !b) continue;
-      const start = isActorLink ? center(a) : ellipsePoint(a, center(b));
-      const tip = isActorLink ? [center(b)[0], b.y + b.h + 4] as Pt : ellipsePoint(b, center(a));
+      let start: Pt;
+      let tip: Pt;
+      if (isActorLink) {
+        const c = figures.get(l.from);
+        const p = figures.get(l.to);
+        if (!c || !p) continue;
+        // Stacked on one side: head of the child straight up to under the
+        // parent's name. Otherwise centre to centre.
+        if (Math.abs(c.cx - p.cx) < 1) {
+          start = c.top > p.top ? [c.cx, c.top - 4] : [c.cx, c.bottom];
+          tip = c.top > p.top ? [p.cx, p.bottom] : [p.cx, p.top - 4];
+        } else {
+          start = [c.cx, (c.top + c.bottom) / 2];
+          tip = [p.cx + (c.cx > p.cx ? 30 : -30), (p.top + p.bottom) / 2];
+        }
+      } else {
+        const a = boxes.get(l.from);
+        const b = boxes.get(l.to);
+        if (!a || !b) continue;
+        start = ellipsePoint(a, center(b));
+        tip = ellipsePoint(b, center(a));
+      }
       const dx = tip[0] - start[0];
       const dy = tip[1] - start[1];
       const len = Math.hypot(dx, dy) || 1;
@@ -467,7 +513,8 @@ export function buildUsecase(spec: UsecaseSpec): BoardBuild<UsecaseModel> {
       const from = anchors.get(l.from);
       const to = boxes.get(l.to);
       if (!from || !to) continue;
-      const p = ellipsePoint(to, from);
+      const path = routeTo(from, to, l.to);
+      const p = path[path.length - 1]!;
       children.push(text(`link ${l.from} ${l.to} label`, (from[0] + p[0]) / 2 - 50, (from[1] + p[1]) / 2 - 18, 100, l.label, { size: 10, color: MUTED, align: "CENTER" }));
     }
   }

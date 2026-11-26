@@ -277,6 +277,7 @@
   // always rebinds the same port, and walking first meant a full lap of dead
   // ports (tens of seconds) before coming back to it.
   var SAME_PORT_RETRIES = 3;
+  var WALK_STEP_MS = 600;
   var MAX_LOG_ROWS = 100;
 
   // Mirrored from src/shared/protocol.ts WRITE_OPERATIONS — used to classify
@@ -746,10 +747,16 @@
         portIndex = (portIndex + 1) % PORT_RANGE;
       }
     }
-    var wait = backoff;
+    // Walking the fallback ports is a sweep, not a retry: each port is a fresh
+    // target, so it gets a short fixed step. Backoff grows only on the default
+    // port. With the 8s cap applied to every step, a restarted server (back on
+    // the default port within seconds) waited out a ~80s tour of nine empty
+    // ports before the plugin looked at it again.
+    var walking = advancePort && portIndex !== 0;
+    var wait = walking ? WALK_STEP_MS : backoff;
     setState("connecting", "Retrying in " + Math.round(wait / 100) / 10 + "s…");
     reconnectTimer = setTimeout(connect, wait);
-    backoff = Math.min(backoff * 2, BACKOFF_MAX);
+    if (!walking) backoff = Math.min(backoff * 2, BACKOFF_MAX);
   }
 
   el.retry.onclick = function () {

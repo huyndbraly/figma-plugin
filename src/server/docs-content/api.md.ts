@@ -79,7 +79,8 @@ separators; a near miss throws with the closest names — never a guess.
   modify() props on layers inside the instance; \`{from: otherInstanceId}\`
   copies another instance's overrides. \`getInstanceOverrides(id)\` reads them.
 - \`swapComponent(id, component)\`, \`exposeNestedInstance(id)\`,
-  \`detachInstance(id)\`, \`resetInstanceOverrides(id)\`.
+  \`detachInstance(id)\`, \`resetInstanceOverrides(id, {keepProperties?})\` (also
+  resets property values to their defaults; the variant is kept).
 - \`getLibraryComponent(key)\` — import a component/set from a PUBLISHED
   shared library by key; returns the same rich shape as get_component
   (props + variants + anatomy = reconstruction spec). Instantiate the result

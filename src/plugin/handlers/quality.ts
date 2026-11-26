@@ -445,7 +445,9 @@ export async function responsiveAudit(ctx: HandlerContext): Promise<unknown> {
       const map = buildChildMap(toMini(base), toMini(copy));
       const back = new Map(Object.entries(map).map(([orig, cp]) => [cp, orig]));
       back.set(copy.id, base.id);
-      const remap = (s: string) => s.replace(/\(([^()\s]+)\)/g, (all, id: string) => (back.has(id) ? `(${back.get(id)})` : all));
+      // Every id the audit prints — "(2:39)" or a bare "clipped by 2:47" —
+      // names a node of the throwaway copy; say which ORIGINAL it is.
+      const remap = (s: string) => s.replace(/I?\d+:\d+(?:;\d+:\d+)*/g, (id) => back.get(id) ?? id);
       const audit = (await layoutAudit(subCtx(ctx, { nodeId: copy.id }))) as { summary: { issues: string[] } };
       const hints: string[] = [];
       for (const child of copy.findAll((k) => k.visible !== false)) {
