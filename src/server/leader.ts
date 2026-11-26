@@ -13,10 +13,13 @@
  * A process that hits EADDRINUSE verifies the incumbent via GET /health and
  * becomes a FOLLOWER, forwarding every operation via POST /rpc with the
  * leader's Bearer token. Followers run a jittered 3–5 s health monitor and,
- * on leader death (health unreachable + stale/removed token file), attempt
- * takeover by re-running election. A 401 from the leader triggers a re-read
- * of the discovery file (the leader restarted with a fresh token) before the
- * error is surfaced.
+ * on leader death (connection refused, or no answer from a process that is
+ * gone), take over by contending for the dead leader's port only. A forward
+ * refused by the leader takes over at once and sends the op again. A leader
+ * that is merely busy (its process alive, its /health late) is followed,
+ * never stepped around. A 401 from the leader triggers a re-read of the
+ * discovery file (the leader restarted with a fresh token) before the error
+ * is surfaced.
  *
  * CRITICAL: the `runValidated` callback — passed in by index.ts — wraps
  * validateOperation() and is invoked in exactly ONE place per role:
@@ -28,11 +31,11 @@
 import { mkdir, writeFile, readFile, rename, rm } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { Bridge } from "./bridge.js";
-import { DEFAULT_PORT, PORT_RANGE, type LeaderInfo } from "../shared/protocol.js";
+import { DEFAULT_PORT, PORT_RANGE, READ_OPERATIONS, type LeaderInfo } from "../shared/protocol.js";
 import { baseDir, leaderFilePath, leaderFilePathFor } from "./paths.js";
 import { VERSION } from "./version.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
-import { Follower } from "./follower.js";
+import { Follower, LeaderUnreachable, pidAlive } from "./follower.js";
 
 export type Role = "leader" | "follower";
 
@@ -41,13 +44,26 @@ export type Role = "leader" | "follower";
  * supplies this; it is the single validation choke point. Signature matches
  * both the leader-direct path and the /rpc path. `channel` targets a specific
  * Figma window; `sessionId` also feeds Figma-side session→channel bindings.
+ * `signal` aborts when the caller stops waiting.
  */
 export type RunValidated = (
   op: string,
   params: Record<string, unknown>,
   sessionId?: string,
   route?: import("./route.js").RouteArg,
+  signal?: AbortSignal,
 ) => Promise<unknown>;
+
+/**
+ * Forwards that only read: safe to send again after the connection to the
+ * leader reset under them. A write might have started on the old leader.
+ */
+const REPEATABLE_FORWARDS = new Set<string>([
+  ...(READ_OPERATIONS as readonly string[]),
+  "list_channels",
+  "__status__",
+  "__register__",
+]);
 
 export interface CoordinatorDeps {
   /** Validate + dispatch (leader path). Also used for /rpc forwards. */
@@ -60,6 +76,14 @@ export interface CoordinatorDeps {
    * every op after a takeover failed NOT_CONNECTED).
    */
   onBridgeCreated?: (bridge: Bridge) => void;
+  /**
+   * Fires whenever this process starts following a leader — at election,
+   * after a takeover by another process, after the leader restarted with a
+   * new token. The new leader knows nothing of this process's session, so
+   * index.ts registers it again; otherwise the plugin's session picker lost
+   * every follower after a failover.
+   */
+  onFollowerCreated?: () => void;
   /** Health poll interval bounds (ms); default 3000–5000 jittered. */
   healthIntervalMs?: [number, number];
   startPort?: number;
@@ -92,9 +116,12 @@ export class Coordinator {
    *      leader.json). This is the fix for the "every window becomes its own
    *      leader" bug: a second instance now discovers the incumbent instead
    *      of grabbing the next free port.
-   *   2. Else try to BIND it → become LEADER. A foreign process that squats a
-   *      port (health check fails) is skipped so a Figma Plugin MCP leader can still
-   *      live on a higher port (the plugin walks the same range to find it).
+   *   2. Else, if nobody listens, try to BIND it → become LEADER. A foreign
+   *      process that squats a port is skipped so a Figma Plugin MCP leader
+   *      can still live on a higher port (the plugin walks the same range to
+   *      find it). A port that accepts but answers late is skipped only when
+   *      its discovery file does not name a live process — a busy leader of
+   *      ours is followed, never stepped around.
    * Ties/races on the same port (bind loses to a peer that just came up) are
    * resolved by a bounded retry of the whole election. Each start() call is a
    * fresh run with a fresh retry budget.
@@ -104,33 +131,54 @@ export class Coordinator {
     return this.elect();
   }
 
-  private async elect(): Promise<Role> {
+  /**
+   * @param onlyPort A takeover: contend for the dead leader's port and
+   *   nothing else. Walking on to port+1 there is how a briefly busy leader
+   *   ended up with a second leader beside it — one the plugin, still on the
+   *   first port, never talks to.
+   */
+  private async elect(onlyPort?: number): Promise<Role> {
     this.electionAttempts++;
+    if (this.closed) throw new Error("Coordinator closed.");
     if (this.electionAttempts > Coordinator.MAX_ELECTION_ATTEMPTS) {
       throw new Error(
         `Could not become leader or follower after ${Coordinator.MAX_ELECTION_ATTEMPTS} attempts — ` +
-          `port ${this.deps.startPort ?? DEFAULT_PORT}..+${PORT_RANGE - 1} may be held by a foreign process. ` +
+          `port ${onlyPort ?? this.deps.startPort ?? DEFAULT_PORT}${onlyPort === undefined ? `..+${PORT_RANGE - 1}` : ""} may be held by a foreign process. ` +
           `Free one of those ports, or set FIGMA_MCP_PORT to a free port in ` +
           `${DEFAULT_PORT}-${DEFAULT_PORT + PORT_RANGE - 1} (the range the Figma plugin scans).`,
       );
     }
-    const startPort = this.deps.startPort ?? DEFAULT_PORT;
+    const startPort = onlyPort ?? this.deps.startPort ?? DEFAULT_PORT;
+    const span = onlyPort === undefined ? PORT_RANGE : 1;
     const token = randomBytes(24).toString("hex");
 
-    for (let i = 0; i < PORT_RANGE; i++) {
+    for (let i = 0; i < span; i++) {
       const port = startPort + i;
+      const state = await Follower.probe(port);
 
-      // 1. A Figma Plugin MCP leader already lives here → follow it (or retry on race).
-      if (await Follower.checkHealth(port)) {
+      // 1. A Figma Plugin MCP leader lives here → follow it (or retry on
+      // race). A `busy` port counts when its discovery file names a live
+      // process: a leader blocked past the health timeout by a long op is
+      // still the leader, and skipping its port split the cohort in two.
+      if (state === "ok" || (state === "busy" && (await this.ownedByLiveLeader(port)))) {
         const followed = await this.tryFollowOn(port);
         if (followed) return "follower";
         // It answers /health but its discovery file isn't visible/matching
         // yet (it is still starting up). Back off and re-run the election.
         await delay(250);
-        return this.elect();
+        return this.elect(onlyPort);
+      }
+      if (state !== "refused") {
+        // Something that is not ours holds it. Skip it — except in a
+        // takeover, which waits for this port rather than moving.
+        if (onlyPort !== undefined) {
+          await delay(250);
+          return this.elect(onlyPort);
+        }
+        continue;
       }
 
-      // 2. Nothing (or a foreign process) here → try to become leader.
+      // 2. Nobody listens here → try to become leader.
       const bridge = new Bridge({
         // The /rpc forward path: a follower forwarded an op → leader runs it
         // through the SAME validate+dispatch choke point as its own calls.
@@ -152,12 +200,19 @@ export class Coordinator {
       } catch (err) {
         await bridge.close().catch(() => {});
         if (!isAddrInUse(err)) throw err;
-        // The port was taken between the health check and our bind. If a
-        // Figma Plugin MCP peer grabbed it, re-run election so we follow it; if a
-        // foreign process took it, move on to the next port.
-        if (await Follower.checkHealth(port)) {
+        // The port was taken between the probe and our bind. If a Figma
+        // Plugin MCP peer grabbed it (healthy, still starting, or ours and
+        // busy), re-run election so we follow it; only a foreign process
+        // sends us on to the next port.
+        const again = await Follower.probe(port);
+        if (
+          onlyPort !== undefined ||
+          again === "ok" ||
+          again === "refused" ||
+          (again === "busy" && (await this.ownedByLiveLeader(port)))
+        ) {
           await delay(200);
-          return this.elect();
+          return this.elect(onlyPort);
         }
         continue;
       }
@@ -165,7 +220,36 @@ export class Coordinator {
 
     // Whole range is held by foreign/unhealthy processes.
     await delay(250);
-    return this.elect();
+    return this.elect(onlyPort);
+  }
+
+  /** Does leader-<port>.json name a process that is still running? */
+  private async ownedByLiveLeader(port: number): Promise<boolean> {
+    const info = await this.readLeaderFile(port);
+    return !!info && info.port === port && pidAlive(info.pid);
+  }
+
+  /**
+   * Take over from a leader that stopped answering — once, however many
+   * callers notice at the same moment (the health monitor and several
+   * failing forwards). Contends only for the dead leader's port.
+   */
+  private takeoverRun?: Promise<void>;
+  private takeover(deadPort: number): Promise<void> {
+    if (this.takeoverRun) return this.takeoverRun;
+    this.stopHealthMonitor();
+    this.takeoverRun = (async () => {
+      try {
+        this.electionAttempts = 0;
+        await this.elect(deadPort);
+      } catch {
+        // Lost or blocked: keep following and let the monitor try again.
+        if (!this.closed && this.role === "follower") this.startHealthMonitor();
+      } finally {
+        this.takeoverRun = undefined;
+      }
+    })();
+    return this.takeoverRun;
   }
 
   /**
@@ -181,6 +265,7 @@ export class Coordinator {
     this.follower = new Follower(info);
     this.startHealthMonitor();
     this.electionAttempts = 0;
+    this.deps.onFollowerCreated?.();
     return true;
   }
 
@@ -191,12 +276,16 @@ export class Coordinator {
     sessionId?: string,
     channel?: string,
     timeoutMs?: number,
-    route?: { file?: string; page?: string },
+    route?: { file?: string; page?: string; signal?: AbortSignal },
   ): Promise<unknown> {
     if (!this.follower) {
       throw new OpError(ErrorCode.INTERNAL, "forward() called without a follower.", "This is a server bug.");
     }
-    const opts = route?.file || route?.page ? { file: route.file, page: route.page } : undefined;
+    const opts = {
+      ...(route?.file ? { file: route.file } : {}),
+      ...(route?.page ? { page: route.page } : {}),
+      ...(route?.signal ? { signal: route.signal } : {}),
+    };
     try {
       return await this.follower.forward(op, params, sessionId, channel, timeoutMs, opts);
     } catch (err) {
@@ -210,6 +299,26 @@ export class Coordinator {
         (await this.refreshFollowerInfo())
       ) {
         return this.follower.forward(op, params, sessionId, channel, timeoutMs, opts);
+      }
+      // The leader is gone: take over NOW rather than at the next health
+      // tick (3–5s away), then send the op once more — to ourselves if we
+      // won, to the new leader if someone else did. A refused connection
+      // never reached anyone, so any op may go again; a reset one may have
+      // started on the dead leader, so only reads are repeated.
+      if (err instanceof LeaderUnreachable && this.follower && !this.closed) {
+        await this.takeover(this.follower.info.port);
+        if (err.kind === "refused" || REPEATABLE_FORWARDS.has(op)) {
+          if (this.role === "leader") {
+            return this.deps.runValidated(
+              op,
+              params,
+              sessionId,
+              { ...(channel ? { channel } : {}), ...(route?.file ? { file: route.file } : {}), ...(route?.page ? { page: route.page } : {}) },
+              route?.signal,
+            );
+          }
+          return this.follower.forward(op, params, sessionId, channel, timeoutMs, opts);
+        }
       }
       throw err;
     }
@@ -229,36 +338,36 @@ export class Coordinator {
       return false;
     }
     this.follower = new Follower(fresh);
+    this.deps.onFollowerCreated?.();
     return true;
   }
 
   private startHealthMonitor(): void {
+    this.stopHealthMonitor();
     const [lo, hi] = this.deps.healthIntervalMs ?? [3000, 5000];
     const tick = async () => {
       if (this.closed || this.role !== "follower" || !this.follower) return;
-      let alive = await Follower.checkHealth(this.follower.info.port).catch(() => false);
-      if (!alive) {
-        // A single dropped /health request does not prove that the leader is
+      const leader = this.follower.info;
+      let state = await Follower.probe(leader.port).catch(() => "refused" as const);
+      if (state === "busy" || state === "foreign") {
+        // A single slow or garbled /health does not prove that the leader is
         // dead. In particular, deleting its discovery file after one miss
         // strands a still-listening leader: new MCP processes can see the
         // healthy port but have no token with which to follow it.
         await delay(250);
-        alive = await Follower.checkHealth(this.follower.info.port).catch(() => false);
+        state = await Follower.probe(leader.port).catch(() => "refused" as const);
       }
-      if (!alive) {
-        // Leader looks dead — attempt takeover by re-electing.
-        this.stopHealthMonitor();
-        try {
-          // Do not remove another process's discovery file here. If the
-          // leader really died, binding its now-free port and publishing our
-          // own token replaces the stale file atomically. If this was merely
-          // a transient health failure, leaving the file alone keeps the live
-          // leader discoverable.
-          await this.start();
-        } catch {
-          // Election lost the race (someone else took over) → resume follow.
-          this.startHealthMonitor();
-        }
+      // Refused = nothing listens: the leader is dead, take over at once.
+      // Busy while its process lives = a long op blocks its event loop; it
+      // is still the leader and the plugin is still connected to it.
+      const dead = state === "refused" || (state !== "ok" && !(state === "busy" && pidAlive(leader.pid)));
+      if (dead) {
+        // Do not remove another process's discovery file here. If the
+        // leader really died, binding its now-free port and publishing our
+        // own token replaces the stale file atomically. If this was merely
+        // a transient health failure, leaving the file alone keeps the live
+        // leader discoverable.
+        await this.takeover(leader.port);
         return;
       }
       this.scheduleHealth(lo, hi, tick);

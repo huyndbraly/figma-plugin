@@ -318,6 +318,21 @@ const channelLoaded: Promise<void> = figma.clientStorage
     /* first run / storage unavailable — server will assign a channel */
   });
 
+/**
+ * Requests run one at a time, in arrival order. The server sends one op per
+ * window at a time — but only per CONNECTION: after a reconnect the new
+ * connection's first op arrived while the op from the old connection was
+ * still running here, and two handlers interleaved on one document (the
+ * Plugin API corrupts its own transient state when mutations overlap). A
+ * `batch` is one request, so its items stay inside its turn.
+ */
+let turn: Promise<void> = Promise.resolve();
+function runInTurn(work: () => Promise<void>): Promise<void> {
+  const next = turn.then(work, work);
+  turn = next.catch(() => undefined);
+  return next;
+}
+
 figma.ui.onmessage = async (msg: UiToMain) => {
   if (!msg || typeof msg !== "object") return;
   switch (msg.kind) {
@@ -371,8 +386,11 @@ figma.ui.onmessage = async (msg: UiToMain) => {
       break;
     }
     case "request": {
-      const res = await dispatch(msg.payload);
-      post({ kind: "response", payload: res, op: msg.payload.op });
+      const req = msg.payload;
+      await runInTurn(async () => {
+        const res = await dispatch(req);
+        post({ kind: "response", payload: res, op: req.op });
+      });
       break;
     }
     case "local": {
@@ -390,26 +408,32 @@ figma.ui.onmessage = async (msg: UiToMain) => {
         });
         break;
       }
+      const op = msg.op;
+      const id = msg.id;
       const ctx = makeContext(msg.params ?? {}, () => {});
-      try {
-        const result = await HANDLERS[msg.op](ctx);
-        post({
-          kind: "local",
-          id: msg.id,
-          ok: true,
-          result,
-          ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
-        });
-      } catch (e) {
-        const bridgeError = toBridgeError(e);
-        post({
-          kind: "local",
-          id: msg.id,
-          ok: false,
-          error: bridgeError,
-          ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
-        });
-      }
+      // Same turn-taking as server requests: a panel click must not switch
+      // the page under an agent's op that is half done.
+      await runInTurn(async () => {
+        try {
+          const result = await HANDLERS[op](ctx);
+          post({
+            kind: "local",
+            id,
+            ok: true,
+            result,
+            ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+          });
+        } catch (e) {
+          const bridgeError = toBridgeError(e);
+          post({
+            kind: "local",
+            id,
+            ok: false,
+            error: bridgeError,
+            ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+          });
+        }
+      });
       break;
     }
     default:

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer as netServer } from "node:net";
 import type { LeaderInfo } from "../../src/shared/protocol.js";
 import { Coordinator } from "../../src/server/leader.js";
 import { Bridge } from "../../src/server/bridge.js";
@@ -113,10 +114,11 @@ describe("election attempt budget", () => {
     coords.push(follower);
     expect(await follower.start()).toBe("follower");
 
+    // One slow /health (the leader busy for a moment), then a healthy one.
     const check = vi
-      .spyOn(Follower, "checkHealth")
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+      .spyOn(Follower, "probe")
+      .mockResolvedValueOnce("busy")
+      .mockResolvedValueOnce("ok");
     try {
       await vi.waitFor(() => expect(check.mock.calls.length).toBeGreaterThanOrEqual(2), {
         timeout: 1_000,
@@ -169,5 +171,98 @@ describe("follower token refresh on 401", () => {
     const d = mkCoord(46341);
     expect(await d.start()).toBe("follower");
     await expect(d.forward("get_selection", {})).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+  }, 20_000);
+});
+
+describe("a busy leader is followed, not stepped around (split brain)", () => {
+  it("follows a leader that accepts but answers late when its process is alive", async () => {
+    // Stand-in for a leader whose event loop is blocked past the 1.5s
+    // health timeout: TCP accepts, HTTP never answers.
+    const hole = netServer(() => {});
+    await new Promise<void>((r) => hole.listen(46350, "127.0.0.1", () => r()));
+    try {
+      await mkdir(baseDir(), { recursive: true });
+      await writeFile(
+        leaderFilePathFor(46350),
+        JSON.stringify({ ...infoFor(46350, "busy-token"), pid: process.pid }),
+        { mode: 0o600 },
+      );
+      const d = mkCoord(46350);
+      // Previously: health "failed" twice, EADDRINUSE, and d became a SECOND
+      // leader on 46351 with no plugin behind it.
+      expect(await d.start()).toBe("follower");
+      expect(d.info()?.port).toBe(46350);
+    } finally {
+      hole.close();
+    }
+  }, 20_000);
+
+  it("still skips a silent port that no live leader of ours claims", async () => {
+    const hole = netServer(() => {});
+    await new Promise<void>((r) => hole.listen(46352, "127.0.0.1", () => r()));
+    try {
+      const d = mkCoord(46352);
+      expect(await d.start()).toBe("leader");
+      expect(d.info()?.port).toBe(46353);
+    } finally {
+      hole.close();
+    }
+  }, 20_000);
+});
+
+describe("fast failover", () => {
+  it("a forward refused by a dead leader takes over at once and runs the op", async () => {
+    const leader = mkCoord(46360);
+    expect(await leader.start()).toBe("leader");
+
+    const ran: string[] = [];
+    const f = new Coordinator({
+      runValidated: async (op) => {
+        ran.push(op);
+        return { ranOn: "new-leader" };
+      },
+      startPort: 46360,
+      healthIntervalMs: [60_000, 60_001], // the monitor must not be what saves us
+    });
+    coords.push(f);
+    expect(await f.start()).toBe("follower");
+
+    await leader.close();
+    coords.splice(coords.indexOf(leader), 1);
+
+    expect(await f.forward("get_selection", {})).toEqual({ ranOn: "new-leader" });
+    expect(f.role).toBe("leader");
+    expect(f.info()?.port).toBe(46360);
+    expect(ran).toEqual(["get_selection"]);
+  }, 20_000);
+
+  it("takes over on the first refused health check and registers again with whoever leads", async () => {
+    const leader = mkCoord(46370);
+    expect(await leader.start()).toBe("leader");
+    let follows = 0;
+    const f = new Coordinator({
+      runValidated: async () => ({}),
+      startPort: 46370,
+      healthIntervalMs: [5, 6],
+      onFollowerCreated: () => {
+        follows++;
+      },
+    });
+    coords.push(f);
+    expect(await f.start()).toBe("follower");
+    expect(follows).toBe(1);
+
+    // One refused probe — the leader is in fact alive, so the takeover
+    // attempt ends by following it again. The old monitor re-checked after
+    // 250ms first; now the first refusal is enough to act.
+    const real = Follower.probe.bind(Follower);
+    const probe = vi.spyOn(Follower, "probe").mockImplementation(real);
+    probe.mockImplementationOnce(async () => "refused");
+    try {
+      await vi.waitFor(() => expect(follows).toBe(2), { timeout: 2_000 });
+      expect(f.role).toBe("follower");
+    } finally {
+      probe.mockRestore();
+    }
   }, 20_000);
 });

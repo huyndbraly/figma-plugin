@@ -8,9 +8,11 @@
  *                   (requested in hello, or assigned by the server and echoed
  *                   back with a `{type:"assigned"}` message). Multiple Figma
  *                   windows stay connected simultaneously, one per channel. A
- *                   new hello on an EXISTING channel replaces only that
- *                   channel's connection (its in-flight requests are failed
- *                   fast) — other channels are untouched.
+ *                   resume hello (channel + token) on an EXISTING channel
+ *                   replaces that channel's connection only when the old
+ *                   socket no longer answers a ping (its in-flight requests
+ *                   fail, its queued ones move over); a live incumbent keeps
+ *                   its channel and the newcomer gets a fresh one.
  *   GET  /health  — diagnostics JSON (used by follower discovery + status).
  *   POST /rpc     — follower → leader forwarding, Bearer-token authed. The
  *                   forwarded op still goes through the same validate + queue
@@ -23,6 +25,8 @@
  *     (same wait-for-plugin behaviour the single-connection bridge had);
  *   no channel + several → file/page match, then session sticky, then
  *     focused window, then AMBIGUOUS_CHANNEL listing files not channel ids.
+ *   An op whose window disconnected moments ago (route.ts RECONNECT_GRACE_MS)
+ *     waits for it in the same queue, re-resolved on every hello.
  *
  * Correlation: every dispatched request gets an id; responses/progress are
  * matched via the owning connection's `pending` map. Each op has a per-op
@@ -48,7 +52,14 @@ import {
   type WireMessage,
 } from "../shared/protocol.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
-import { namesMatch, resolveRoute, USER_ACTIVITY_FRESH_MS, type RouteArg } from "./route.js";
+import {
+  namesMatch,
+  resolveRoute,
+  RECONNECT_GRACE_MS,
+  USER_ACTIVITY_FRESH_MS,
+  type RouteArg,
+  type RouteDecision,
+} from "./route.js";
 
 /**
  * Does this operation CHANGE the document? A timeout on a read is just a
@@ -59,6 +70,39 @@ const MUTATING = new Set<string>(WRITE_OPERATIONS as readonly string[]);
 function mutates(op: string): boolean {
   return MUTATING.has(op);
 }
+
+/**
+ * The hint for a write whose outcome is unknown — it reached the plugin and
+ * then the answer was lost. Saying only "retry" is how a page ends up with
+ * every diagram on it twice.
+ */
+function mayHaveCompletedHint(op: string): string {
+  return `The Figma plugin was NOT cancelled — "${op}" may well have completed. Do NOT simply retry: check with figma_read op:"get_page_model" (or get_design_context) first, and if the frame is there, use \`update\` with its id rather than drawing a second one.`;
+}
+
+/**
+ * The error for a request lost with its connection. Three different
+ * situations, three different next steps: never sent (retry is safe), a read
+ * on the wire (retry is safe), a write on the wire (check before retrying).
+ */
+function connectionLostError(op: string, sent: boolean, message: string, reconnectHint: string): OpError {
+  if (!sent) {
+    return new OpError(
+      ErrorCode.NOT_CONNECTED,
+      message,
+      `Nothing was sent to Figma for "${op}" — it is safe to retry. ${reconnectHint}`,
+    );
+  }
+  if (mutates(op)) {
+    return new OpError(ErrorCode.NOT_CONNECTED, message, `${mayHaveCompletedHint(op)} ${reconnectHint}`);
+  }
+  return new OpError(ErrorCode.NOT_CONNECTED, message, `The answer was lost; a read is safe to retry. ${reconnectHint}`);
+}
+
+/** How long a resume hello waits for the incumbent socket to answer a ping. */
+const DEFAULT_LIVENESS_PROBE_MS = 1500;
+/** Disconnected channels remembered for routing (last file/page shown). */
+const MAX_GONE = 64;
 
 /** Cap on requests waiting for a plugin slot (per connection + unrouted). */
 const MAX_QUEUE = 100;
@@ -155,6 +199,14 @@ interface QueueItem {
   pending: Pending;
 }
 
+/** An op waiting for its window (none connected, or the right one away). */
+interface ParkedItem extends QueueItem {
+  opts: DispatchOptions;
+  /** When it stops waiting and gets a final answer (epoch ms). */
+  deadlineAt: number;
+  parkedAt: number;
+}
+
 export interface DispatchOptions {
   timeoutMs?: number;
   chunk?: BridgeRequest["chunk"];
@@ -188,12 +240,17 @@ export interface DispatchOptions {
 }
 
 export interface BridgeHandlers {
-  /** Called for POST /rpc after Bearer auth passes. Returns the op result. */
+  /**
+   * Called for POST /rpc after Bearer auth passes. Returns the op result.
+   * `signal` aborts when the follower stops waiting (its HTTP request
+   * closed), so an op still queued is dropped instead of running for nobody.
+   */
   onRpc?: (
     op: string,
     params: Record<string, unknown>,
     sessionId?: string,
     route?: RouteArg,
+    signal?: AbortSignal,
   ) => Promise<unknown>;
 }
 
@@ -202,6 +259,10 @@ export interface BridgeOptions {
   helloTimeoutMs?: number;
   /** Max accepted WS frame size in bytes. */
   maxPayloadBytes?: number;
+  /** ms a resume hello waits for the incumbent socket's pong. */
+  livenessProbeMs?: number;
+  /** ms an op waits for a window that disconnected (default RECONNECT_GRACE_MS). */
+  reconnectGraceMs?: number;
 }
 
 /**
@@ -290,8 +351,12 @@ class PluginConnection {
       pending.onProgress?.(res.progress);
     }
 
+    // Settle, let the owner react, THEN send the next op. A page switch
+    // queued ahead of its op cancels that op from its resolve/reject — it
+    // must run before drainQueue() puts the op on the wire.
     this.settle(res.id);
     pending.resolve(res);
+    this.drainQueue();
   }
 
   private armTimer(id: string, op: Operation, timeoutMs: number): NodeJS.Timeout {
@@ -299,6 +364,7 @@ class PluginConnection {
       const pending = this.pending.get(id);
       if (!pending) return;
       this.settle(id);
+      queueMicrotask(() => this.drainQueue()); // after the reject below
       pending.reject(
         new OpError(
           ErrorCode.PLUGIN_TIMEOUT,
@@ -323,13 +389,39 @@ class PluginConnection {
     pending.timer = this.armTimer(pending.id, pending.op, pending.timeoutMs);
   }
 
+  /** Forget a finished request and free its in-flight slot. The caller
+   * drains the queue once the request's owner has been told. */
   private settle(id: string): void {
     const pending = this.pending.get(id);
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pending.delete(id);
     if (this.inFlight > 0) this.inFlight--;
-    this.drainQueue();
+  }
+
+  /**
+   * Remove and return the requests already on the wire (sent, unanswered).
+   * Queued requests stay put, so a rejected page switch can still cancel the
+   * op queued behind it before the queue is handed on.
+   */
+  takeInFlight(): Pending[] {
+    const queued = new Set(this.queue.map((item) => item.pending.id));
+    const out: Pending[] = [];
+    for (const [id, p] of this.pending) {
+      if (queued.has(id)) continue;
+      clearTimeout(p.timer);
+      this.pending.delete(id);
+      out.push(p);
+    }
+    this.inFlight = 0;
+    return out;
+  }
+
+  /** Remove and return every request still waiting (never sent), in order. */
+  takeQueued(): QueueItem[] {
+    const out = this.queue.splice(0).filter((item) => this.pending.has(item.pending.id));
+    this.pending.clear();
+    return out;
   }
 
   /**
@@ -387,12 +479,23 @@ export class Bridge {
    * in-flight requests. */
   private readonly stagedSockets = new Map<WebSocket, NodeJS.Timeout>();
   /**
-   * Ops dispatched with NO channel while NO plugin is connected. They wait
-   * here (timers not armed — the clock starts at dispatch) and drain to the
-   * first connection that completes hello. This preserves the "start the
-   * agent first, open Figma second" flow the single-connection bridge had.
+   * Ops waiting for their window: none is connected yet ("start the agent
+   * first, open Figma second"), or the one they belong to disconnected
+   * moments ago and is most likely reconnecting. Each is resolved again
+   * through the router on every hello — never drained wholesale onto
+   * whichever window happens to say hello first — and gets a final answer
+   * at its deadline. The per-op timer is not armed while parked; the clock
+   * starts at dispatch.
    */
-  private readonly unrouted: QueueItem[] = [];
+  private readonly unrouted: ParkedItem[] = [];
+  /**
+   * Channels that disconnected, with what they last showed. Routing waits
+   * for one that left within the reconnect grace, and names the file a
+   * session was on when its window does not come back.
+   */
+  private readonly gone = new Map<string, { info: PluginInfo; goneAt: number }>();
+  /** Resume hellos waiting on the incumbent socket's liveness probe. */
+  private readonly probing = new Set<WebSocket>();
   /**
    * Figma-side pairing: sessionId → channel. `user` is a Connect click in the
    * plugin UI; `auto` is a successful file/page/focus route. `notified` flips
@@ -411,10 +514,14 @@ export class Bridge {
 
   private readonly helloTimeoutMs: number;
   private readonly maxPayloadBytes: number;
+  private readonly livenessProbeMs: number;
+  private readonly reconnectGraceMs: number;
 
   constructor(private readonly handlers: BridgeHandlers = {}, opts: BridgeOptions = {}) {
     this.helloTimeoutMs = opts.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
     this.maxPayloadBytes = opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD;
+    this.livenessProbeMs = opts.livenessProbeMs ?? DEFAULT_LIVENESS_PROBE_MS;
+    this.reconnectGraceMs = opts.reconnectGraceMs ?? RECONNECT_GRACE_MS;
   }
 
   setSessionsProvider(fn: () => SessionSummaryWire[]): void {
@@ -715,32 +822,99 @@ export class Bridge {
     // Reclaiming an existing channel requires the resume token issued on
     // first assign. A hello that only knows the channel *name* (e.g. from
     // unauthenticated GET /health) gets a fresh channel instead of stealing.
-    let channel = requested;
-    let resumeToken = newResumeToken();
-    const previous = channel ? this.channels.get(channel) : undefined;
-    if (previous) {
-      if (offeredResume && safeEqualString(offeredResume, previous.resumeToken)) {
-        resumeToken = previous.resumeToken;
-        previous.failAllPending(
-          new OpError(
-            ErrorCode.NOT_CONNECTED,
-            `Plugin connection on channel "${channel}" was replaced by a new Figma window.`,
-            "Retry the operation; the new plugin connection is now active.",
-          ),
-        );
-        this.bySocket.delete(previous.ws);
-        if (previous.ws !== client) {
-          try {
-            previous.ws.close(1000, "replaced");
-          } catch {
-            /* ignore */
-          }
-        }
+    const previous = requested ? this.channels.get(requested) : undefined;
+    if (!previous) {
+      this.establish(client, hello, requested || this.generateChannel(), newResumeToken());
+      return;
+    }
+    if (!offeredResume || !safeEqualString(offeredResume, previous.resumeToken)) {
+      this.establish(client, hello, this.generateChannel(), newResumeToken());
+      return;
+    }
+    if (!previous.open) {
+      this.establish(client, hello, requested, previous.resumeToken, previous);
+      return;
+    }
+    // The token proves this hello comes from a window that once held the
+    // channel — but the plugin keys its stored channel by file NAME, so a
+    // second window of the same file (or a second "Untitled") offers the
+    // same channel and token. Taking over a socket that still answers
+    // would steal a live window's channel. Ask the incumbent first: a live
+    // socket answers a ping at once (the browser does it, however
+    // throttled the page); a dead one (window closed without a FIN, laptop
+    // asleep) does not, and only then is this a reconnect.
+    this.probing.add(client);
+    void this.probeAlive(previous.ws).then((alive) => {
+      if (!this.probing.delete(client) || client.readyState !== WebSocket.OPEN) return;
+      const current = this.channels.get(requested);
+      if (current === previous && !alive) {
+        this.establish(client, hello, requested, previous.resumeToken, previous);
+      } else if (!current) {
+        // The incumbent closed while we asked; the channel is free again.
+        this.establish(client, hello, requested, previous.resumeToken);
       } else {
-        channel = "";
+        this.establish(client, hello, this.generateChannel(), newResumeToken());
+      }
+    });
+  }
+
+  /** Resolve true when `ws` answers a protocol ping within the probe window. */
+  private probeAlive(ws: WebSocket): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        resolve(false);
+        return;
+      }
+      const done = (alive: boolean) => {
+        clearTimeout(timer);
+        ws.off("pong", onPong);
+        ws.off("close", onClose);
+        resolve(alive);
+      };
+      const onPong = () => done(true);
+      const onClose = () => done(false);
+      const timer = setTimeout(() => done(false), this.livenessProbeMs);
+      timer.unref?.();
+      ws.on("pong", onPong);
+      ws.on("close", onClose);
+      try {
+        ws.ping();
+      } catch {
+        done(false);
+      }
+    });
+  }
+
+  /**
+   * Join `client` to `channel`. With `previous`, this is a reconnect of the
+   * same window onto its own channel: requests already on the wire die with
+   * the old socket, but requests that never left the queue move over and
+   * run on the new connection — they were never sent, so nothing is lost
+   * or doubled.
+   */
+  private establish(
+    client: WebSocket,
+    hello: PluginHello,
+    channel: string,
+    resumeToken: string,
+    previous?: PluginConnection,
+  ): void {
+    let carried: QueueItem[] = [];
+    if (previous) {
+      const message = `Plugin connection on channel "${channel}" was replaced by a new connection from that window.`;
+      for (const p of previous.takeInFlight()) {
+        p.reject(connectionLostError(p.op, true, message, "The new connection is active."));
+      }
+      carried = previous.takeQueued();
+      this.bySocket.delete(previous.ws);
+      if (previous.ws !== client) {
+        try {
+          previous.ws.close(1000, "replaced");
+        } catch {
+          /* ignore */
+        }
       }
     }
-    if (!channel) channel = this.generateChannel();
 
     const info: PluginInfo = {
       version: hello.pluginVersion,
@@ -756,22 +930,18 @@ export class Bridge {
     const conn = new PluginConnection(channel, client, info, resumeToken);
     this.channels.set(channel, conn);
     this.bySocket.set(client, conn);
+    this.gone.delete(channel);
 
     // Tell the plugin which channel it is joined to (it shows this to the
-    // user so they can point specific agents at specific windows).
+    // user so they can point specific agents at specific windows). When it
+    // differs from the one the plugin asked for, the UI says so.
     conn.send({ type: "assigned", channel, resumeToken });
 
-    // Zero-config path: ops issued before any window connected wait in the
-    // unrouted queue — hand them to this connection now.
-    if (this.unrouted.length > 0 && this.channels.size === 1) {
-      for (const item of this.unrouted.splice(0)) {
-        // The wait-for-a-window deadline is over; the connection arms the
-        // real per-op timer when the op goes on the wire.
-        clearTimeout(item.pending.timer);
-        item.pending.timer = undefined;
-        conn.enqueue(item.request, item.pending);
-      }
-    }
+    for (const item of carried) conn.enqueue(item.request, item.pending);
+
+    // Ops waiting for a window: each goes through the router again, so an op
+    // for another file keeps waiting for ITS window instead of landing here.
+    this.rerouteParked();
 
     conn.drainQueue();
     this.broadcastChannels();
@@ -784,23 +954,37 @@ export class Bridge {
       this.stagedSockets.delete(client);
       return; // a never-handshaked socket died; nothing else to do
     }
+    if (this.probing.delete(client)) return; // gave up while its resume was probed
     const conn = this.bySocket.get(client);
     if (!conn) {
       return; // an old, already-replaced socket closing
     }
     this.bySocket.delete(client);
     this.channels.delete(conn.channel);
-    conn.failAllPending(
-      new OpError(
-        ErrorCode.NOT_CONNECTED,
-        `Figma plugin on channel "${conn.channel}" disconnected.`,
-        "Open the Figma Plugin MCP plugin in Figma (Plugins → Figma Plugin MCP) and wait for it to reconnect.",
-      ),
-    );
+    this.rememberGone(conn);
+    const message = `Figma plugin on channel "${conn.channel}" (${conn.info.fileName || "untitled"}) disconnected.`;
+    const reconnect =
+      "If the window does not reconnect by itself within seconds, open the Figma Plugin MCP plugin in that file (Plugins → Figma Plugin MCP).";
+    // In-flight first: a page switch rejected here cancels the op queued
+    // behind it while that op is still in this queue.
+    for (const p of conn.takeInFlight()) p.reject(connectionLostError(p.op, true, message, reconnect));
+    for (const item of conn.takeQueued()) {
+      item.pending.reject(connectionLostError(item.pending.op, false, message, reconnect));
+    }
     // Session bindings to this channel are kept: the window usually reconnects
-    // on the same channel (the plugin UI persists it). Resolution skips dead
-    // bindings, so they are harmless while the window is away.
+    // on the same channel (the plugin UI persists it), and routing waits for
+    // it through the reconnect grace (see `gone`).
     this.broadcastChannels();
+  }
+
+  private rememberGone(conn: PluginConnection): void {
+    this.gone.delete(conn.channel);
+    this.gone.set(conn.channel, { info: conn.info, goneAt: Date.now() });
+    while (this.gone.size > MAX_GONE) {
+      const oldest = this.gone.keys().next().value;
+      if (oldest === undefined) break;
+      this.gone.delete(oldest);
+    }
   }
 
   // ---- dispatch / routing ----
@@ -870,84 +1054,175 @@ export class Bridge {
 
       // From here on every refusal goes through pending.reject, which also
       // detaches the abort listener; the raw reject left it on the signal.
-      void this.routeAndEnqueue(op, request, pending, opts);
+      this.routeAndEnqueue(request, pending, opts);
     });
   }
 
   /**
    * Resolve the target window (file/page/channel/session/focus) and put the
-   * op on that connection's queue. Page switches run as a prior
-   * set_current_page on the same channel so they work with the plugin that
-   * is already open — no extra protocol field.
+   * op on that connection's queue — or park it until its window is there.
+   * Page switches run as a set_current_page queued directly ahead of the op
+   * on the same channel, so they work with the plugin that is already open —
+   * no extra protocol field.
    */
-  private async routeAndEnqueue(
-    op: Operation,
+  private routeAndEnqueue(request: BridgeRequest, pending: Pending, opts: DispatchOptions): void {
+    try {
+      const decision = this.decide(opts, false);
+      if (decision.ok) {
+        this.enqueueRouted(decision, request, pending, opts);
+        return;
+      }
+      // No window yet, or the one this op belongs to is reconnecting: wait.
+      // Hinted ops used to fail in 0ms here while unhinted ones waited, so a
+      // call naming its file died in exactly the gap a reload opens.
+      if (this.channels.size === 0 || decision.waitUntil !== undefined) {
+        this.park(request, pending, opts, decision.waitUntil);
+        return;
+      }
+      pending.reject(new OpError(decision.code, decision.message, decision.hint));
+    } catch (err) {
+      pending.reject(err instanceof OpError ? err : new OpError(ErrorCode.INTERNAL, String(err)));
+    }
+  }
+
+  /** Run the router over the connected (and recently disconnected) windows. */
+  private decide(opts: DispatchOptions, final: boolean): RouteDecision {
+    const windows = [...this.channels.values()].map((c) => ({
+      channel: c.channel,
+      fileName: c.info.fileName,
+      pageName: c.info.pageName,
+      lastUserActivityAt: c.lastUserActivityAt,
+      queueLength: c.queue.length + c.inFlight,
+    }));
+    const bound = opts.sessionId ? this.sessionBindings.get(opts.sessionId) : undefined;
+    const boundLast = bound ? this.gone.get(bound.channel)?.info : undefined;
+    return resolveRoute({
+      ...(opts.channel ? { channel: opts.channel } : {}),
+      ...(opts.file ? { file: opts.file } : {}),
+      ...(opts.page ? { page: opts.page } : {}),
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      ...(bound ? { sessionBoundChannel: bound.channel, sessionBoundSource: bound.source } : {}),
+      ...(boundLast ? { sessionBoundLast: { fileName: boundLast.fileName, pageName: boundLast.pageName } } : {}),
+      windows,
+      // At an op's deadline the wait is over: answer from what is connected.
+      gone: final
+        ? []
+        : [...this.gone].map(([channel, g]) => ({
+            channel,
+            fileName: g.info.fileName,
+            pageName: g.info.pageName,
+            goneAt: g.goneAt,
+          })),
+      graceMs: this.reconnectGraceMs,
+    });
+  }
+
+  private park(request: BridgeRequest, pending: Pending, opts: DispatchOptions, waitUntil?: number): void {
+    if (this.unrouted.length >= MAX_QUEUE) {
+      pending.reject(
+        new OpError(
+          ErrorCode.QUEUE_FULL,
+          this.channels.size === 0
+            ? `Request queue is full (${this.unrouted.length}/${MAX_QUEUE}) — no plugin is connected to drain the queue.`
+            : `Request queue is full (${this.unrouted.length}/${MAX_QUEUE}) — ops are waiting for a Figma window to reconnect.`,
+          "Open the Figma Plugin MCP plugin so queued operations can run.",
+        ),
+      );
+      return;
+    }
+    const now = Date.now();
+    const hinted = Boolean(opts.channel?.trim() || opts.file?.trim() || opts.page?.trim());
+    // An unhinted op waits its whole budget for the first window (start the
+    // agent first, open Figma second). One that names its target waits the
+    // reconnect grace: long enough for a reload, short enough that a wrong
+    // file name is not a 30s stall.
+    let deadlineAt = now + (hinted ? Math.min(pending.timeoutMs, this.reconnectGraceMs) : pending.timeoutMs);
+    if (waitUntil !== undefined) deadlineAt = Math.min(now + pending.timeoutMs, waitUntil);
+    const item: ParkedItem = { request, pending, opts, deadlineAt: Math.max(deadlineAt, now + 1), parkedAt: now };
+    this.unrouted.push(item);
+    this.armParkTimer(item);
+  }
+
+  private armParkTimer(item: ParkedItem): void {
+    clearTimeout(item.pending.timer);
+    item.pending.timer = setTimeout(() => this.expireParked(item), Math.max(0, item.deadlineAt - Date.now()));
+    item.pending.timer.unref?.();
+  }
+
+  /** The wait is over: route with what is connected now, or fail. */
+  private expireParked(item: ParkedItem): void {
+    if (!this.removeUnrouted(item.request.id)) return;
+    item.pending.timer = undefined;
+    const { pending } = item;
+    if (this.channels.size === 0) {
+      pending.reject(
+        new OpError(
+          ErrorCode.PLUGIN_TIMEOUT,
+          `Operation "${pending.op}" waited ${Date.now() - item.parkedAt}ms for a Figma window and none connected.`,
+          "Nothing was sent to Figma. Open the Figma Plugin MCP plugin in the file you want, then retry.",
+        ),
+      );
+      return;
+    }
+    try {
+      const decision = this.decide(item.opts, true);
+      if (decision.ok) this.enqueueRouted(decision, item.request, pending, item.opts);
+      else pending.reject(new OpError(decision.code, decision.message, decision.hint));
+    } catch (err) {
+      pending.reject(err instanceof OpError ? err : new OpError(ErrorCode.INTERNAL, String(err)));
+    }
+  }
+
+  /** A window said hello: give every waiting op another routing attempt. */
+  private rerouteParked(): void {
+    for (const item of [...this.unrouted]) {
+      if (!this.unrouted.includes(item)) continue;
+      let decision: RouteDecision;
+      try {
+        decision = this.decide(item.opts, false);
+      } catch {
+        continue; // its deadline gives the answer
+      }
+      if (decision.ok) {
+        this.removeUnrouted(item.request.id);
+        clearTimeout(item.pending.timer);
+        item.pending.timer = undefined;
+        this.enqueueRouted(decision, item.request, item.pending, item.opts);
+        continue;
+      }
+      // Still not routable. Keep waiting until the deadline — another window
+      // may be on its way — but no longer than its own window's grace.
+      if (decision.waitUntil !== undefined && decision.waitUntil < item.deadlineAt) {
+        item.deadlineAt = decision.waitUntil;
+        this.armParkTimer(item);
+      }
+    }
+  }
+
+  /** Bind/notify per the decision and queue the op on its window. */
+  private enqueueRouted(
+    decision: Extract<RouteDecision, { ok: true }>,
     request: BridgeRequest,
     pending: Pending,
     opts: DispatchOptions,
-  ): Promise<void> {
-    try {
-      const explicit = Boolean(opts.channel?.trim() || opts.file?.trim() || opts.page?.trim());
-      if (this.channels.size === 0 && !explicit) {
-        if (this.unrouted.length >= MAX_QUEUE) {
-          pending.reject(
-            new OpError(
-              ErrorCode.QUEUE_FULL,
-              `Request queue is full (${this.unrouted.length}/${MAX_QUEUE}) — no plugin is connected to drain the queue.`,
-              "Open the Figma Plugin MCP plugin so queued operations can run.",
-            ),
-          );
-          return;
-        }
-        pending.timer = setTimeout(() => {
-          if (!this.removeUnrouted(request.id)) return;
-          pending.reject(
-            new OpError(
-              ErrorCode.PLUGIN_TIMEOUT,
-              `Operation "${op}" waited ${pending.timeoutMs}ms for a Figma window and none connected.`,
-              "Nothing was sent to Figma. Open the Figma Plugin MCP plugin in the file you want, then retry.",
-            ),
-          );
-        }, pending.timeoutMs);
-        pending.timer.unref?.();
-        this.unrouted.push({ request, pending });
-        return;
-      }
+  ): void {
+    const op = request.op;
+    const explicit = Boolean(opts.channel?.trim() || opts.file?.trim() || opts.page?.trim());
+    const conn = this.channels.get(decision.channel);
+    if (!conn) {
+      pending.reject(
+        new OpError(
+          ErrorCode.CHANNEL_NOT_FOUND,
+          `No Figma window is connected on channel "${decision.channel}".`,
+          `Connected: ${this.describeChannels()}.`,
+        ),
+      );
+      return;
+    }
 
-      const windows = [...this.channels.values()].map((c) => ({
-        channel: c.channel,
-        fileName: c.info.fileName,
-        pageName: c.info.pageName,
-        lastUserActivityAt: c.lastUserActivityAt,
-        queueLength: c.queue.length + c.inFlight,
-      }));
-      const bound = opts.sessionId ? this.sessionBindings.get(opts.sessionId) : undefined;
-      const decision = resolveRoute({
-        ...(opts.channel ? { channel: opts.channel } : {}),
-        ...(opts.file ? { file: opts.file } : {}),
-        ...(opts.page ? { page: opts.page } : {}),
-        ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-        ...(bound ? { sessionBoundChannel: bound.channel, sessionBoundSource: bound.source } : {}),
-        windows,
-      });
-      if (!decision.ok) {
-        pending.reject(new OpError(decision.code, decision.message, decision.hint));
-        return;
-      }
-      const conn = this.channels.get(decision.channel);
-      if (!conn) {
-        pending.reject(
-          new OpError(
-            ErrorCode.CHANNEL_NOT_FOUND,
-            `No Figma window is connected on channel "${decision.channel}".`,
-            `Connected: ${this.describeChannels()}.`,
-          ),
-        );
-        return;
-      }
-
-      if (opts.sessionId && decision.sticky === "auto") {
-        const prev = this.sessionBindings.get(opts.sessionId);
+    if (opts.sessionId) {
+      const prev = this.sessionBindings.get(opts.sessionId);
+      if (decision.sticky === "auto") {
         if (!prev || prev.source !== "user" || explicit) {
           this.sessionBindings.set(opts.sessionId, {
             channel: conn.channel,
@@ -955,46 +1230,92 @@ export class Bridge {
             source: prev?.source === "user" && !explicit ? "user" : "auto",
           });
         }
+      } else if (decision.reason === "session" && prev && prev.channel !== conn.channel) {
+        // The bound window came back under a new channel: follow it, keep
+        // who made the binding, and tell the agent once.
+        this.sessionBindings.set(opts.sessionId, { channel: conn.channel, notified: false, source: prev.source });
       }
+    }
 
-      const binding = opts.sessionId ? this.sessionBindings.get(opts.sessionId) : undefined;
-      const notice = decision.notice;
-      if (notice && binding && !binding.notified) {
-        const inner = pending.resolve;
-        pending.resolve = (res) => {
-          if (binding.notified) return inner(res);
-          binding.notified = true;
-          inner({ ...res, warnings: [...(res.warnings ?? []), notice] });
-        };
-      }
+    const binding = opts.sessionId ? this.sessionBindings.get(opts.sessionId) : undefined;
+    const notice = decision.notice;
+    if (notice && binding && !binding.notified) {
+      const inner = pending.resolve;
+      pending.resolve = (res) => {
+        if (binding.notified) return inner(res);
+        binding.notified = true;
+        inner({ ...res, warnings: [...(res.warnings ?? []), notice] });
+      };
+    }
 
-      if (decision.ensurePage && op !== "set_current_page" && !namesMatch(conn.info.pageName, decision.ensurePage)) {
-        const switched = await this.dispatch("set_current_page", { name: decision.ensurePage }, {
-          channel: conn.channel,
-          timeoutMs: Math.min(pending.timeoutMs, 15_000),
-        });
-        if (!switched.ok) {
-          const err = switched.error;
-          pending.reject(
-            new OpError(
-              (err?.code as ErrorCode | undefined) ?? ErrorCode.NODE_NOT_FOUND,
-              err?.message ?? `Could not switch to page "${decision.ensurePage}".`,
-              err?.hint ?? `Open a window of this file already on "${decision.ensurePage}", or create the page first.`,
-            ),
-          );
+    if (decision.ensurePage && op !== "set_current_page" && !namesMatch(conn.info.pageName, decision.ensurePage)) {
+      this.enqueueAfterPageSwitch(conn, decision.ensurePage, request, pending);
+      return;
+    }
+    conn.enqueue(request, pending);
+  }
+
+  /**
+   * Queue set_current_page and the op back to back, without yielding in
+   * between. Awaiting the switch before queueing the op let another
+   * session's switch to a different page slip in between, and this op ran
+   * on THAT page. The op is cancelled — before it is sent — if the switch
+   * fails.
+   */
+  private enqueueAfterPageSwitch(
+    conn: PluginConnection,
+    page: string,
+    request: BridgeRequest,
+    pending: Pending,
+  ): void {
+    const op = request.op;
+    let failed: OpError | undefined;
+    const failOp = (err: OpError) => {
+      failed = err;
+      const cancelled =
+        conn.cancelQueued(pending.id) ||
+        this.removeUnrouted(pending.id) ||
+        [...this.channels.values()].some((c) => c.cancelQueued(pending.id));
+      if (cancelled) pending.reject(err);
+    };
+    const switchId = randomUUID();
+    const switchPending: Pending = {
+      id: switchId,
+      op: "set_current_page",
+      timeoutMs: Math.min(pending.timeoutMs, 15_000),
+      // Plain functions, not promise callbacks: they run synchronously when
+      // the switch settles, before the connection sends the next op.
+      resolve: (res) => {
+        if (res.ok) {
+          const named =
+            res.result && typeof res.result === "object" ? (res.result as { name?: string }).name : undefined;
+          if (named) conn.info.pageName = named;
           return;
         }
-        const named =
-          switched.result && typeof switched.result === "object"
-            ? (switched.result as { name?: string }).name
-            : undefined;
-        if (named) conn.info.pageName = named;
-      }
-
-      conn.enqueue(request, pending);
-    } catch (err) {
-      pending.reject(err instanceof OpError ? err : new OpError(ErrorCode.INTERNAL, String(err)));
+        const err = res.error;
+        failOp(
+          new OpError(
+            (err?.code as ErrorCode | undefined) ?? ErrorCode.NODE_NOT_FOUND,
+            err?.message ?? `Could not switch to page "${page}".`,
+            err?.hint ?? `Open a window of this file already on "${page}", or create the page first.`,
+          ),
+        );
+      },
+      reject: (e) =>
+        failOp(
+          new OpError(
+            e.code,
+            `Could not switch to page "${page}" before "${op}": ${e.message}`,
+            `"${op}" itself was not sent to Figma — it is safe to retry.`,
+          ),
+        ),
+    };
+    conn.enqueue({ id: switchId, op: "set_current_page", params: { name: page } }, switchPending);
+    if (failed) {
+      pending.reject(failed); // refused before it ever reached the queue
+      return;
     }
+    conn.enqueue(request, pending);
   }
 
   /** Take one request out of the unrouted queue; false when it is not there. */
@@ -1078,6 +1399,14 @@ export class Bridge {
       return;
     }
 
+    // The follower gave up (its call was cancelled, or it died): the HTTP
+    // request closes before we answered. Abort the op so one still queued is
+    // dropped instead of running later for nobody.
+    const abandoned = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) abandoned.abort();
+    });
+
     try {
       // NOTE: onRpc runs the op through the SAME validateOperation choke point
       // as leader-direct calls — see index.ts wiring. No bypass.
@@ -1086,10 +1415,16 @@ export class Bridge {
         ...(body.file ? { file: body.file } : {}),
         ...(body.page ? { page: body.page } : {}),
       };
-      const result = await this.handlers.onRpc(body.op ?? "", body.params ?? {}, body.sessionId, route);
-      this.respondJson(res, 200, { ok: true, result });
+      const result = await this.handlers.onRpc(
+        body.op ?? "",
+        body.params ?? {},
+        body.sessionId,
+        route,
+        abandoned.signal,
+      );
+      if (!res.destroyed) this.respondJson(res, 200, { ok: true, result });
     } catch (err) {
-      this.respondJson(res, 200, { ok: false, error: toBridgeError(err) });
+      if (!res.destroyed) this.respondJson(res, 200, { ok: false, error: toBridgeError(err) });
     }
   }
 
