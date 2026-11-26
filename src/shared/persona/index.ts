@@ -100,7 +100,8 @@ export function parsePersonaText(src: string): { source?: string; personas: Pers
       continue;
     }
     if (word === "persona") {
-      const m = /^persona\s+([\w.-]+)\s*(.*)$/.exec(t);
+      // Ids in any script: `persona thư "Thư"` is "thư", not "th".
+      const m = /^persona\s+([\p{L}\p{M}\p{N}_.-]+)\s*(.*)$/u.exec(t);
       if (!m) {
         warnings.push(`persona text, line ${l.no}: a persona needs an id — \`persona thu "Thu Trang" primary\`.`);
         continue;

@@ -67,7 +67,8 @@ separators; a near miss throws with the closest names — never a guess.
   \`arrangeComponentSet(setId, {rowsBy?, gap?})\` re-tidies one.
 - \`addComponentProperty(id, {name, type: BOOLEAN|TEXT|INSTANCE_SWAP|VARIANT,
   defaultValue, bind?})\` → \`{key}\`. \`bind: "Label"\` (layer name / "A/B" path
-  / id, or a list) wires it to layers — on a set, in EVERY variant.
+  / id, or a list) wires it to layers — on a set, in EVERY variant. Layers
+  inside a nested instance cannot be bound; a refused bind removes the property.
   \`editComponentProperty(id, property, {name?, defaultValue?})\`,
   \`deleteComponentProperty(id, property)\`, \`setComponentDescription(id, text)\`.
 - \`instantiate(component, {variant?, properties?, overrides?, parentId?,
@@ -88,20 +89,23 @@ separators; a near miss throws with the closest names — never a guess.
 
 ## Quality audits
 - \`a11yAudit(nodeId?, {minTouch?: 44, minFontSize?: 11})\` → findings per node:
-  contrast below WCAG AA, tap targets under 44×44 (controls = reactions or a
-  control word in the layer name), small text, controls with no name.
+  contrast below WCAG AA, tap targets under 44×44 (controls = reactions, or a
+  control word in the name of a layer ≤ 120 px tall), small text, controls
+  with no name. Text inside controls is still checked.
 - \`auditDesignSystem(nodeId?, {kinds?})\` → \`compliance\` %, \`autoFixable\`,
   per-kind bound/bindable/near/off counts, top off-palette colours.
 - \`applyDesignSystem(nodeId?, {dryRun?, kinds?, includeNear?})\` — bind every
-  literal that EQUALS a token (colour → variable per paint, text → style,
-  radius/spacing → number variable). Run with \`dryRun: true\` first.
+  literal that EQUALS a token (colour → variable per paint, text → style with
+  the same font AND line height/tracking/case, radius/spacing → number
+  variable). Run with \`dryRun: true\` first.
 - \`responsiveAudit(nodeId, {presets?: ["iphone-se","ipad"], sizes?, keep?})\`
-  — layout_audit of a resized copy per viewport; copies are removed.
+  — layout_audit of a resized copy per viewport (on the page; an instance for
+  a component/variant); copies are removed.
 
 ## Code ↔ Figma component map
 - \`exportComponentMap(query? | names[])\` → \`{map, typescript}\`: a starting
   map (code name → Figma component, props ↔ variants/properties). Save it in
-  the codebase; \`checkComponentMap(map)\` reports drift.
+  the codebase; \`checkComponentMap(map)\` reports drift (\`fixed\` included).
 - \`useComponentMap(map)\` once, then \`render("Button", {tone: "primary",
   children: "Save"}, {parentId})\` instantiates the exact variant.
 

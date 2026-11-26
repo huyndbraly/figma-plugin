@@ -5,6 +5,7 @@ import {
   resetInstanceOverrides,
   swapComponent,
   addComponentProperty,
+  checkComponentMap,
   componentize,
   createVariants,
   findComponent,
@@ -148,6 +149,9 @@ function makeComponentish(n: any): any {
     const key = `${name}#${++seq}:0`;
     this.customProps[key] = { type, defaultValue };
     return key;
+  };
+  n.deleteComponentProperty = function (key: string) {
+    delete this.customProps[key];
   };
   n.createInstance = function () {
     const inst = base("INSTANCE", this.type === "COMPONENT" && this.parent?.type === "COMPONENT_SET" ? this.parent.name : this.name, {
@@ -308,6 +312,29 @@ describe("instantiate", () => {
     const loose = (await instantiate(ctx({ component: card.id, x: 0, y: 0 }))) as any;
     expect(nodes.get(loose.id).y).toBeGreaterThanOrEqual(844);
   });
+
+  it("applies `variant` on top of a variant named directly", async () => {
+    buttonSet();
+    const res = (await instantiate(ctx({ component: "Button/Size=sm, State=hover", variant: { state: "default" } }))) as any;
+    expect(nodes.get(res.id).main.name).toBe("Size=sm, State=default");
+    expect(res.componentName).toBe("Button");
+  });
+
+  it("looks a name up once, not once per instance, and still sees renames and removals", async () => {
+    const s = buttonSet();
+    const card = component("Card");
+    page.appendChild(card);
+    const scan = vi.spyOn(page, "findAllWithCriteria");
+    for (let i = 0; i < 5; i++) await instantiate(ctx({ component: "Button" }));
+    expect(scan).toHaveBeenCalledTimes(1);
+    // A rename is a miss in the index: rescanned, found.
+    card.name = "Tile";
+    const tile = (await instantiate(ctx({ component: "Tile" }))) as any;
+    expect(nodes.get(tile.id).main).toBe(card);
+    // A removed component is never handed back from the index.
+    s.remove();
+    await expect(instantiate(ctx({ component: "Button" }))).rejects.toMatchObject({ code: "NODE_NOT_FOUND" });
+  });
 });
 
 describe("setInstanceProperties", () => {
@@ -415,6 +442,22 @@ describe("createVariants", () => {
     ).rejects.toMatchObject({ code: "INVALID_PARAMS" });
     expect(page.findAll((n: any) => n.type === "COMPONENT")).toHaveLength(0);
   });
+
+  it("gives passed-in components their names back when combining fails", async () => {
+    const a = component("Primary");
+    const b = component("Secondary");
+    page.appendChild(a);
+    page.appendChild(b);
+    (globalThis as any).figma.combineAsVariants = vi.fn(() => {
+      throw new Error("cannot combine");
+    });
+    await expect(
+      createVariants(ctx({ name: "Tone", componentIds: [a.id], variants: [{ props: { Tone: "secondary" }, componentId: b.id }, { props: { Tone: "ghost" } }] })),
+    ).rejects.toMatchObject({ code: "INVALID_PARAMS", message: expect.stringContaining("cannot combine") });
+    expect([a.name, b.name]).toEqual(["Primary", "Secondary"]);
+    // The one it built is gone.
+    expect(page.findAll((n: any) => n.type === "COMPONENT").map((n: any) => n.name)).toEqual(["Primary", "Secondary"]);
+  });
 });
 
 describe("addComponentProperty", () => {
@@ -432,6 +475,95 @@ describe("addComponentProperty", () => {
     const res = (await addComponentProperty(c)) as any;
     expect(res.id).toBe(s.id);
     expect(c.warnings.some((w) => /live on its set/.test(w))).toBe(true);
+  });
+
+  it("binds the component's own layer, never one inside a nested instance", async () => {
+    const icon = component("Icon", [text("Label", "inner")]);
+    page.appendChild(icon);
+    const card = component("Card");
+    page.appendChild(card);
+    const nested = icon.createInstance();
+    card.appendChild(nested); // comes first in the tree
+    const own = text("Label", "Title");
+    card.appendChild(own);
+    const res = (await addComponentProperty(ctx({ nodeId: card.id, name: "Title", type: "TEXT", defaultValue: "Title", bind: "Label" }))) as any;
+    expect(res.bound).toEqual([{ id: own.id, name: "Label", field: "characters" }]);
+    expect(nested.children[0].componentPropertyReferences).toBeNull();
+  });
+
+  it("takes the property back out when a layer refuses the binding", async () => {
+    const card = component("Card");
+    const a = text("Label", "A");
+    const b = text("Label", "B");
+    card.appendChild(a);
+    const group = base("FRAME", "Row");
+    group.appendChild(b);
+    card.appendChild(group);
+    page.appendChild(card);
+    Object.defineProperty(b, "componentPropertyReferences", {
+      get: () => null,
+      set: () => {
+        throw new Error("cannot reference");
+      },
+    });
+    await expect(
+      addComponentProperty(ctx({ nodeId: card.id, name: "Title", type: "TEXT", defaultValue: "x", bind: ["Label", "Row/Label"] })),
+    ).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+    expect(Object.keys(card.componentPropertyDefinitions)).toEqual([]);
+    expect(a.componentPropertyReferences).toEqual({});
+  });
+});
+
+describe("copying overrides from another instance", () => {
+  function fakeInstance(id: string, main: any, layers: Array<[string, any]>, extra: Record<string, unknown> = {}): any {
+    const inst = base("INSTANCE", main.name, {
+      main,
+      componentProperties: {},
+      setProperties: vi.fn(),
+      getMainComponentAsync: async () => main,
+      ...extra,
+    });
+    nodes.delete(inst.id);
+    inst.id = id;
+    nodes.set(id, inst);
+    for (const [layerId, layer] of layers) {
+      nodes.delete(layer.id);
+      layer.id = layerId;
+      nodes.set(layerId, layer);
+      inst.appendChild(layer);
+    }
+    return inst;
+  }
+
+  it("copies root and sublayer overrides, also from a nested instance whose id starts with I", async () => {
+    const title = text("Title", "Card");
+    const card = component("Card", [title]);
+    page.appendChild(card);
+    // The source is nested inside another instance: its id is already a path.
+    const srcTitle = text("Title", "Hello");
+    const src = fakeInstance(`I500:1;${card.id}`, card, [[`I500:1;${card.id};${title.id}`, srcTitle]], {
+      opacity: 0.5,
+      overrides: [
+        { id: `I500:1;${card.id}`, overriddenFields: ["opacity"] },
+        { id: `I500:1;${card.id};${title.id}`, overriddenFields: ["characters"] },
+      ],
+    });
+    const dstTitle = text("Title", "Card");
+    const dst = fakeInstance("600:1", card, [[`I600:1;${title.id}`, dstTitle]]);
+    page.appendChild(dst);
+    const res = (await setInstanceOverrides(ctx({ nodeId: dst.id, from: src.id }))) as any;
+    expect(dst.opacity).toBe(0.5);
+    expect(dstTitle.characters).toBe("Hello");
+    expect(res.applied).toBe(2);
+  });
+});
+
+describe("checkComponentMap", () => {
+  it("warns when the mapped name belongs to several components", async () => {
+    page.appendChild(component("Card"));
+    page.appendChild(component("card"));
+    const res = (await checkComponentMap(ctx({ map: { components: { Card: { figma: "Card" } } } }))) as any;
+    expect(res.findings.some((f: any) => f.severity === "warning" && /names 2 components/.test(f.message))).toBe(true);
   });
 });
 
