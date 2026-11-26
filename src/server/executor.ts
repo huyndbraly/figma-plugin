@@ -20,9 +20,10 @@
  * transport, not the trust boundary.
  *
  * figma.batch(ops) is special: it splits into BATCH_CHUNK_SIZE chunks streamed
- * sequentially, each chunk a separate bridge dispatch. Progress resets the
- * timeout; per-item try/catch on the plugin side yields exact per-index errors;
- * partial results are committed (no rollback).
+ * sequentially, each chunk a separate bridge dispatch timed by the sum of its
+ * items' op budgets. The plugin pings progress after every item, which resets
+ * that timer; per-item try/catch on the plugin side yields exact per-index
+ * errors and warnings; partial results are committed (no rollback).
  */
 import { VERSION } from "./version.js";
 import { Worker } from "node:worker_threads";
@@ -31,6 +32,7 @@ import { request as httpsRequest } from "node:https";
 import type { LookupFunction } from "node:net";
 import {
   BATCH_CHUNK_SIZE,
+  DEFAULT_OP_TIMEOUT_MS,
   OP_TIMEOUTS,
   VM_TIMEOUT_MS,
   type AnyOperation,
@@ -59,9 +61,14 @@ import { translateProps, type ComponentMap, type Translated } from "../shared/co
 export type OpRunner = (
   op: AnyOperation,
   params: Record<string, unknown>,
-  /** Aborted when the figma_write that issued the op has given up waiting —
-   * the runner hands it to the bridge so a still-queued op is dropped. */
-  ctx?: { signal: AbortSignal },
+  ctx?: {
+    /** Aborted when the figma_write that issued the op has given up waiting —
+     * the runner hands it to the bridge so a still-queued op is dropped. */
+    signal?: AbortSignal;
+    /** Overrides the bridge's per-op budget — a batch chunk is timed by what
+     * is IN it, not by the 30s every batch dispatch otherwise gets. */
+    timeoutMs?: number;
+  },
 ) => Promise<BridgeResponse>;
 
 export interface ExecutorDeps {
@@ -69,7 +76,10 @@ export interface ExecutorDeps {
   /** Injectable for tests — real icon fetch is server-side over the CDN. */
   iconFetcher?: Fetcher;
   /** Injectable for tests — resolves an image URL to base64 bytes. */
-  imageFetcher?: (url: string) => Promise<string>;
+  imageFetcher?: (url: string, init?: { signal?: AbortSignal }) => Promise<string>;
+  /** The calling figma_write's abort signal (set by executeWrite): server-side
+   * fetches made for the call stop when it stops waiting. */
+  signal?: AbortSignal;
   /** Injectable for tests — the per-hop HTTP transport under loadImage's
    * redirect and address checks (default: pinnedHttpsFetch). */
   imageFetch?: ImageFetch;
@@ -243,11 +253,14 @@ async function executeWriteInner(
   const logs: string[] = [];
   const warnings: string[] = [];
 
+  const startedAt = Date.now();
   // Host-side writes to session.state made DURING this call (setupTokens'
-  // token map). The worker's sandbox works on a JSON copy of session.state
-  // that is synced back on exit; overlay keys re-apply on top of that copy so
-  // host-side writes survive the sync.
-  const stateOverlay: Record<string, unknown> = {};
+  // token map, useComponentMap). Each write is numbered; the invoke envelope
+  // that follows it carries it into the sandbox's own `state` copy at once, so
+  // code later in the same call reads it. On exit the sandbox reports the
+  // highest number it merged: those keys are already in its copy (and any
+  // in-call edit of them wins); only writes it never saw are re-applied.
+  const stateOverlay = new StateOverlay();
   // Every op this call issues carries one abort signal. When the budget runs
   // out the caller is told PLUGIN_TIMEOUT and moves on; an op still sitting in
   // a bridge queue must not run afterwards on whatever window turns up.
@@ -257,7 +270,8 @@ async function executeWriteInner(
   setMaxListeners(0, abort.signal);
   const scopedDeps: ExecutorDeps = {
     ...deps,
-    runOp: (op, params) => deps.runOp(op, params, { signal: abort.signal }),
+    signal: abort.signal,
+    runOp: (op, params, ctx) => deps.runOp(op, params, { ...ctx, signal: abort.signal }),
   };
   const figmaProxy = buildFigmaProxy(session, scopedDeps, warnings, stateOverlay);
 
@@ -283,35 +297,55 @@ async function executeWriteInner(
   // - banned globals are context stubs — a thrown Error must be context-realm.
   // - `console` and `__syncState` are the only outside values left reachable:
   //   scrubbed by the bootstrap and returning only primitives.
-  const invoke = async (method: string, argsJson: string): Promise<string> => {
+  // Ops the sandbox has asked for that have not answered yet. At the deadline
+  // they decide the hint (a Figma op still running is not a sync loop); on a
+  // normal finish the un-awaited ones are waited for, not abandoned.
+  const inFlight = new Map<number, { method: string; settled: Promise<string> }>();
+  let invokeSeq = 0;
+  const invokeRaw = async (method: string, argsJson: string): Promise<string> => {
+    let envelope: Record<string, unknown>;
     try {
       // Reads go through the proxy's get-trap so unknown methods resolve to
       // the DX stub (mapped suggestion / nearest-method hint), whose thrown
       // OpError lands in the error envelope below.
       const fn = (figmaProxy as Record<string, unknown>)[method];
       if (typeof fn !== "function") {
-        return JSON.stringify({
+        envelope = {
           ok: false,
           error: { code: ErrorCode.INVALID_PARAMS, message: `figma.${method} is not a function.` },
-        });
+        };
+      } else {
+        const args = decodeArgs(JSON.parse(argsJson));
+        const result = await (fn as (...a: unknown[]) => unknown)(...args);
+        envelope = { ok: true, result };
       }
-      const args: unknown = JSON.parse(argsJson);
-      const result = await (fn as (...a: unknown[]) => unknown)(...(Array.isArray(args) ? args : [args]));
-      return JSON.stringify({ ok: true, result });
     } catch (err) {
       const be = toBridgeError(err);
-      return JSON.stringify({
+      envelope = {
         ok: false,
         error: { code: be.code, message: be.message, ...(be.hint ? { hint: be.hint } : {}) },
-      });
+      };
     }
+    // Host-side state writes ride back on whichever envelope comes next.
+    const delta = stateOverlay.takeUnsent();
+    if (delta) Object.assign(envelope, delta);
+    return JSON.stringify(envelope);
+  };
+  const invoke = (method: string, argsJson: string): Promise<string> => {
+    const id = ++invokeSeq;
+    const settled = invokeRaw(method, argsJson).finally(() => inFlight.delete(id));
+    inFlight.set(id, { method, settled });
+    return settled;
   };
 
-  const syncState = (json: string): void => {
+  const syncState = (json: string, seenSeq: unknown): void => {
     try {
       const parsed: unknown = JSON.parse(json);
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        session.state = { ...(parsed as Record<string, unknown>), ...stateOverlay };
+        session.state = stateOverlay.applyUnseen(
+          { ...(parsed as Record<string, unknown>) },
+          typeof seenSeq === "number" ? seenSeq : 0,
+        );
       }
     } catch {
       /* malformed state JSON — keep the last known-good session.state */
@@ -366,7 +400,7 @@ async function executeWriteInner(
   }
   type WorkerMsg =
     | { t: "invoke"; seq: number; method: string; argsJson: string }
-    | { t: "state"; json: string }
+    | { t: "state"; json: string; seq?: number }
     | { t: "log"; line: string }
     | { t: "log-dropped"; n: number }
     | DoneMsg;
@@ -393,7 +427,7 @@ async function executeWriteInner(
           }
         });
       } else if (m.t === "state") {
-        syncState(m.json);
+        syncState(m.json, m.seq);
       } else if (m.t === "log") {
         const line = String(m.line);
         if (logs.length >= MAX_LOG_LINES || logChars >= MAX_LOG_CHARS) logDropped++;
@@ -435,11 +469,16 @@ async function executeWriteInner(
   // timeout room to report before the parent steps in.
   let msg: DoneMsg | null;
   let terminated = false;
+  // What was still running when the budget ran out — read before abort()
+  // settles the queued ones.
+  let pendingAtDeadline: string[] = [];
+  const budgetMs = timeoutMs + WORKER_SLACK_MS;
   try {
-    msg = await withDeadline(done, timeoutMs + WORKER_SLACK_MS);
+    msg = await withDeadline(done, budgetMs);
   } catch {
     terminated = true;
     msg = null;
+    pendingAtDeadline = [...inFlight.values()].map((f) => f.method);
     abort.abort();
   }
   try {
@@ -447,9 +486,45 @@ async function executeWriteInner(
   } catch {
     /* already gone */
   }
+
+  // The code returned while ops it never awaited were still running. They are
+  // host-side promises, independent of the worker: wait for them (within what
+  // is left of the budget) so their errors and warnings reach the caller and a
+  // later call never races them. What is still pending after that is dropped
+  // if it has not reached Figma yet. Awaited code has nothing here.
+  if (!terminated && inFlight.size > 0) {
+    const late: string[] = [];
+    for (const [, f] of inFlight) {
+      void f.settled.then((env) => {
+        const e = parseErrorEnvelope(env);
+        if (e) late.push(`Un-awaited figma.${f.method} failed after the code returned: ${e}`);
+      });
+    }
+    const remaining = Math.max(0, startedAt + budgetMs - Date.now());
+    const all = Promise.allSettled([...inFlight.values()].map((f) => f.settled));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      all.then(() => false),
+      new Promise<boolean>((r) => {
+        timer = setTimeout(() => r(true), remaining);
+      }),
+    ]);
+    clearTimeout(timer);
+    // Let the .then above record errors for the ones that just settled.
+    await Promise.resolve();
+    if (timedOut) {
+      const still = [...inFlight.values()].map((f) => f.method);
+      abort.abort();
+      warnings.push(
+        `${still.length} figma op${still.length === 1 ? " was" : "s were"} still running when the budget ran out (${[...new Set(still)].map((m) => `figma.${m}`).join(", ")}) — not awaited by the code. Any not yet sent to Figma were dropped; one already sent may still land. Await every figma.* call.`,
+      );
+    }
+    for (const w of late) if (!warnings.includes(w)) warnings.push(w);
+  }
   if (logDropped > 0) logs.push(`… ${logDropped} more log line${logDropped === 1 ? "" : "s"} truncated`);
 
   if (msg === null) {
+    const writing = pendingAtDeadline.filter(isMutatingMethod);
     return {
       ok: false,
       logs,
@@ -458,7 +533,13 @@ async function executeWriteInner(
         ? {
             code: ErrorCode.PLUGIN_TIMEOUT,
             message: `figma_write exceeded the ${timeoutMs}ms budget — the sandbox worker was terminated.`,
-            hint: "A synchronous loop after an await can block the sandbox — bound every loop, or split the work across calls.",
+            hint: pendingAtDeadline.length
+              ? `The budget ran out while waiting on ${[...new Set(pendingAtDeadline)].map((m) => `figma.${m}`).join(", ")} — Figma was slow, not your code.${
+                  writing.length
+                    ? " An op already sent to Figma was NOT cancelled and may well have landed: do NOT simply retry — check with figma_read (get_page_model / get_design_context) first, then continue from what is there."
+                    : ""
+                } Split the work across calls; figma_status shows whether the window is throttled.`
+              : "A synchronous loop after an await, or an awaited promise that never settles, can block the sandbox — bound every loop, or split the work across calls.",
           }
         : {
             code: ErrorCode.SANDBOX_ERROR,
@@ -483,6 +564,76 @@ const WORKER_HEAP_MB = 512;
 
 /** Grace on top of VM_TIMEOUT_MS for worker spawn + the in-worker vm timeout. */
 const WORKER_SLACK_MS = 3000;
+
+/**
+ * Host-side writes to session.state during one call, numbered so the sandbox
+ * can say which ones it has merged into its own copy. See executeWriteInner.
+ */
+class StateOverlay {
+  private seq = 0;
+  private sentSeq = 0;
+  private readonly entries = new Map<string, { value: unknown; seq: number }>();
+
+  set(key: string, value: unknown): void {
+    this.entries.set(key, { value, seq: ++this.seq });
+  }
+
+  /** Writes not yet put on an envelope, as the envelope fields the bootstrap
+   * merges ({state, stateSeq}); undefined when there are none. */
+  takeUnsent(): { state: Record<string, unknown>; stateSeq: number } | undefined {
+    if (this.seq === this.sentSeq) return undefined;
+    const state: Record<string, unknown> = {};
+    for (const [k, e] of this.entries) if (e.seq > this.sentSeq) state[k] = e.value;
+    this.sentSeq = this.seq;
+    return { state, stateSeq: this.seq };
+  }
+
+  /** Re-apply the writes the sandbox never merged onto its synced-back copy. */
+  applyUnseen(next: Record<string, unknown>, seenSeq: number): Record<string, unknown> {
+    for (const [k, e] of this.entries) if (e.seq > seenSeq) next[k] = e.value;
+    return next;
+  }
+}
+
+/**
+ * Positional args off the wire. JSON has no `undefined` — inside an array it
+ * becomes null — so the bootstrap lists the undefined slots and they are put
+ * back here: a11yAudit(undefined, opts) must reach argsToParams as undefined,
+ * not as a null nodeId.
+ */
+function decodeArgs(wire: unknown): unknown[] {
+  if (Array.isArray(wire)) return wire;
+  if (isObj(wire) && Array.isArray((wire as Record<string, unknown>).args)) {
+    const { args, undef } = wire as { args: unknown[]; undef?: unknown };
+    const out = args.slice();
+    if (Array.isArray(undef)) {
+      for (const i of undef) if (typeof i === "number" && i >= 0 && i < out.length) out[i] = undefined;
+    }
+    return out;
+  }
+  return [wire];
+}
+
+/** The error message in an invoke envelope, or undefined when it succeeded. */
+function parseErrorEnvelope(env: string): string | undefined {
+  try {
+    const e = JSON.parse(env) as { ok?: boolean; error?: { code?: string; message?: string } };
+    if (e.ok === true) return undefined;
+    return `${e.error?.code ?? "ERROR"}: ${e.error?.message ?? "failed"}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Sandbox methods that only read — a timeout while one runs left nothing half-drawn. */
+const READ_ONLY_METHODS = new Set(["searchIcons", "getChildren", "useComponentMap"]);
+
+/** Whether a sandbox method can change the document (decides the timeout hint). */
+function isMutatingMethod(method: string): boolean {
+  if (READ_ONLY_METHODS.has(method)) return false;
+  const op = Object.hasOwn(METHOD_TO_OP, method) ? METHOD_TO_OP[method] : undefined;
+  return op ? !isReadOp(op) : true;
+}
 
 /**
  * The sandbox bootstrap, run inside the worker's vm context before user code.
@@ -558,12 +709,27 @@ const BOOTSTRAP_SRC = `(() => {
   try { state = JSON.parse(stateJson || "{}"); } catch (_) { state = {}; }
   if (state === null || typeof state !== "object" || Array.isArray(state)) state = {};
 
+  // Host-side state writes (setupTokens -> state.tokens) arrive on invoke
+  // envelopes and are merged into 'state' at once; the sync reports the
+  // highest one merged so the parent re-applies only writes never seen here.
+  let seenSeq = 0;
+  const rawSync = __syncState;
+  __syncState = (json) => rawSync(json, seenSeq);
+
   // figma: every method becomes a context-realm async wrapper around the
   // relay. The Promise __inv returns is awaited INSIDE the wrapper and never
   // reaches user code; only the resolved JSON string (a primitive — no
   // prototype chain, nothing to escape through) crosses.
   const callMethod = async (m, args) => {
-    const env = JSON.parse(await __inv(m, JSON.stringify(args)));
+    // JSON turns an undefined arg into null; name those slots so the host
+    // puts undefined back (a11yAudit(undefined, opts) is not a null nodeId).
+    const undef = [];
+    for (let i = 0; i < args.length; i++) if (args[i] === undefined) undef.push(i);
+    const env = JSON.parse(await __inv(m, JSON.stringify({ args, undef })));
+    if (env && env.state && typeof env.state === "object" && state !== null && typeof state === "object") {
+      for (const k of Object.keys(env.state)) state[k] = env.state[k];
+      if (typeof env.stateSeq === "number" && env.stateSeq > seenSeq) seenSeq = env.stateSeq;
+    }
     if (env && env.ok === true) return env.result;
     const info = (env && env.error) || {};
     const err = new Error(typeof info.message === "string" ? info.message : ("figma." + m + " failed"));
@@ -650,7 +816,8 @@ export const WRITE_WORKER_SOURCE = `(function () {
       pending.set(id, res);
       parentPort.postMessage({ t: "invoke", seq: id, method, argsJson });
     });
-  const syncState = (json) => parentPort.postMessage({ t: "state", json });
+  const syncState = (json, seq) =>
+    parentPort.postMessage({ t: "state", json, seq: typeof seq === "number" ? seq : 0 });
 
   // console lines stream to the parent so partial output survives a wedge —
   // on termination the caller still sees how far the code got.
@@ -813,7 +980,7 @@ function buildFigmaProxy(
   session: Session,
   deps: ExecutorDeps,
   warnings: string[],
-  stateOverlay: Record<string, unknown>,
+  stateOverlay: StateOverlay,
 ): Record<string, unknown> {
   // One figma_write call is one placement group: when its screens have to
   // move clear of existing work, they move together and stay a row.
@@ -886,13 +1053,13 @@ function buildFigmaProxy(
   // ids back, this avoids echoing a full serialized node per item.
   proxy["batch"] = async (
     ops: Array<{ op: string; params: Record<string, unknown> }>,
-    opts: { resultDetail?: "full" | "ids" } = {},
+    opts?: { resultDetail?: "full" | "ids" },
   ) =>
     runBatch(
       Array.isArray(ops) ? ops.map((o) => (o && isObj(o.params) ? { ...o, params: withPlaceGroup(o.op as AnyOperation, o.params, placeGroup) } : o)) : ops,
       deps,
       warnings,
-      opts.resultDetail === "ids" ? "ids" : "full",
+      isObj(opts) && opts.resultDetail === "ids" ? "ids" : "full",
     );
 
   // setupTokens: run the plugin op, then cache the resulting token map into
@@ -907,30 +1074,18 @@ function buildFigmaProxy(
       (session.state.tokens as Record<string, unknown> | undefined) ?? {};
     const map = mergeTokenMap(existing, tokensJson, result);
     session.state.tokens = map;
-    // The sandbox works on a context-realm copy of state synced back on exit;
-    // record the host-side write so the sync does not lose it.
-    stateOverlay["tokens"] = map;
+    // The sandbox works on a context-realm copy of state: the overlay carries
+    // this write into it on the next envelope and keeps the exit sync from
+    // dropping it.
+    stateOverlay.set("tokens", map);
     return result;
   };
 
   // Icons: searchIcons is server-side (no fetch); loadIcon fetches the SVG
   // server-side, then forwards the load_icon op to the plugin with `svg`.
   proxy["searchIcons"] = (query: string) => searchIconsSvc(query);
-  proxy["loadIcon"] = async (name: string, opts: { library?: IconLibrary; size?: number; color?: string; parentId?: string } = {}) => {
-    const loaded = await loadIconSvg(name, {
-      ...(opts.library ? { library: opts.library } : {}),
-      ...(deps.iconFetcher ? { fetcher: deps.iconFetcher } : {}),
-    });
-    return call("load_icon", {
-      name,
-      canonical: loaded.canonical,
-      library: loaded.library,
-      svg: loaded.svg,
-      ...(opts.size !== undefined ? { size: opts.size } : {}),
-      ...(opts.color !== undefined ? { color: opts.color } : {}),
-      ...(opts.parentId !== undefined ? { parentId: opts.parentId } : {}),
-    });
-  };
+  proxy["loadIcon"] = async (name: string, opts?: Record<string, unknown>) =>
+    call("load_icon", await resolveIconParams({ ...(isObj(opts) ? opts : {}), name }, deps));
 
 
   // userflow: the graph is the AGENT's analysis of the spec (screens, happy
@@ -954,28 +1109,8 @@ function buildFigmaProxy(
   // raw base64. Previously only base64 worked and a URL crashed the plugin with
   // a cryptic atob() error; now the server resolves the URL to base64 before
   // forwarding, matching the documented loadImage(url|base64) contract.
-  proxy["loadImage"] = async (
-    source: string,
-    opts: Record<string, unknown> = {},
-  ) => {
-    if (typeof source !== "string" || source.length === 0) {
-      throw new OpError(
-        ErrorCode.INVALID_PARAMS,
-        "loadImage requires a URL, a data: URI, or a base64 string.",
-        "Pass an https URL (public hosts only), a data:image/...;base64,... URI, or raw base64 bytes.",
-      );
-    }
-    let base64: string;
-    if (/^https?:\/\//i.test(source)) {
-      base64 = await fetchImageAsBase64(source, deps);
-    } else if (source.startsWith("data:")) {
-      const comma = source.indexOf(",");
-      base64 = comma >= 0 ? source.slice(comma + 1) : source;
-    } else {
-      base64 = source;
-    }
-    return call("load_image", { base64, ...opts });
-  };
+  proxy["loadImage"] = async (source: unknown, opts?: Record<string, unknown>) =>
+    call("load_image", { base64: await resolveImageSource(source, deps), ...(isObj(opts) ? opts : {}) });
 
   // Code ↔ Figma component map. The map lives in the CODEBASE (the agent reads
   // it and hands it over once per session); render() translates code props to
@@ -990,10 +1125,10 @@ function buildFigmaProxy(
       );
     }
     session.state.componentMap = map;
-    stateOverlay["componentMap"] = map;
+    stateOverlay.set("componentMap", map);
     return { components: Object.keys((map as ComponentMap).components).length };
   };
-  proxy["render"] = async (codeName: string, props: Record<string, unknown> = {}, opts: Record<string, unknown> = {}) => {
+  proxy["render"] = async (codeName: string, props?: Record<string, unknown>, opts?: Record<string, unknown>) => {
     const { map: inline, ...rest } = isObj(opts) ? (opts as Record<string, unknown>) : {};
     const map = (inline ?? session.state.componentMap) as ComponentMap | undefined;
     if (!map || !isObj(map.components)) {
@@ -1139,12 +1274,15 @@ export async function fetchImageFollowingSafeRedirects(
   url: string,
   fetchImpl?: ImageFetch,
   resolveHost: HostResolver = defaultHostResolver,
+  /** The calling figma_write's signal: the download stops when it stops waiting. */
+  signal?: AbortSignal,
 ): Promise<Response> {
   const transport: ImageFetch = fetchImpl ?? ((u, init) => pinnedHttpsFetch(u, init, resolveHost));
   let current = assertSafeImageUrl(url);
   for (let hop = 0; ; hop++) {
+    if (signal?.aborted) throw new Error("Image download cancelled — the call that asked for it stopped waiting.");
     await assertHostResolvesPublic(current.hostname, resolveHost);
-    const res = await transport(current.href, { redirect: "manual" });
+    const res = await transport(current.href, { redirect: "manual", ...(signal ? { signal } : {}) });
     if (res.status < 300 || res.status >= 400) return res;
     const location = res.headers.get("location");
     if (!location) return res;
@@ -1304,8 +1442,8 @@ function tooLarge(): OpError {
 async function fetchImageAsBase64(url: string, deps: ExecutorDeps): Promise<string> {
   const safe = assertSafeImageUrl(url);
   try {
-    if (deps.imageFetcher) return await deps.imageFetcher(safe.href);
-    const res = await fetchImageFollowingSafeRedirects(safe.href, deps.imageFetch, deps.resolveHost);
+    if (deps.imageFetcher) return await deps.imageFetcher(safe.href, deps.signal ? { signal: deps.signal } : undefined);
+    const res = await fetchImageFollowingSafeRedirects(safe.href, deps.imageFetch, deps.resolveHost, deps.signal);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     return buf.toString("base64");
@@ -1319,6 +1457,84 @@ async function fetchImageAsBase64(url: string, deps: ExecutorDeps): Promise<stri
       "Check the URL is reachable and points at an image, or pass base64 bytes directly.",
     );
   }
+}
+
+/**
+ * loadImage's source → the base64 the plugin decodes: an http(s) URL is
+ * fetched here (public hosts only), a data: URI is stripped to its payload,
+ * anything else is taken as base64 already. Shared by figma.loadImage and
+ * load_image items inside figma.batch.
+ */
+async function resolveImageSource(source: unknown, deps: ExecutorDeps): Promise<string> {
+  if (typeof source !== "string" || source.length === 0) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      "loadImage requires a URL, a data: URI, or a base64 string.",
+      "Pass an https URL (public hosts only), a data:image/...;base64,... URI, or raw base64 bytes.",
+    );
+  }
+  if (/^https?:\/\//i.test(source)) return fetchImageAsBase64(source, deps);
+  if (source.startsWith("data:")) {
+    const comma = source.indexOf(",");
+    return comma >= 0 ? source.slice(comma + 1) : source;
+  }
+  return source;
+}
+
+/**
+ * load_icon params with the SVG fetched server-side: { name, library?, ...rest }
+ * → { ...rest, name, canonical, library, svg }. Everything else the plugin op
+ * honours (size, color, parentId, x, y, inset, align, insertAt) passes through.
+ */
+async function resolveIconParams(
+  params: Record<string, unknown>,
+  deps: ExecutorDeps,
+): Promise<Record<string, unknown>> {
+  const { library, name, ...rest } = params;
+  if (typeof name !== "string" || name.trim() === "") {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      "loadIcon requires an icon name.",
+      'e.g. figma.loadIcon("check", { size: 20, parentId }). searchIcons("…") lists candidate names.',
+    );
+  }
+  const loaded = await loadIconSvg(name, {
+    ...(typeof library === "string" && library ? { library: library as IconLibrary } : {}),
+    ...(deps.iconFetcher ? { fetcher: deps.iconFetcher } : {}),
+    ...(deps.signal ? { signal: deps.signal } : {}),
+  });
+  return { ...rest, name, canonical: loaded.canonical, library: loaded.library, svg: loaded.svg };
+}
+
+/**
+ * Batch items whose op is answered partly on the server: the plugin cannot
+ * fetch, so a load_image URL / data: URI and a load_icon by name are resolved
+ * here, exactly as figma.loadImage / figma.loadIcon do, before validation.
+ */
+async function resolveBatchItemParams(
+  op: unknown,
+  params: Record<string, unknown>,
+  deps: ExecutorDeps,
+): Promise<Record<string, unknown>> {
+  if (op === "load_image") {
+    const { source, url, base64, ...rest } = params;
+    const src = base64 ?? source ?? url;
+    if (typeof src !== "string") return params;
+    // Raw base64 needs nothing; a URL or data: URI goes through loadImage's path.
+    if (src === base64 && !/^https?:\/\//i.test(src) && !src.startsWith("data:")) return params;
+    return { ...rest, base64: await resolveImageSource(src, deps) };
+  }
+  if (op === "load_icon" && (typeof params.svg !== "string" || params.svg.length === 0)) {
+    if (typeof params.name !== "string" || params.name.trim() === "") {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        "load_icon in a batch needs an icon name (or raw svg).",
+        'Pass { op: "load_icon", params: { name: "check", size?, parentId? } }, or call figma.loadIcon(name, opts) outside the batch.',
+      );
+    }
+    return resolveIconParams(params, deps);
+  }
+  return params;
 }
 
 /**
@@ -1342,7 +1558,10 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
     case "zoom_to_fit":
     case "layout_audit":
     case "export_node":
-      return { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+      // (nodeId, opts) or the documented single bag: exportNode({nodeId, format}).
+      return isObj(first)
+        ? { ...(first as Record<string, unknown>), ...optsOf(second) }
+        : { nodeId: first, ...optsOf(second) };
     case "get_node":
       return { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
     case "get_nodes":
@@ -1356,9 +1575,9 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
     case "find_component":
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : first === undefined
-          ? {}
-          : { query: first, ...(isObj(second) ? (second as object) : {}) };
+        : first == null
+          ? optsOf(second)
+          : { query: first, ...optsOf(second) };
     case "find_or_create_component":
       // findOrCreateComponent(name, spec) or ({name, spec})
       return isObj(first)
@@ -1367,16 +1586,20 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
     case "instantiate": {
       // instantiate("Button", {variant, properties, parentId}) / ({component, ...});
       // instantiate("Button", parentId) mirrors create(spec, parentId).
-      if (isObj(first)) return first as Record<string, unknown>;
+      // instantiate({key}, {parentId, variant}) — a library ref plus opts.
       const opts = isObj(second) ? { ...(second as Record<string, unknown>) } : {};
       if (typeof second === "string" && second.length > 0) opts.parentId = second;
+      if (isObj(first)) return { ...(first as Record<string, unknown>), ...opts };
       return { component: first, ...opts };
     }
     case "swap_component":
-      // swapComponent(instanceId, "Icon/Check", {variant?})
+      // swapComponent(instanceId, "Icon/Check", {variant?}); the component
+      // may also be a library ref: swapComponent(id, {key}, {variant?}).
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : { nodeId: first, component: second, ...(isObj(args[2]) ? (args[2] as object) : {}) };
+        : isObj(second)
+          ? { nodeId: first, ...componentRefOf(second as Record<string, unknown>), ...optsOf(args[2]) }
+          : { nodeId: first, component: second, ...optsOf(args[2]) };
     case "set_component_description":
       // setComponentDescription(nodeId, "text", {link}) or (nodeId, {description, link})
       return isObj(first)
@@ -1404,21 +1627,22 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
     case "audit_design_system":
     case "apply_design_system":
     case "responsive_audit":
-      // auditX(nodeId?, opts?) or auditX({nodeId, ...})
+      // auditX(nodeId?, opts?) or auditX({nodeId, ...}); auditX(undefined,
+      // opts) audits the selection with those opts.
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : first === undefined
-          ? {}
-          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+        : first == null
+          ? optsOf(second)
+          : { nodeId: first, ...optsOf(second) };
     case "export_component_map":
       // exportComponentMap("button") / (["Button", "Card"]) / ({query|names})
       return isObj(first)
         ? (first as Record<string, unknown>)
         : Array.isArray(first)
-          ? { names: first, ...(isObj(second) ? (second as object) : {}) }
-          : first === undefined
-            ? {}
-            : { query: first, ...(isObj(second) ? (second as object) : {}) };
+          ? { names: first, ...optsOf(second) }
+          : first == null
+            ? optsOf(second)
+            : { query: first, ...optsOf(second) };
     case "check_component_map":
       // checkComponentMap(map) — the map itself, or {map}
       return isObj(first) && "map" in (first as object) ? (first as Record<string, unknown>) : { map: first };
@@ -1515,40 +1739,40 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
       // screenshot({nodeId, scale}) documented; tolerate screenshot("1:2").
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : first === undefined
-          ? {}
-          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+        : first == null
+          ? optsOf(second)
+          : { nodeId: first, ...optsOf(second) };
     case "reflow_diagram":
       // reflowDiagram({frameId?}) — tolerate a bare frame id.
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : first === undefined
-          ? {}
-          : { frameId: first, ...(isObj(second) ? (second as object) : {}) };
+        : first == null
+          ? optsOf(second)
+          : { frameId: first, ...optsOf(second) };
     case "get_design_context":
       // getDesignContext({nodeId?, detail?, depth?}) — tolerate a bare nodeId.
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : first === undefined
-          ? {}
-          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+        : first == null
+          ? optsOf(second)
+          : { nodeId: first, ...optsOf(second) };
     case "scan_text_nodes":
       // scanTextNodes({nodeId?, limit?}) — tolerate a bare nodeId.
       return isObj(first)
         ? (first as Record<string, unknown>)
-        : first === undefined
-          ? {}
-          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+        : first == null
+          ? optsOf(second)
+          : { nodeId: first, ...optsOf(second) };
     case "scan_nodes_by_types":
       // scanNodesByTypes({types?, nodeId?}) — an array arg is the type list,
       // a string arg a scope nodeId.
       return isObj(first)
         ? (first as Record<string, unknown>)
         : Array.isArray(first)
-          ? { types: first, ...(isObj(second) ? (second as object) : {}) }
-          : first === undefined
-            ? {}
-            : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+          ? { types: first, ...optsOf(second) }
+          : first == null
+            ? optsOf(second)
+            : { nodeId: first, ...optsOf(second) };
     case "read_selection":
       // readSelection({detail?, depth?}) — tolerate a bare detail string.
       return isObj(first)
@@ -1607,7 +1831,7 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
       // so the arg was silently dropped (figma.screenshot("1:2") screenshotted
       // the whole page). Fail loud instead.
       if (isObj(first)) return first as Record<string, unknown>;
-      if (first === undefined) return {};
+      if (first == null) return {};
       throw new OpError(
         ErrorCode.INVALID_PARAMS,
         `"${op}" takes an options object, not a bare ${Array.isArray(first) ? "array" : typeof first}.`,
@@ -1632,38 +1856,51 @@ async function runBatch(
     throw new OpError(ErrorCode.INVALID_PARAMS, "batch() requires a non-empty array of { op, params }.", "Pass e.g. [{ op: \"create\", params: {...} }, ...].");
   }
 
-  // Validate every item up-front through the choke point. A bad item fails
-  // just that index; the rest still run.
-  const validated: Array<{ index: number; op: AnyOperation; params: Record<string, unknown>; error?: OpError }> = ops.map((item, index) => {
-    try {
-      const v = validateOperation(item.op, item.params);
-      return { index, op: v.op, params: v.params };
-    } catch (err) {
-      return { index, op: item.op as Operation, params: item.params, error: err as OpError };
-    }
-  });
-
   const results: Array<{ index: number; ok: boolean; result?: unknown; error?: { code: ErrorCode; message: string; hint?: string } }> = [];
   const total = ops.length;
+  const chunkTotal = Math.ceil(total / BATCH_CHUNK_SIZE);
 
-  for (let start = 0; start < validated.length; start += BATCH_CHUNK_SIZE) {
-    const chunkItems = validated.slice(start, start + BATCH_CHUNK_SIZE);
+  for (let start = 0; start < total; start += BATCH_CHUNK_SIZE) {
     const chunkIndex = Math.floor(start / BATCH_CHUNK_SIZE);
-    const chunkTotal = Math.ceil(validated.length / BATCH_CHUNK_SIZE);
 
-    // Items that already failed validation get their error recorded without a
-    // round-trip; the rest are dispatched as one chunk to the plugin.
-    const runnable = chunkItems.filter((it) => !it.error);
-    for (const bad of chunkItems.filter((it) => it.error)) {
-      results.push({ index: bad.index, ok: false, error: bridgeErr(bad.error as OpError) });
+    // Each item goes through the choke point (after any server-side resolve —
+    // an image URL fetched, an icon's SVG loaded) just before its chunk is
+    // sent, so resolved image bytes are held for one chunk at a time. A bad
+    // item fails just that index, without a round-trip; the rest still run.
+    const runnable: Array<{ index: number; op: Operation; params: Record<string, unknown> }> = [];
+    for (let index = start; index < Math.min(start + BATCH_CHUNK_SIZE, total); index++) {
+      const item: unknown = ops[index];
+      try {
+        if (!isObj(item)) {
+          throw new OpError(
+            ErrorCode.INVALID_PARAMS,
+            `Batch item ${index} is not an { op, params } object.`,
+            'Each item is { op: "create", params: {...} }.',
+          );
+        }
+        const { op, params } = item as { op?: unknown; params?: unknown };
+        const resolved = isObj(params) ? await resolveBatchItemParams(op, params as Record<string, unknown>, deps) : params;
+        const v = validateOperation(op as string, resolved);
+        runnable.push({ index, op: v.op as Operation, params: v.params });
+      } catch (err) {
+        results.push({ index, ok: false, error: toBridgeError(err) });
+      }
     }
 
     if (runnable.length === 0) continue;
 
-    const res = await deps.runOp("batch", {
-      ops: runnable.map((it) => ({ op: it.op, params: it.params })),
-      chunk: { index: chunkIndex, total: chunkTotal },
-    });
+    // The bridge gives a batch dispatch 30s; a chunk of slow ops (instantiate,
+    // audits, screenshots) needs what its items would each get on their own.
+    // The plugin pings progress after every item, which resets the timer too.
+    const chunkTimeoutMs = runnable.reduce((sum, it) => sum + (OP_TIMEOUTS[it.op] ?? DEFAULT_OP_TIMEOUT_MS), 0);
+    const res = await deps.runOp(
+      "batch",
+      {
+        ops: runnable.map((it) => ({ op: it.op, params: it.params })),
+        chunk: { index: chunkIndex, total: chunkTotal },
+      },
+      { timeoutMs: chunkTimeoutMs },
+    );
     // Dedupe: the same safe-default warning fires on every node of a large
     // draw, and N identical copies teach the agent nothing the first one did
     // not — they just cost tokens.
@@ -1683,9 +1920,13 @@ async function runBatch(
     }
 
     // Plugin returns per-item outcomes in chunk order; map back to original idx.
-    const items = (res.result as { items?: Array<{ ok: boolean; result?: unknown; error?: { code: ErrorCode; message: string; hint?: string } }> } | undefined)?.items ?? [];
+    const items = (res.result as { items?: Array<{ ok: boolean; result?: unknown; error?: { code: ErrorCode; message: string; hint?: string }; warnings?: string[] }> } | undefined)?.items ?? [];
     runnable.forEach((it, i) => {
       const out = items[i];
+      // The plugin files each item's warnings on the item, not the chunk.
+      if (Array.isArray(out?.warnings)) {
+        for (const w of out.warnings) if (typeof w === "string" && !warnings.includes(w)) warnings.push(w);
+      }
       if (out && out.ok) {
         results.push({ index: it.index, ok: true, result: resultDetail === "ids" ? trimToId(out.result) : out.result });
       } else if (out) {
@@ -1709,10 +1950,6 @@ function withPlaceGroup(op: AnyOperation, params: Record<string, unknown>, group
   return { ...params, placeGroup: group };
 }
 
-function bridgeErr(e: OpError): { code: ErrorCode; message: string; hint?: string } {
-  return { code: e.code, message: e.message, ...(e.hint ? { hint: e.hint } : {}) };
-}
-
 /**
  * Reduce a batch item's result to just its id (resultDetail:"ids"). Most write
  * ops return { id, node: {...} }; keep only the id, falling back to the raw
@@ -1730,6 +1967,23 @@ function trimToId(result: unknown): unknown {
 
 function isObj(v: unknown): v is object {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** A trailing options arg as a spreadable bag ({} for undefined/null/scalars). */
+function optsOf(v: unknown): Record<string, unknown> {
+  return isObj(v) ? (v as Record<string, unknown>) : {};
+}
+
+/**
+ * A component passed as an object: a node read back from Figma ({id, …} —
+ * its id, since every local component has a key that only imports once
+ * published), or a ref bag ({key} / {component} / {componentId}).
+ */
+function componentRefOf(ref: Record<string, unknown>): Record<string, unknown> {
+  if (typeof ref.id === "string" && ref.id) return { componentId: ref.id };
+  const out: Record<string, unknown> = {};
+  for (const k of ["key", "component", "componentId"] as const) if (ref[k] !== undefined) out[k] = ref[k];
+  return out;
 }
 
 /**

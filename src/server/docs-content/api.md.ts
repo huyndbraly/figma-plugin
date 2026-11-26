@@ -48,7 +48,11 @@ A malformed color THROWS — it is never silently replaced.
 - \`group(nodeIds)\`, \`ungroup(nodeId)\`, \`flatten(nodeId)\`.
 - \`batch(ops, {resultDetail?})\` — see recipes; streams in chunks with partial
   commit. \`resultDetail: "ids"\` trims each successful item to just its id
-  (skip echoing a full node per item on large create batches).
+  (skip echoing a full node per item on large create batches). Item warnings
+  land in the call's warnings. \`load_image\` items take \`{source: url|data:}\`
+  and \`load_icon\` items \`{name, library?}\` — resolved server-side.
+- Await every figma.* call: un-awaited ones are waited for before the call
+  answers, and their failures come back only as warnings.
 
 ## Components
 A component is named by NAME (\`"Button"\`, \`"Button/Size=sm, State=default"\`),
@@ -78,7 +82,7 @@ separators; a near miss throws with the closest names — never a guess.
 - \`setInstanceOverrides(id, [{target:"Label", props:{characters:"Hi"}}])\` —
   modify() props on layers inside the instance; \`{from: otherInstanceId}\`
   copies another instance's overrides. \`getInstanceOverrides(id)\` reads them.
-- \`swapComponent(id, component)\`, \`exposeNestedInstance(id)\`,
+- \`swapComponent(id, component|{key}, {variant?})\`, \`exposeNestedInstance(id)\`,
   \`detachInstance(id)\`, \`resetInstanceOverrides(id, {keepProperties?})\` (also
   resets property values to their defaults; the variant is kept).
 - \`getLibraryComponent(key)\` — import a component/set from a PUBLISHED
@@ -153,8 +157,8 @@ separators; a near miss throws with the closest names — never a guess.
 ## Text & assets
 - \`setText(nodeId, content)\`.
 - \`searchIcons(query)\` → candidate canonical names (no fetch).
-- \`loadIcon(name, {library, size, color, parentId})\` — SVG fetched server-side,
-  drawn by the plugin.
+- \`loadIcon(name, {library, size, color, parentId, x, y, inset, align,
+  insertAt})\` — SVG fetched server-side, drawn by the plugin.
 - \`loadImage(urlOrBase64)\`.
 
 ## Userflow

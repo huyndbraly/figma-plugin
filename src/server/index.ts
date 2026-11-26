@@ -394,7 +394,8 @@ export async function createServer(): Promise<ServerHandle> {
             return b.dispatch(v, p, {
               ...hint,
               ...(sessionId ? { sessionId } : {}),
-              ...(ctx ? { signal: ctx.signal } : {}),
+              ...(ctx?.signal ? { signal: ctx.signal } : {}),
+              ...(ctx?.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
             });
           },
         });
@@ -506,7 +507,8 @@ export async function createServer(): Promise<ServerHandle> {
         return bridge.dispatch(validOp, validParams, {
           ...hint,
           sessionId: sid,
-          ...(ctx ? { signal: ctx.signal } : {}),
+          ...(ctx?.signal ? { signal: ctx.signal } : {}),
+          ...(ctx?.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
         });
       },
     });

@@ -6,7 +6,6 @@ import {
   OPERATIONS,
   ErrorCode,
   PROTOCOL_VERSION,
-  BATCH_CHUNK_SIZE,
 } from "../shared/protocol.js";
 import { makeContext } from "./context.js";
 import { toBridgeError, err } from "./errors.js";
@@ -183,8 +182,7 @@ interface BatchResult {
 
 /**
  * batch: sequential execution with per-item try/catch, partial commit, and a
- * progress ping at every BATCH_CHUNK_SIZE boundary + at completion of each
- * chunk. Returns per-index {ok, result|error}.
+ * progress ping after every item. Returns per-index {ok, result|error}.
  */
 async function runBatch(
   req: BridgeRequest,
@@ -241,10 +239,11 @@ async function runBatch(
       failCount++;
     }
 
-    // progress at each chunk boundary and at the very end of a chunk.
-    if ((i + 1) % BATCH_CHUNK_SIZE === 0 || i === items.length - 1) {
-      progress(i + 1, items.length, `batch ${i + 1}/${items.length}`);
-    }
+    // Progress after EVERY item: each ping resets the server's timer, so one
+    // slow item (instantiate, an audit) is timed on its own instead of the
+    // whole chunk sharing one budget — a trip there reported every item
+    // failed although the plugin went on to commit them.
+    progress(i + 1, items.length, `batch ${i + 1}/${items.length}`);
   }
 
   return { items: results, okCount, failCount };

@@ -23,7 +23,14 @@ import { assertSafeIconName } from "./security.js";
 export type IconLibrary = "ionicons" | "lucide" | "tabler" | "bootstrap-icons";
 export const DEFAULT_LIBRARY: IconLibrary = "lucide";
 
-export type Fetcher = (url: string) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+export type Fetcher = (
+  url: string,
+  /** Aborted when the figma_write that asked stops waiting. */
+  init?: { signal?: AbortSignal },
+) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+
+/** A CDN that accepts the socket and then says nothing must not hold the call. */
+export const ICON_FETCH_TIMEOUT_MS = 15_000;
 
 /**
  * Cross-library semantic aliases → canonical name in the *lucide/ionicons*
@@ -212,15 +219,40 @@ function librariesFor(name: string): IconLibrary[] {
   return name in IONICON_MAP ? ["lucide", "ionicons"] : ["lucide"];
 }
 
-const defaultFetcher: Fetcher = async (url) => {
-  // Node 18+ has global fetch. Wrapped so tests can inject a fake.
-  const res = await (globalThis.fetch as unknown as (u: string) => Promise<Response>)(url);
-  return { ok: res.ok, status: res.status, text: () => res.text() };
+export const defaultFetcher: Fetcher = async (url, init) => {
+  // Node 18+ has global fetch. Wrapped so tests can inject a fake. One
+  // controller carries both the caller's signal and our own deadline
+  // (AbortSignal.any is Node 20+), and the deadline spans the body read too —
+  // prompt headers say nothing about a body that trickles.
+  const ctl = new AbortController();
+  const timer = setTimeout(
+    () => ctl.abort(new Error(`Icon CDN did not answer within ${ICON_FETCH_TIMEOUT_MS / 1000}s.`)),
+    ICON_FETCH_TIMEOUT_MS,
+  );
+  timer.unref?.();
+  const outer = init?.signal;
+  const onAbort = () => ctl.abort(new Error("Icon download cancelled — the call that asked for it stopped waiting."));
+  if (outer?.aborted) onAbort();
+  else outer?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const res = await globalThis.fetch(url, { signal: ctl.signal });
+    const body = await res.text();
+    return { ok: res.ok, status: res.status, text: async () => body };
+  } catch (e) {
+    // Report why it stopped (deadline / caller gone), not a bare AbortError.
+    const reason: unknown = ctl.signal.aborted ? ctl.signal.reason : e;
+    throw reason instanceof Error ? reason : new Error(String(reason));
+  } finally {
+    clearTimeout(timer);
+    outer?.removeEventListener("abort", onAbort);
+  }
 };
 
 export interface LoadIconOptions {
   library?: IconLibrary;
   fetcher?: Fetcher;
+  /** Aborted when the call that asked stops waiting; the fetch stops too. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -253,7 +285,17 @@ export async function loadIconSvg(name: string, opts: LoadIconOptions = {}): Pro
     /* cache miss */
   }
 
-  const res = await fetcher(url);
+  let res: Awaited<ReturnType<Fetcher>>;
+  try {
+    res = await fetcher(url, opts.signal ? { signal: opts.signal } : undefined);
+  } catch (e) {
+    if (e instanceof OpError) throw e;
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Could not fetch icon "${canonical}" from ${library}: ${e instanceof Error ? e.message : String(e)}`,
+      "Retry once the icon CDN is reachable, or try another { library }.",
+    );
+  }
   if (!res.ok) {
     throw new OpError(
       ErrorCode.NODE_NOT_FOUND,

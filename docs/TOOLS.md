@@ -211,7 +211,7 @@ Components are named by **name** as readily as by id (`"Button"`, `"Button/Size=
 | `instantiate` (alias `createInstance`) | `instantiate(component, { variant?, properties?, overrides?, parentId?, insertAt?, x?, y?, width?, height?, instanceName? })` | Instance of a component or set. `variant: { Size: "lg" }` picks a variant; a partial request keeps the default variant's other values. `properties` set TEXT/BOOLEAN/INSTANCE_SWAP/VARIANT values by plain name. `overrides` as in `setInstanceOverrides`. Placed on the page it keeps clear of existing work, like `create`. |
 | `setInstanceProperties` (alias `setProperties`) | `setInstanceProperties(instanceId, { Label: "Save", "Show icon": false, Size: "lg", Icon: "Icon/Check" })` | Names without the `#…` suffix, case-insensitive. VARIANT values apply first (switching variant re-reads the instance), then the rest. INSTANCE_SWAP takes a component name or id. Unknown names fail with the list of real ones. |
 | `setInstanceOverrides` | `setInstanceOverrides(instanceId, [{ target, props }])` or `(instanceId, { from, overrides?, properties? })` | Edit layers **inside** an instance with `modify` props (`characters`, `fill`, `visible`, …); `target` is a layer name, `"A/B"` path or id. `from: otherInstanceId` copies that instance's properties and directly overridden fields. |
-| `swapComponent` | `swapComponent(instanceId, component, { variant? })` | Point an instance at another component; Figma keeps the overrides it can. |
+| `swapComponent` | `swapComponent(instanceId, component, { variant? })` | Point an instance at another component; Figma keeps the overrides it can. `component` may also be `{ key }` for a published library component (as may `instantiate`'s: `instantiate({ key }, { parentId, variant })`). |
 | `exposeNestedInstance` | `exposeNestedInstance(nestedInstanceId, { expose? })` | Surface a nested instance's properties on the component that contains it. |
 | `detachInstance` | `detachInstance(instanceId)` | Instance → plain frame. Returns the frame's `{ id }`. |
 | `resetInstanceOverrides` | `resetInstanceOverrides(instanceId, { keepProperties? })` | Back to the main component's values: clears overrides AND puts TEXT/BOOLEAN/INSTANCE_SWAP property values back to their defaults (Figma's own reset leaves those). The variant is kept. `keepProperties: true` clears overrides only. |
@@ -370,7 +370,7 @@ await figma.setupTokens({ colors: { surface: { light: "#FFFFFF", dark: "#0B0B0F"
 |---|---|---|
 | `setText` | `setText(nodeId, content)` | Update a text node's characters. |
 | `searchIcons` | `searchIcons(query)` | Resolves candidate canonical names across icon libraries via a cross-library alias map. **Never fetches an SVG** — cheap, use it to pick before paying for a `loadIcon` call. |
-| `loadIcon` | `loadIcon(name, { library, size, color, parentId })` | Fetches the SVG server-side (from unpkg), caches it on disk, and hands it to the plugin to draw as vector nodes. Libraries: `lucide` (default), `ionicons`, `tabler`, `bootstrap-icons`. |
+| `loadIcon` | `loadIcon(name, { library, size, color, parentId, x?, y?, inset?, align?, insertAt? })` | Fetches the SVG server-side (from unpkg, 15 s timeout), caches it on disk, and hands it to the plugin to draw as vector nodes; the placement options are the same as `create`'s. Libraries: `lucide` (default), `ionicons`, `tabler`, `bootstrap-icons`. |
 | `loadImage` | `loadImage(urlOrBase64)` | Load an image (URL or base64) onto the canvas. |
 
 ```js
@@ -1095,7 +1095,8 @@ In `figma_write`, per-call warnings surface on the tool result (`{ ok, result, l
 
 `figma.batch(ops)` — the `batch` write operation, taking `{ ops: [{ op, params }, ...] }` (the plugin also accepts an `items` key as an alias) — executes many operations in **one MCP round-trip**, but the server-to-plugin leg streams them in **chunks of 20** (`BATCH_CHUNK_SIZE`):
 
-- Each chunk boundary — and the very last item overall — emits a progress ping (`{ done, total, note }`) back to the server, which **resets the per-chunk timeout** (30 s per chunk, not 30 s total).
+- Each chunk gets the **sum of its items' own op budgets** (30 s for most ops; 60–120 s for `instantiate`, `componentize`, the audits, `screenshot`…), and every item emits a progress ping (`{ done, total, note }`) back to the server that **resets that timer** — a chunk of slow ops is not squeezed into one 30 s window.
+- Items whose op is partly server-side are resolved before dispatch, as the sandbox methods do: a `load_image` item's `source` (https URL or `data:` URI) is fetched/decoded to `base64`, and a `load_icon` item given `{ name, library? }` instead of `svg` has its SVG loaded server-side.
 - Execution is **sequential with per-item try/catch**: one failing item does not abort the batch. Results are **partial-commit** (no rollback) — everything that succeeded stays on the canvas.
 - The response reports every item's outcome with its **original index**, sorted ascending, so results line up with your input array even when some items were rejected before dispatch:
   ```jsonc
@@ -1133,6 +1134,10 @@ state.rootId = (await figma.create({ type: "FRAME", name: "Screen", width: 390, 
 // call 2 — same sessionId — state.rootId and state.tokens are still there
 await figma.create({ type: "TEXT", parentId: state.rootId, characters: "Hi", wrap: true });
 ```
+
+Keys the server writes (`state.tokens` from `setupTokens`, `state.componentMap` from `useComponentMap`) appear in `state` as soon as the call that wrote them returns — later lines of the same `figma_write` can read them, and an edit you make to them afterwards in that call is what persists.
+
+Await every `figma.*` call. If the code returns while ops it never awaited are still running, `figma_write` waits for them (within the call's budget) before answering, and reports any that failed as warnings; one still running when the budget runs out is dropped if it has not reached Figma yet.
 
 Omit `sessionId` to use the default session. `figma_status.sessions` lists a summary per active session. Sessions are process-local — they live on the leader (the process that owns the bridge/executor); a follower's `figma_write` calls are forwarded to the leader and execute against the leader's session state, so `sessionId` behaves consistently regardless of which MCP process (leader or follower) the client happens to be talking to.
 

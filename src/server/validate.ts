@@ -89,6 +89,24 @@ const needsNodeId: Record<string, true> = {
   responsive_audit: true,
 };
 
+/**
+ * A library component passed as `component: { key }` — the shape the
+ * component-ref docs use — is the same request as a top-level `key`. Lifted
+ * before the schema runs, which only knows component as a name or id.
+ */
+function liftComponentKey<T extends z.ZodTypeAny>(schema: T) {
+  return z.preprocess((v) => {
+    if (typeof v !== "object" || v === null || Array.isArray(v)) return v;
+    const p = v as Record<string, unknown>;
+    const c = p.component;
+    if (typeof c !== "object" || c === null || Array.isArray(c)) return v;
+    const key = (c as Record<string, unknown>).key;
+    if (typeof key !== "string" || p.key !== undefined) return v;
+    const { component: _ref, ...rest } = p;
+    return { ...rest, key };
+  }, schema);
+}
+
 /** Per-op refinements layered on top of the base params object. */
 const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   get_node: z.object({ nodeId }).passthrough(),
@@ -507,23 +525,29 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   delete_component_property: z
     .object({ nodeId, property: z.string().trim().min(1, "property (name or key) is required") })
     .passthrough(),
-  instantiate: z
-    .object({
-      component: z.string().trim().min(1).optional(),
-      componentId: nodeId.optional(),
-      name: z.string().trim().min(1).optional(),
-      key: z.string().trim().min(1).optional(),
-      variant: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
-      properties: z.record(z.unknown()).optional(),
-      parentId: nodeId.optional(),
-    })
-    .passthrough()
-    .refine((p) => p.component || p.componentId || p.name || p.key, {
-      message: "instantiate requires component (name or id), componentId, or key.",
-    }),
+  instantiate: liftComponentKey(
+    z
+      .object({
+        component: z.string().trim().min(1).optional(),
+        componentId: nodeId.optional(),
+        name: z.string().trim().min(1).optional(),
+        key: z.string().trim().min(1).optional(),
+        variant: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+        properties: z.record(z.unknown()).optional(),
+        parentId: nodeId.optional(),
+      })
+      .passthrough()
+      .refine((p) => p.component || p.componentId || p.name || p.key, {
+        message: "instantiate requires component (name or id), componentId, or key.",
+      }),
+  ),
+  // The handler reads properties ?? props; accept the same.
   set_instance_properties: z
-    .object({ nodeId, properties: z.record(z.unknown()) })
-    .passthrough(),
+    .object({ nodeId, properties: z.record(z.unknown()).optional(), props: z.record(z.unknown()).optional() })
+    .passthrough()
+    .refine((p) => p.properties || p.props, {
+      message: "set_instance_properties requires properties (or props): { name: value }.",
+    }),
   set_instance_overrides: z
     .object({
       nodeId,
@@ -537,12 +561,14 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .refine((p) => p.overrides || p.from || p.properties, {
       message: "set_instance_overrides requires overrides, from, or properties.",
     }),
-  swap_component: z
-    .object({ nodeId, component: z.string().trim().min(1).optional(), key: z.string().trim().min(1).optional() })
-    .passthrough()
-    .refine((p) => p.component || p.key || p.componentId, {
-      message: "swap_component requires component (name or id) or key.",
-    }),
+  swap_component: liftComponentKey(
+    z
+      .object({ nodeId, component: z.string().trim().min(1).optional(), key: z.string().trim().min(1).optional() })
+      .passthrough()
+      .refine((p) => p.component || p.key || p.componentId, {
+        message: "swap_component requires component (name or id) or key.",
+      }),
+  ),
   expose_nested_instance: z.object({ nodeId, expose: z.boolean().optional() }).passthrough(),
   detach_instance: z.object({ nodeId }).passthrough(),
   reset_instance_overrides: z.object({ nodeId }).passthrough(),
