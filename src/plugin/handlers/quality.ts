@@ -90,6 +90,16 @@ function maxParam(v: unknown, def: number): number {
 // Accessibility
 // ---------------------------------------------------------------------------
 
+function hasTapReaction(n: BaseNode): boolean {
+  const reactions = (n as { reactions?: ReadonlyArray<Reaction> }).reactions;
+  return Array.isArray(reactions) && reactions.some((r) => isInteractiveTrigger(r?.trigger?.type));
+}
+
+function containsTapTarget(n: SceneNode): boolean {
+  if (!("findOne" in n)) return false;
+  return !!(n as ChildrenMixin).findOne((k) => k.visible !== false && hasTapReaction(k));
+}
+
 function isInteractive(n: SceneNode): boolean {
   const reactions = (n as { reactions?: ReadonlyArray<Reaction> }).reactions;
   const tap = Array.isArray(reactions) && reactions.some((r) => isInteractiveTrigger(r?.trigger?.type));
@@ -195,7 +205,14 @@ export async function a11yAudit(ctx: HandlerContext): Promise<unknown> {
       }
       return;
     }
-    if (inControl.has(n.id) || !isInteractive(n)) return;
+    const tap = hasTapReaction(n);
+    // A layer with its OWN tap reaction is a control wherever it sits; only
+    // name-matched anatomy inside a control (an "icon", a "chip" glyph) is
+    // left alone.
+    if ((inControl.has(n.id) && !tap) || !isInteractive(n)) return;
+    // Matched by name only, but holding real controls: a container ("Settings
+    // menu" hugging its rows), not a control — its items are checked instead.
+    if (!tap && containsTapTarget(n)) return;
     inControl.add(n.id);
     const box = n as SceneNode & LayoutMixin;
     if ("width" in box && (box.width < minTouch - 0.5 || box.height < minTouch - 0.5)) {

@@ -16,9 +16,9 @@
  *     fix Hiện tổng tiền trước bước thẻ
  */
 import { lines, takeQuoted } from "../diagram/text-util.js";
-import { needsWideCoverage } from "../diagram/metrics.js";
+import { needsWideCoverage, textWidth } from "../diagram/metrics.js";
 import { fillDeep, unresolved, type PolicyValues } from "../model/policy.js";
-import { INK, MUTED, PAD, RULE, SOFT, ellipse, header, line, rect, text, textHeight, tint, type Pt, type Spec } from "../board/emit.js";
+import { INK, MUTED, PAD, RULE, SOFT, ellipse, header, line, rect, text, textHeight, tint, wrap, type Pt, type Spec } from "../board/emit.js";
 import type { BoardBuild } from "../usecase/index.js";
 
 export interface JourneyPhase {
@@ -269,7 +269,12 @@ export function buildJourney(spec: JourneySpec): BoardBuild<JourneyModel> {
         const bad = p.feeling < 0;
         children.push(ellipse(`journey:${p.id} feeling`, cx - 7, cy - 7, 14, 14, { fill: bad ? "#e03131" : p.feeling > 0 ? "#2f9e44" : "#868e96", stroke: "#ffffff", strokeWeight: 2 }));
         const note = noteText(p);
-        const noteY = bad ? cy - 10 - textHeight(note, NOTE_W, 11) : cy + 12;
+        const noteH = textHeight(note, NOTE_W, 11);
+        const noteY = bad ? cy - 10 - noteH : cy + 12;
+        // The curve runs through the cell the note sits in; a white backdrop
+        // keeps a two-line note readable where the line crosses it.
+        const noteW = Math.min(NOTE_W, Math.max(...wrap(note, NOTE_W, 11).map((l) => textWidth(l, 11))) + 8);
+        children.push(rect(`journey:${p.id} feeling note bg`, cx - noteW / 2, noteY - 2, noteW, noteH + 4, { fill: "#ffffff", radius: 4 }));
         children.push(text(`journey:${p.id} feeling note`, cx - COL_W / 2 + 12, noteY, NOTE_W, note, { size: 11, color: MUTED, align: "CENTER" }));
       });
     } else {

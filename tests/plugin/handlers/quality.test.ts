@@ -175,6 +175,32 @@ describe("a11y_audit", () => {
   });
 });
 
+describe("a11y_audit containers and nested tap targets", () => {
+  it("checks a tappable child of a short, control-named container", async () => {
+    const screen = node("FRAME", "Screen", { fills: solid("#ffffff") });
+    page.appendChild(screen);
+    // Hugs its rows, so it is short enough to look like a control by name.
+    const menu = node("FRAME", "Settings menu", { width: 370, height: 60 });
+    screen.appendChild(menu);
+    const close = node("FRAME", "Close", { width: 20, height: 20, reactions: [{ trigger: { type: "ON_CLICK" } }] });
+    menu.appendChild(close);
+    const res = (await a11yAudit(ctx({ nodeId: screen.id }))) as any;
+    const kinds = res.findings.map((f: any) => `${f.kind}:${f.name}`);
+    expect(kinds).toContain("touch-target:Close");
+    expect(kinds.some((k: string) => k.endsWith(":Settings menu"))).toBe(false);
+  });
+
+  it("still treats name-only anatomy inside a real control as part of it", async () => {
+    const screen = node("FRAME", "Screen", { fills: solid("#ffffff") });
+    page.appendChild(screen);
+    const btn = node("FRAME", "Share button", { width: 48, height: 48 });
+    screen.appendChild(btn);
+    btn.appendChild(node("FRAME", "Icon button", { width: 16, height: 16 }));
+    const res = (await a11yAudit(ctx({ nodeId: screen.id }))) as any;
+    expect(res.findings.some((f: any) => f.name === "Icon button")).toBe(false);
+  });
+});
+
 describe("design-system audit and apply", () => {
   function screenWithLiterals() {
     const screen = node("FRAME", "Screen", { fills: solid("#ffffff"), layoutMode: "VERTICAL", paddingLeft: 16, paddingRight: 16, paddingTop: 0, paddingBottom: 0, itemSpacing: 12, primaryAxisAlignItems: "MIN", cornerRadius: 8 });
