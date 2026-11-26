@@ -44,29 +44,55 @@ export function readMarkData(node: BaseNode): Partial<FlowMark> | null {
   }
 }
 
+/**
+ * The page-level items that carry a userflow marker: the page's children and
+ * a SECTION's — a SECTION only groups the canvas, so a userflow parked inside
+ * one still maps the screens it names (the same descent `linkScreens` makes).
+ *
+ * This runs for every screen-sized frame a create draws, and the walk read
+ * the marker of every layer on the page each time. One native search narrowed
+ * by the marker keys returns only the frames that have one, in document
+ * order; the walk stays for a runtime without it.
+ */
+function flowMarkedItems(page: PageNode): readonly BaseNode[] {
+  try {
+    if (typeof page.findAllWithCriteria === "function") {
+      const marked = page.findAllWithCriteria({ pluginData: { keys: [FLOW_MARKER, LEGACY_FLOW_MARKER] } });
+      // By id: two handles on the same node are not guaranteed to be ===.
+      return marked.filter((n) => {
+        const parent = n.parent;
+        if (!parent) return false;
+        return parent.id === page.id || (parent.type === "SECTION" && parent.parent?.id === page.id);
+      });
+    }
+  } catch {
+    // fall back to the walk
+  }
+  const items: BaseNode[] = [];
+  for (const child of page.children) {
+    if (child.type === "SECTION") items.push(...child.children);
+    else items.push(child);
+  }
+  return items;
+}
+
 /** Every userflow frame on a page, newest declaration order preserved. */
 export function readFlowMarks(page: PageNode): FlowMark[] {
   const out: FlowMark[] = [];
-  for (const child of page.children) {
-    // A SECTION only groups the canvas — a userflow parked inside one still
-    // maps the screens it names (the same descent `linkScreens` makes).
-    const items: readonly BaseNode[] =
-      child.type === "SECTION" ? child.children : [child];
-    for (const item of items) {
-      const parsed = readMarkData(item);
-      if (!parsed) continue;
-      out.push({
-        frameId: item.id,
-        frameName: item.name,
-        title: typeof parsed.title === "string" ? parsed.title : item.name,
-        nodes: Array.isArray(parsed.nodes) ? parsed.nodes.map(String) : [],
-        screens:
-          parsed.screens && typeof parsed.screens === "object"
-            ? (parsed.screens as Record<string, string>)
-            : {},
-        ...(parsed.graph ? { graph: parsed.graph } : {}),
-      });
-    }
+  for (const item of flowMarkedItems(page)) {
+    const parsed = readMarkData(item);
+    if (!parsed) continue;
+    out.push({
+      frameId: item.id,
+      frameName: item.name,
+      title: typeof parsed.title === "string" ? parsed.title : item.name,
+      nodes: Array.isArray(parsed.nodes) ? parsed.nodes.map(String) : [],
+      screens:
+        parsed.screens && typeof parsed.screens === "object"
+          ? (parsed.screens as Record<string, string>)
+          : {},
+      ...(parsed.graph ? { graph: parsed.graph } : {}),
+    });
   }
   return out;
 }

@@ -106,7 +106,31 @@ function recolorPaintList(
   tally: { changed: number; skippedBound: number },
 ): void {
   const paints = node[field];
-  if (paints === figma.mixed || !Array.isArray(paints)) return;
+  if (paints === figma.mixed) {
+    // A text coloured in several runs reads as figma.mixed as a whole, and
+    // returning here left every multi-colour label out of a recolor. Its runs
+    // are recoloured one by one instead.
+    const text = node as unknown as TextNode;
+    if (field !== "fills" || typeof text.getStyledTextSegments !== "function") return;
+    for (const seg of text.getStyledTextSegments(["fills"])) {
+      const { next, changed } = recolored(seg.fills, from, toRgb, tally);
+      if (changed > 0) text.setRangeFills(seg.start, seg.end, next);
+      tally.changed += changed;
+    }
+    return;
+  }
+  if (!Array.isArray(paints)) return;
+  const { next, changed } = recolored(paints, from, toRgb, tally);
+  if (changed > 0) node[field] = next;
+  tally.changed += changed;
+}
+
+function recolored(
+  paints: readonly Paint[],
+  from: string | undefined,
+  toRgb: { r: number; g: number; b: number },
+  tally: { skippedBound: number },
+): { next: Paint[]; changed: number } {
   let changed = 0;
   const next = paints.map((paint) => {
     if (paint.type !== "SOLID") return paint;
@@ -118,8 +142,7 @@ function recolorPaintList(
     changed++;
     return { ...paint, color: toRgb };
   });
-  if (changed > 0) node[field] = next as Paint[];
-  tally.changed += changed;
+  return { next, changed };
 }
 
 /**

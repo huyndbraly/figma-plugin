@@ -5,6 +5,7 @@ import {
   serializeTree,
   normalizeDetail,
   Detail,
+  type SerializedNode,
 } from "../serialize.js";
 import { availableFonts } from "../fonts.js";
 import { rgbToHex } from "../color-util.js";
@@ -12,6 +13,18 @@ import { r2 } from "../num.js";
 import { nodeNotFound, err } from "../errors.js";
 import { ErrorCode, BATCH_CHUNK_SIZE } from "../../shared/protocol.js";
 import { listComponents } from "./design-system.js";
+import { localVariables } from "./tokens.js";
+
+/**
+ * How many nodes one get_design_context may serialize. The depth limit alone
+ * does not bound a page: three levels of a file with 400 top-level screens of
+ * 40 layers each is 16 000 nodes, a response bigger than the agent's context.
+ * The walk is breadth-first, so what survives the cap is the outline — every
+ * screen before any screen's insides — which is the map the read is for.
+ */
+const DESIGN_CONTEXT_MAX_NODES = 3000;
+/** scan_nodes_by_types' default cap — the same budget search_nodes keeps. */
+const SCAN_TYPES_LIMIT = 200;
 
 export async function getDocumentInfo(): Promise<unknown> {
   const page = figma.currentPage;
@@ -77,15 +90,67 @@ export async function getDesignContext(ctx: HandlerContext): Promise<unknown> {
   } else if (root.type === "DOCUMENT") {
     for (const pg of (root as DocumentNode).children) await pg.loadAsync?.();
   }
-  const tree = serializeTree(root, detail, maxDepth);
+  const maxNodes =
+    typeof p.maxNodes === "number" && p.maxNodes > 0 ? Math.floor(p.maxNodes) : DESIGN_CONTEXT_MAX_NODES;
+  const { tree, count, truncated } = serializeTreeCapped(root, detail, maxDepth, maxNodes);
   return {
     tree,
+    ...(truncated
+      ? {
+          truncated: true,
+          nodeCount: count,
+          truncatedHint: `Stopped at ${count} nodes (maxNodes). The outline is complete down to the depth where it stopped; read one subtree with a nodeId, lower depth, or raise maxNodes.`,
+        }
+      : {}),
     ...(scoped
       ? {}
       : {
           hint: "Whole-page read (sparse). Pass a nodeId to deep-read one subtree, or detail:'compact'|'full' for more per-node data.",
         }),
   };
+}
+
+/**
+ * serializeTree with a node budget. Breadth-first, so the cap cuts the
+ * deepest layers first; a node whose children did not fit gets
+ * `childrenTruncated` with its real child count, so the reader knows the
+ * subtree is there and how to ask for it.
+ */
+export function serializeTreeCapped(
+  root: BaseNode,
+  detail: Detail,
+  maxDepth: number,
+  maxNodes: number,
+): { tree: SerializedNode; count: number; truncated: boolean } {
+  const tree = serializeNode(root, detail);
+  let count = 1;
+  let truncated = false;
+  const queue: Array<{ node: BaseNode; depth: number; out: SerializedNode }> = [
+    { node: root, depth: 0, out: tree },
+  ];
+  for (let head = 0; head < queue.length; head++) {
+    const item = queue[head]!;
+    if (item.depth >= maxDepth) continue;
+    if (!("children" in item.node)) continue;
+    const kids = (item.node as ChildrenMixin).children;
+    if (kids.length === 0) continue;
+    if (count + kids.length > maxNodes) {
+      // All of a node's children or none of them: half a child list reads as
+      // the whole list, and that is worse than a list marked missing.
+      truncated = true;
+      (item.out as Record<string, unknown>).childrenTruncated = kids.length;
+      continue;
+    }
+    const childOut: SerializedNode[] = [];
+    for (const kid of kids) {
+      const so = serializeNode(kid, detail);
+      childOut.push(so);
+      queue.push({ node: kid, depth: item.depth + 1, out: so });
+    }
+    count += kids.length;
+    item.out.children = childOut;
+  }
+  return { tree, count, truncated };
 }
 
 export async function getNode(ctx: HandlerContext): Promise<unknown> {
@@ -155,9 +220,11 @@ export async function searchNodes(ctx: HandlerContext): Promise<unknown> {
   }
 
   const results: unknown[] = [];
+  // No callback when there is no filter: the editor skips a call back into
+  // the plugin for every node of the page.
   const all = types
     ? scope.findAllWithCriteria({ types: types as NodeType[] })
-    : scope.findAll(() => true);
+    : scope.findAll();
   let matched = 0;
   let truncated = false;
   for (const n of all) {
@@ -234,15 +301,29 @@ export async function scanNodesByTypes(ctx: HandlerContext): Promise<unknown> {
     root = figma.currentPage;
   }
   const found = root.findAllWithCriteria({ types: types as NodeType[] });
+  // Capped like search_nodes: "every FRAME on the page" of a large file was
+  // thousands of serialized nodes in one response.
+  const limit = typeof p.limit === "number" && p.limit > 0 ? Math.floor(p.limit) : SCAN_TYPES_LIMIT;
+  const shown = Math.min(found.length, limit);
   const out: unknown[] = [];
-  for (let i = 0; i < found.length; i++) {
+  for (let i = 0; i < shown; i++) {
     out.push(serializeNode(found[i]!, detail));
     if ((i + 1) % BATCH_CHUNK_SIZE === 0) {
-      ctx.progress(i + 1, found.length, "scanning");
+      ctx.progress(i + 1, shown, "scanning");
     }
   }
-  ctx.progress(found.length, found.length, "done");
-  return { count: found.length, nodes: out };
+  ctx.progress(shown, shown, "done");
+  return {
+    count: out.length,
+    nodes: out,
+    ...(found.length > shown
+      ? {
+          hasMore: true,
+          totalMatched: found.length,
+          hint: `Showing ${shown} of ${found.length} nodes. Scope with a nodeId or narrower types, or pass a higher \`limit\`.`,
+        }
+      : {}),
+  };
 }
 
 export async function getStyles(): Promise<unknown> {
@@ -262,12 +343,14 @@ export async function getStyles(): Promise<unknown> {
 
 export async function getVariables(): Promise<unknown> {
   const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  // One fetch for every variable instead of an await per id.
+  const byId = new Map((await localVariables()).map((v) => [v.id, v]));
   const out: unknown[] = [];
   for (const c of collections) {
     const modes = c.modes.map((m) => ({ id: m.modeId, name: m.name }));
     const variables: unknown[] = [];
     for (const id of c.variableIds) {
-      const v = await figma.variables.getVariableByIdAsync(id);
+      const v = byId.get(id);
       if (!v) continue;
       const values: Record<string, unknown> = {};
       for (const m of c.modes) {

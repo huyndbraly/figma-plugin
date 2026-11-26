@@ -45,46 +45,69 @@ export interface ReflowOpts {
   deleted?: boolean;
 }
 
+export type DiagramKind = "userflow" | "activity" | "erd" | "sequence" | "state" | "sitemap";
+
+/**
+ * Which re-routable diagram this node carries, and whether it routes live —
+ * from ONE parse of the stored graph.
+ *
+ * isDiagramFrame, liveRouteOn and reflowAnyFrame each used to walk the six
+ * graph readers on their own, so a live pass parsed a large graph's JSON three
+ * times per frame before the re-route parsed it once more. The readers are
+ * tried in the same order as before, and each one only parses when its own
+ * marker key is set, so the first hit is the only parse.
+ */
+export function diagramKindOf(node: BaseNode): { kind: DiagramKind; liveRoute: boolean } | null {
+  const flow = userflowGraphOf(node);
+  if (flow) return { kind: "userflow", liveRoute: flow.liveRoute };
+  const activity = activityGraphOf(node);
+  if (activity) return { kind: "activity", liveRoute: activity.liveRoute };
+  const erd = erdGraphOf(node);
+  if (erd) return { kind: "erd", liveRoute: erd.liveRoute };
+  const seq = sequenceGraphOf(node);
+  if (seq) return { kind: "sequence", liveRoute: seq.liveRoute };
+  const state = stateGraphOf(node);
+  if (state) return { kind: "state", liveRoute: state.liveRoute };
+  const sitemap = sitemapGraphOf(node);
+  if (sitemap) return { kind: "sitemap", liveRoute: sitemap.liveRoute };
+  return null;
+}
+
 /** Does this node carry a diagram we know how to re-route? */
 export function isDiagramFrame(node: BaseNode): boolean {
-  return (
-    !!userflowGraphOf(node) ||
-    !!activityGraphOf(node) ||
-    !!erdGraphOf(node) ||
-    !!sequenceGraphOf(node) ||
-    !!stateGraphOf(node) ||
-    !!sitemapGraphOf(node)
-  );
+  return !!diagramKindOf(node);
 }
 
 /** Is live re-routing switched on for this frame? */
 export function liveRouteOn(frame: FrameNode): boolean {
-  const flow = userflowGraphOf(frame);
-  if (flow) return flow.liveRoute;
-  const activity = activityGraphOf(frame);
-  if (activity) return activity.liveRoute;
-  const erd = erdGraphOf(frame);
-  if (erd) return erd.liveRoute;
-  const seq = sequenceGraphOf(frame);
-  if (seq) return seq.liveRoute;
-  const state = stateGraphOf(frame);
-  if (state) return state.liveRoute;
-  const sitemap = sitemapGraphOf(frame);
-  if (sitemap) return sitemap.liveRoute;
-  return false;
+  return diagramKindOf(frame)?.liveRoute ?? false;
 }
 
+/**
+ * `kind` is what diagramKindOf already answered: pass it and the dispatch
+ * does not parse the graph again just to pick the router.
+ */
 export async function reflowAnyFrame(
   frame: FrameNode,
   opts?: ReflowOpts,
+  kind?: DiagramKind,
 ): Promise<DiagramReport | null> {
-  if (userflowGraphOf(frame)) return reflowFrame(frame, opts);
-  if (activityGraphOf(frame)) return reflowActivityFrame(frame, opts);
-  if (erdGraphOf(frame)) return reflowErdFrame(frame, opts);
-  if (sequenceGraphOf(frame)) return reflowSequenceFrame(frame, opts);
-  if (stateGraphOf(frame)) return reflowStateFrame(frame, opts);
-  if (sitemapGraphOf(frame)) return reflowSitemapFrame(frame, opts);
-  return null;
+  switch (kind ?? diagramKindOf(frame)?.kind) {
+    case "userflow":
+      return reflowFrame(frame, opts);
+    case "activity":
+      return reflowActivityFrame(frame, opts);
+    case "erd":
+      return reflowErdFrame(frame, opts);
+    case "sequence":
+      return reflowSequenceFrame(frame, opts);
+    case "state":
+      return reflowStateFrame(frame, opts);
+    case "sitemap":
+      return reflowSitemapFrame(frame, opts);
+    default:
+      return null;
+  }
 }
 
 /**
@@ -104,6 +127,16 @@ export function diagramFrames(page: PageNode): FrameNode[] {
   const marked = markedDiagramFrames(page);
   if (!marked) return shallowDiagramFrames(page);
   return marked.filter((frame) => isDiagramFrame(frame));
+}
+
+/**
+ * The frames that MAY carry a re-routable diagram, without parsing a graph:
+ * every marked frame (boards included — diagramKindOf says no to those later).
+ * The DELETE sweep runs on every delete anywhere on the page and only needs to
+ * know which frames lost a layer; the graphs are parsed for those alone.
+ */
+export function diagramFrameCandidates(page: PageNode): FrameNode[] {
+  return markedDiagramFrames(page) ?? shallowDiagramFrames(page);
 }
 
 function shallowDiagramFrames(page: PageNode): FrameNode[] {

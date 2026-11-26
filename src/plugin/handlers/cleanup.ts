@@ -2,6 +2,8 @@
 import { HandlerContext } from "../context.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
+import { loadFontCached, loadNodeFonts } from "../fonts.js";
+import { invalidateTextStyles } from "./styles.js";
 
 /**
  * Cleanup ops: delete a page, delete a local style, and sweep the local
@@ -243,12 +245,16 @@ export async function scanStyleUsages(ctx: HandlerContext): Promise<Map<string, 
 async function rebind(usage: StyleUsage, style: BaseStyle): Promise<void> {
   const node = usage.node as unknown as Record<string, unknown>;
   if (usage.field === "textStyleId") {
-    await figma.loadFontAsync((style as TextStyle).fontName);
+    await loadFontCached((style as TextStyle).fontName);
     const text = usage.node as TextNode;
-    const fonts = usage.range
-      ? text.getRangeAllFontNames(usage.range.start, usage.range.end)
-      : text.getRangeAllFontNames(0, text.characters.length);
-    for (const f of fonts) await figma.loadFontAsync(f);
+    // A whole-node usage goes through loadNodeFonts, which knows an EMPTY
+    // text has no range to ask about: getRangeAllFontNames(0, 0) throws, and
+    // one empty label used to fail the whole rebind and keep the style.
+    if (usage.range) {
+      for (const f of text.getRangeAllFontNames(usage.range.start, usage.range.end)) await loadFontCached(f);
+    } else {
+      await loadNodeFonts(text);
+    }
   }
   const suffix = usage.field.charAt(0).toUpperCase() + usage.field.slice(1); // FillStyleId
   if (usage.range) {
@@ -321,6 +327,7 @@ export async function deleteStyle(ctx: HandlerContext): Promise<unknown> {
 
   const { name, id, type } = style;
   style.remove();
+  invalidateTextStyles();
   commitUndo();
   return {
     deleted: name,
@@ -398,6 +405,7 @@ export async function deleteUnusedStyles(ctx: HandlerContext): Promise<unknown> 
       failed.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+  invalidateTextStyles();
   commitUndo();
   return { deleted, count: deleted.length, failed, inUse, kept };
 }
