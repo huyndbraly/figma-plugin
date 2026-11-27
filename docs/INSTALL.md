@@ -135,6 +135,11 @@ If the package is published to npm:
 | Variable | Default | Meaning |
 |---|---|---|
 | `FIGMA_MCP_PORT` | `38470` | Start port for the bridge. The server still walks up to 9 ports from here when the chosen one is busy, and still becomes a follower if a healthy leader already owns one. |
+| `FIGMA_TOKEN` | — | Figma personal access token for the REST path. **Optional, and a fallback:** a token saved in the plugin panel (REST Token field) wins. See [REST token](#rest-token-optional). |
+| `FIGMA_CACHE` / `FIGMA_CACHE_DIR` | on / `<cwd>/.figma-cache` | The local multi-file design-system index (`search_design_index`). `FIGMA_CACHE=off` disables it. Metadata only (names, ids, keys); the folder writes its own `.gitignore`. |
+| `OPENAI_API_KEY` / `FIGMA_MCP_OPENAI_API_KEY` | — | BYOK for `figma.generateImage` (model `FIGMA_MCP_IMAGE_MODEL`, default `gpt-image-1`). |
+| `ANTHROPIC_API_KEY` / `FIGMA_MCP_ANTHROPIC_API_KEY` | — | BYOK for `figma.generateSvg` (model `FIGMA_MCP_SVG_MODEL`, default `claude-sonnet-5-5`). |
+| `FIGMA_MCP_BYOK_CONFIG` | — | Path to a JSON file `{ openaiApiKey?, anthropicApiKey?, imageModel?, svgModel? }`, read when the env vars above are unset. |
 
 `FIGMA_MCP_PORT` must be an integer in `1024`–`65535`; anything else (a typo, a privileged port) aborts startup with an explicit error rather than silently reverting to the default.
 
@@ -151,6 +156,27 @@ If the package is published to npm:
   }
 }
 ```
+
+## REST token (optional)
+
+Everything that works on an **open** file goes through the plugin and needs no token. A Figma personal access token (PAT) adds what only the REST API can do: **comments** (`get_comments`, `figma.postComment`), **version history** (`get_versions`), and **reading a file nobody has open** from its link (`get_node`, `get_design_context`, `generate_design_md`, `screenshot`, `exportAssets`).
+
+1. **Create it:** Figma → avatar → **Settings → Security → Personal access tokens → Generate new token**.
+2. **Expiration:** Figma offers 1, 7, 30 or 90 days. Note which one — Figma's API cannot tell the tool later.
+3. **Scopes** — tick what you need:
+
+   | Scope | Enables |
+   |---|---|
+   | `current_user:read` | the badge's `@handle` (the token still works without it) |
+   | `file_content:read` | reading closed files, renders, `exportAssets` via REST |
+   | `file_comments:read` / `file_comments:write` | `get_comments` / `postComment` |
+   | `file_versions:read` | `get_versions` |
+   | `library_content:read` | components & styles of a closed file (`generate_design_md`, `index_design_file`) |
+
+4. **Paste it into the plugin panel:** **REST Token (PAT)** field → pick the same expiry in **Exp** → **Save**. The badge goes `Checking…` → `Valid (@handle) · 23h left`. The token is stored with `figma.clientStorage` on your machine only (every file shares it; it is never put in a document) and sent to the local MCP server, which keeps it in memory. It is never written to disk, logged or shown to the AI — `figma_status.restToken` reports only its state, owner handle, scopes, expiry and a masked `figd_…a1b2`.
+5. **Clear** removes it. `FIGMA_TOKEN` in the server's environment still works and is used when no panel token is saved.
+
+**Rate limits.** REST quotas depend on the Figma plan and seat. On a **Starter** plan the file-read endpoints have a very small quota: in testing it ran out after about a dozen reads and Figma answered `429` with `Retry-After` of **4.6 days**. The tool then fails at once with `RATE_LIMITED` (it no longer retries for minutes) and the badge shows `Rate-limited (429) · retry in 4d`. Comments and versions are a different quota tier. **Whenever the file is open, the plugin path is used and costs no quota** — prefer it for repeated reads.
 
 ## Importing the plugin into Figma Desktop
 
@@ -201,5 +227,11 @@ Once the server is registered and the plugin is running, ask your agent to call 
 | `CHANNEL_NOT_FOUND` naming the file this session was on | The window this session worked in closed and has not come back within 15 s | Reopen the plugin in that file, or pass `file` (and `page`) to point the session at another window — it never re-targets a different file by itself. |
 | The plugin says a channel "is live in another window" | Two windows of the same file (or two "Untitled" files) share the stored channel | Nothing to fix: the server kept the live window on its channel and gave this one its own. Route by `file`/`page`. |
 | `pluginConnected: null` with `"statusSource": "unknown"` | This process is a **follower** and could not query the leader for status (leader busy, restarting, or dead) | Nothing to do with the plugin — do **not** reopen or reinstall it. Just retry; the follower's health monitor takes over leadership if the leader is truly dead. |
+
+| Badge `Expired / Invalid (401/403)` | The token expired (1–90 days), was revoked, or was mistyped | Generate a new token, paste it into the panel, **Save**. |
+| Badge `Expired? (date passed)` while Figma still accepts it | The expiry you picked in **Exp** has passed by the clock | Replace the token now; Figma will start refusing it. |
+| Badge amber, tooltip `Missing scopes: …` / error `UNAUTHORIZED` naming a scope | The token was created without that scope | Create a token with the named scope ticked (the error also lists the scopes the current one has), Save it. |
+| `RATE_LIMITED` / badge `Rate-limited (429) · retry in …` | Figma's REST quota for this plan is used up | Open the file in Figma Desktop with the plugin — reads go through the plugin with no quota. REST works again at `restToken.retryAt`. |
+| `get_comments` / `get_versions`: "Which file?" | No link given and the open window did not report its `fileKey` | Pass `{ url }`. Re-run the plugin once after updating — the manifest now enables `enablePrivatePluginApi`, which lets the plugin report its file key. |
 
 For the full error code table (what each `code` means and how to react), see [`TOOLS.md`](./TOOLS.md#error-codes).

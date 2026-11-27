@@ -13,6 +13,11 @@ Practical, copy-pasteable patterns for `figma_write`. Each recipe assumes you're
 - [Setting up design tokens from a design.md-style palette](#setting-up-design-tokens-from-a-designmd-style-palette)
 - [Verify-and-fix loop with layout_audit](#verify-and-fix-loop-with-layout_audit)
 - [Icon search + insert](#icon-search--insert)
+- [Comments and versions (REST token)](#comments-and-versions-rest-token)
+- [Read a file that is not open](#read-a-file-that-is-not-open)
+- [Diagrams in FigJam, slides in Figma Slides](#diagrams-in-figjam-slides-in-figma-slides)
+- [Code Connect files from the component map](#code-connect-files-from-the-component-map)
+- [Rebuild a running page in Figma](#rebuild-a-running-page-in-figma)
 
 ---
 
@@ -393,3 +398,63 @@ await figma.loadIcon("visibility", {
 ```
 
 If a specific library doesn't have the icon, `loadIcon` throws `NODE_NOT_FOUND` — try `searchIcons` again or pass a different `library` from the candidate's `libraries` list. Fetched SVGs are cached on disk (`$TMPDIR/figma-plugin/cache/`), so repeated inserts of the same icon in later calls don't re-fetch.
+
+---
+
+## Comments and versions (REST token)
+
+Needs a token saved in the plugin panel (or `FIGMA_TOKEN`) — check `figma_status.restToken.state === "valid"` first; if not, ask the user to save one.
+
+```js
+// Open threads on the frame a link points at:
+const { threads } = await figma.getComments({ url: "https://www.figma.com/design/KEY/App?node-id=12-34", unresolved: true });
+// Reply — only when the user asked you to: everyone on the file sees it.
+await figma.postComment({ url: "https://www.figma.com/design/KEY/App", replyTo: threads[0].id, message: "Fixed: spacing is now 16." });
+const { versions } = await figma.getVersions({ url: "https://www.figma.com/design/KEY/App", namedOnly: true, limit: 5 });
+return { open: threads.length, lastRelease: versions[0]?.label };
+```
+
+From `figma_read`: `{ op: "get_comments", params: { url } }`, `{ op: "get_versions", params: { fileKey } }`. A token missing `file_comments:write` fails with `UNAUTHORIZED` naming that scope.
+
+## Read a file that is not open
+
+```jsonc
+// figma_read — with the file closed, these go through REST:
+{ "op": "get_design_context", "params": { "url": "https://www.figma.com/design/KEY/App?node-id=12-34", "depth": 2 } }
+{ "op": "generate_design_md", "params": { "fileKey": "KEY" } }
+// Force REST even if it IS open (what was last saved):
+{ "op": "get_node", "params": { "url": "…?node-id=12-34", "source": "rest" } }
+```
+
+Each call spends REST quota (small on Starter plans — a `RATE_LIMITED` error says when it resets). If the file can be opened, open it: the plugin path is faster, sees more, and costs nothing.
+
+## Diagrams in FigJam, slides in Figma Slides
+
+Run the plugin inside a FigJam board and call `figma_diagram` as usual — `userflow`, `activity`, `state` and `sitemap` come out as FigJam shapes and connectors in a section (`native: "figjam"` in the answer), still proof-read first.
+
+```js
+// In a Figma Slides deck:
+const deck = await figma.getSlides();            // rows of slides
+const s = await figma.createSlide({ name: "Roadmap", fill: "#0f172a" });
+await figma.create({ type: "TEXT", parentId: s.id, characters: "Q1 roadmap", fontSize: 64, fill: "#ffffff", x: 120, y: 120 });
+```
+
+## Code Connect files from the component map
+
+```js
+const map = await figma.exportComponentMap();     // or your reviewed figma.components.json
+await figma.useComponentMap(map.map);
+return await figma.exportCodeConnect({ dir: "/abs/path/app/src/figma", importFrom: "@/components/ui" });
+// → { written: [".../Button.figma.tsx", …], skipped, missing }
+// Later, from a repo that already has them:
+// await figma.readCodeConnect({ dir: "/abs/path/app/src", use: true });
+```
+
+## Rebuild a running page in Figma
+
+Needs Playwright next to the MCP server (`npm i -D playwright && npx playwright install chromium`).
+
+```js
+return await figma.htmlToFigma("http://localhost:3000/settings", { width: 390, selector: "main", name: "Settings (from code)", x: 2000, y: 0 });
+// flex → auto-layout; images become named placeholders; past maxNodes the smallest elements are dropped (warned).
+```

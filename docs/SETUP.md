@@ -150,6 +150,8 @@ This part repeats each session, because Figma doesn't auto-start plugins:
 
 > 📌 **Order to remember:** open the kitchen (plugin) → call the translator (AI) → wait for green → check the line is clear → order.
 
+**Optional — REST token.** For comments, version history, and reading files that are *not* open, paste a Figma personal access token into the plugin panel: **REST Token (PAT)** → pick its expiry → **Save**. It stays on your machine; the AI only ever sees whether it is valid. Scopes and limits: [`INSTALL.md` → REST token](./INSTALL.md#rest-token-optional).
+
 **Better results:** if your file already has a design system, say *"read the design system first, then draw"* — the AI reuses your real colors and components instead of inventing new ones.
 
 ### Cursor + Claude Code + Codex at the same time
@@ -227,6 +229,7 @@ The Figma connection isn't working. Please:
 | Skill runs but finds no tools | server registered under a name other than `figma-plugin` | fix the `allowed-tools` line in each `SKILL.md`, or re-register under `figma-plugin` |
 | Version mismatch | server rebuilt, plugin stale | rebuild **and re-import the manifest** |
 | Changed settings, still nothing | didn't restart | always restart after config changes |
+| REST badge red / amber / "Rate-limited" | token expired, missing a scope, or plan quota used up | see [`INSTALL.md` → Troubleshooting](./INSTALL.md#troubleshooting) |
 
 A light that flickers or goes yellow between actions is normal — it reconnects itself.
 
