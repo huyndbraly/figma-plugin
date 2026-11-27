@@ -28,6 +28,7 @@ const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
 const TOOL_NAMES = TOOLS.map((t) => t.name).sort();
 const tools = read("docs/TOOLS.md");
 const readme = read("README.md");
+const readmeEn = read("README.en.md");
 const arch = read("ARCHITECTURE.md");
 
 /** Tool names that once existed. Naming one as callable is the bug. */
@@ -67,7 +68,7 @@ describe("the shipped docs", () => {
     // The cost is that a NEW sentence claiming a count is not covered until
     // somebody adds it here, which is the honest trade.
     const CLAIMS: Array<[string, string, string]> = [
-      ["README.md", readme, `**${n}** diagram kinds`],
+      ["README.en.md", readmeEn, `**${n}** diagram kinds`],
       ["ARCHITECTURE.md", arch, `${n[0]!.toUpperCase()}${n.slice(1)} kinds behind one \`type\``],
       [
         "ARCHITECTURE.md",
