@@ -11,6 +11,7 @@ import { makeContext } from "./context.js";
 import { toBridgeError, err } from "./errors.js";
 import { HANDLERS, assertRegistryComplete, Handler } from "./handlers/registry.js";
 import { installDiagramLive } from "./diagram-live.js";
+import { cleanRestToken } from "../shared/rest-token.js";
 
 declare const __VERSION__: string;
 declare const __BUILD__: string;
@@ -33,6 +34,8 @@ type UiToMain =
   | { kind: "request"; payload: BridgeRequest }
   | { kind: "hello-request" }
   | { kind: "save-channel"; channel: string | null; resumeToken?: string | null }
+  // The REST Token field: save (string) or clear (null) the PAT.
+  | { kind: "save-rest-token"; token: string | null; expiresAt?: number | null }
   // The panel is resizable: only the main thread may call figma.ui.resize(),
   // so the iframe measures the drag and sends the size here.
   | { kind: "resize"; width: number; height: number }
@@ -46,6 +49,9 @@ type MainToUi =
   | { kind: "context"; reason: "selection" | "page"; hello: HelloData }
   | { kind: "response"; payload: BridgeResponse; op: Operation }
   | { kind: "progress"; payload: BridgeResponse; op: Operation }
+  // The stored PAT after a save/clear (or a refusal). The UI forwards it to
+  // the server with set_rest_token; it never shows the value.
+  | { kind: "rest-token"; token: string | null; expiresAt?: number | null; reason: "saved" | "cleared" | "rejected"; error?: string }
   | {
       kind: "local";
       id: string;
@@ -78,6 +84,14 @@ interface HelloData {
   channel: string | null;
   /** Resume secret for reclaiming the channel after reload. */
   resumeToken: string | null;
+  /**
+   * The Figma REST personal access token saved on THIS machine
+   * (clientStorage — per user, shared by every file, never in the document).
+   * Rides in the hello so a restarted server gets it back at once.
+   */
+  restToken: string | null;
+  /** When that token expires (epoch ms), as the user said at Save; null = not stated. */
+  restTokenExpiresAt: number | null;
 }
 
 function post(msg: MainToUi): void {
@@ -95,6 +109,20 @@ function channelStorageKey(): string {
 let storedChannel: string | null = null;
 let storedResumeToken: string | null = null;
 
+/**
+ * clientStorage key of the REST token. NOT per file: a personal access token
+ * belongs to the user, and every file on this machine should use it. Never
+ * setPluginData / document storage — a document travels to everyone it is
+ * shared with.
+ */
+const REST_TOKEN_KEY = "figma-plugin:rest-token";
+let storedRestToken: string | null = null;
+let storedRestExpiresAt: number | null = null;
+
+function cleanExpiry(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
 function helloData(): HelloData {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -106,6 +134,8 @@ function helloData(): HelloData {
     editorType: figma.editorType,
     channel: storedChannel,
     resumeToken: storedResumeToken,
+    restToken: storedRestToken,
+    restTokenExpiresAt: storedRestToken ? storedRestExpiresAt : null,
   };
 }
 
@@ -297,7 +327,21 @@ if (missing.length > 0) {
 
 // Restore this file's channel before the UI connects (the UI asks for
 // handshake/hello first, and hello carries the stored channel).
-const channelLoaded: Promise<void> = figma.clientStorage
+const restTokenLoaded: Promise<void> = figma.clientStorage
+  .getAsync(REST_TOKEN_KEY)
+  .then((v) => {
+    // Legacy: the bare token string. Current: { token, expiresAt }.
+    if (v && typeof v === "object") {
+      const o = v as { token?: unknown; expiresAt?: unknown };
+      storedRestToken = cleanRestToken(o.token);
+      storedRestExpiresAt = cleanExpiry(o.expiresAt);
+    } else storedRestToken = cleanRestToken(v);
+  })
+  .catch(() => {
+    /* storage unavailable — no token until the user saves one */
+  });
+
+const channelOnlyLoaded: Promise<void> = figma.clientStorage
   .getAsync(channelStorageKey())
   .then((v) => {
     // Legacy: plain channel string. Current: { channel, resumeToken }.
@@ -316,6 +360,9 @@ const channelLoaded: Promise<void> = figma.clientStorage
   .catch(() => {
     /* first run / storage unavailable — server will assign a channel */
   });
+
+/** Channel AND REST token: the first hello carries both. */
+const channelLoaded: Promise<void> = Promise.all([channelOnlyLoaded, restTokenLoaded]).then(() => undefined);
 
 /**
  * Requests run one at a time, in arrival order. The server sends one op per
@@ -368,6 +415,34 @@ figma.ui.onmessage = async (msg: UiToMain) => {
       } catch {
         /* non-fatal: channel just won't persist across restarts */
       }
+      break;
+    }
+    case "save-rest-token": {
+      await restTokenLoaded;
+      if (msg.token === null) {
+        storedRestToken = null;
+        storedRestExpiresAt = null;
+        try {
+          await figma.clientStorage.deleteAsync(REST_TOKEN_KEY);
+        } catch {
+          /* nothing stored */
+        }
+        post({ kind: "rest-token", token: null, reason: "cleared" });
+        break;
+      }
+      const token = cleanRestToken(msg.token);
+      if (!token) {
+        post({ kind: "rest-token", token: storedRestToken, reason: "rejected", error: "That does not look like a personal access token (figd_…, no spaces)." });
+        break;
+      }
+      storedRestToken = token;
+      storedRestExpiresAt = cleanExpiry(msg.expiresAt);
+      try {
+        await figma.clientStorage.setAsync(REST_TOKEN_KEY, { token, expiresAt: storedRestExpiresAt });
+      } catch {
+        /* non-fatal: works for this session, will not survive a restart */
+      }
+      post({ kind: "rest-token", token, expiresAt: storedRestExpiresAt, reason: "saved" });
       break;
     }
     case "resize": {

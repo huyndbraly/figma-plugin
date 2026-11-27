@@ -70,13 +70,29 @@ Returns rich diagnostics — never a bare boolean:
   "queueLength": 0,
   "pendingCount": 0,
   "sessions": [ /* session summaries */ ],
+  // The Figma REST token's STATE — never the token. null on an old server.
+  "restToken": { "state": "valid", "source": "plugin", "handle": "ngoc", "masked": "figd_…a1b2", "checkedAt": 1764200000000 },
   "hints": [
     "All systems nominal. Draw with figma_write; verify with figma_read layout_audit."
   ]
 }
 ```
 
-`hints` is an ordered list, most actionable first. It surfaces (in order of how they're evaluated): follower mode, missing bridge auth, no plugin connected, protocol version mismatch, stale heartbeat, non-empty queue. If none apply, it returns a single "all nominal" hint.
+`hints` is an ordered list, most actionable first. It surfaces (in order of how they're evaluated): follower mode, missing bridge auth, no plugin connected, protocol version mismatch, stale heartbeat, non-empty queue, a rejected or rate-limited REST token. If none apply, it returns a single "all nominal" hint.
+
+`restToken` also carries `scopes`, `missingScopes` and `expiresAt` when known. `restToken.state` is one of `not_set` · `unverified` (FIGMA_TOKEN not checked yet) · `checking` · `valid` (with `handle`) · `invalid` (Figma answered 401/403 for the token) · `rate_limited` (429) · `error` (the check could not run). `source` is `"plugin"` (saved in the plugin panel) or `"env"` (`FIGMA_TOKEN`). See [The REST token (PAT)](#the-rest-token-pat).
+
+### The REST token (PAT)
+
+The plugin panel has a **REST Token (PAT)** field under *Channel*: a password input, **Save** and **Clear**, and a live badge — `Not set` · `Checking…` · `Valid (@handle)` · `Expired / Invalid (401/403)` · `Rate-limited (429)`.
+
+- **Stored on the user's machine only**: `figma.clientStorage` (shared by every file, never in the document). The plugin sends it in its `hello` and with `set_rest_token`; clearing is always an explicit `set_rest_token { token: null }`, so a window that missed a newer token cannot wipe it.
+- **Held in RAM by the server** that owns the bridge (the leader). Priority: the plugin's token, else `FIGMA_TOKEN`. A follower never holds it: its REST requests are forwarded to the leader (`__rest_fetch__` over the authenticated `/rpc`) and run there; with no token on the leader, the follower falls back to its own `FIGMA_TOKEN`.
+- **Checked from Node** with `GET https://api.figma.com/v1/me` (the plugin's `networkAccess` stays localhost-only). Every real REST request also updates the state: a 401, or a 403 that names the token, flips it to *invalid* at once; a 403 for one file triggers a re-check instead (no access to a file is not a bad token); a 429 shows *rate-limited* until the next success.
+- **Expiry.** Figma's API cannot report when a PAT expires (`/v1/me` has no such field, and there is no introspection endpoint). The panel's **Exp** picker (1 / 7 / 30 / 90 days — the choices Figma offers) records it at Save; it is stored with the token, travels as `expiresAt`, the badge counts down (`Valid (@handle) · 23h left`, amber under a day, `Expired? (date passed)` after), and `figma_status` hints under 24 h. Without it, an expired token is still caught the moment Figma answers 401/403 — the badge turns *Expired / Invalid* and errors say to generate a new token.
+- **Scopes.** A 403 for a missing scope is *not* a bad token: Figma answers `"Invalid scope: [<the token's scopes>]. This endpoint requires the X scope."`, so the badge stays *Valid* (amber), `restToken.missingScopes` records X, and the error names the scope to add and the scopes the token has. Each check also learns the token's scopes up front (`restToken.scopes`, read from that same 403 on an endpoint PATs rarely have) and `figma_status` lists the features a token cannot do: `file_content:read` (closed-file reads, renders), `file_comments:read` / `:write`, `file_versions:read`, `library_content:read` (components/styles of a closed file).
+- **Never written to disk, logged, or returned to an agent** — `figma_status` carries the state, the handle and a masked preview (`figd_…a1b2`) only.
+- **Every REST request is reported** to every plugin window (`rest_event`): it counts in READS / WRITES / ERRORS and shows in ACTIVITY as `[REST] REST · get_nodes (fileKey) · 142ms` or `[REST] REST · 403 Token expired / invalid`.
 
 ---
 
@@ -109,7 +125,7 @@ Pass `params.url` — the link from Figma's right-click → **Copy link to selec
 |---|---|---|
 | `get_document_info` | — | Root document metadata. |
 | `get_selection` | — | Currently selected node(s) in Figma (shallow — id/name/type). |
-| `read_selection` | — (optional `detail`, `depth`) | **Deep**-read the current selection in one call — the selection-first editing entry point. Returns `{ count, nodes }`. |
+| `read_selection` | — (optional `detail`, `depth`) | **Deep**-read the current selection in one call — the selection-first editing entry point. Returns `{ count, nodes }`. At `detail: "full"`/`"design"` a node with prototype reactions also carries `motion`: `[{ trigger: { type, delay?, timeout? (s) }, actions: [{ type, destinationId, navigation, transition: { type (SMART_ANIMATE, MOVE_IN, DISSOLVE…), duration (s), easing: { type, bezier?: [x1,y1,x2,y2], spring?: { mass, stiffness, damping } }, direction?, matchLayers?, css?: "300ms cubic-bezier(…)" } }] }]` — the same on `get_design_context`. |
 | `get_design_context` | — (optional `nodeId`, `detail`, `depth`, `maxNodes`) | `detail: "sparse" \| "compact" \| "full" \| "design"`. A whole-page read (no `nodeId`) defaults to `sparse` since a page can be huge; a scoped read (with `nodeId`) defaults to `compact`. Depth-limited traversal. At `design` detail, paints/effects/typography are compacted (solid fills as hex, Figma-default fields omitted, empty arrays dropped). At most `maxNodes` nodes (default 3000, breadth-first); a capped read sets `truncated` and marks the cut nodes `childrenTruncated`. |
 | `get_node` | `nodeId` (non-empty string) | Single node by id. |
 | `get_nodes` | `nodeIds` (array, min 1) | Batch node fetch. |
@@ -136,6 +152,11 @@ Pass `params.url` — the link from Figma's right-click → **Copy link to selec
 | `design_fingerprint` | — | A hash of the file's design system, for checking whether a cached `design-kit.md` is still valid: compare it to the `<!-- dsfp:… -->` in the file. |
 | `get_diagram_spec` | `nodeId` (a diagram `frameId`) | **The model a drawn diagram was made from**, read back off its frame — so a finding can be fixed with a [`patch`](#editing-a-diagram-instead-of-re-drawing-it) instead of the whole spec sent again. Returns `{ nodeId, kind, title, spec }`. Errors if the frame was not drawn by `figma_diagram`, or predates the model being stored. |
 | `get_page_model` | — (optional `pageId`, `scope`) | **Every model the page holds**, so the tools can ask whether the diagrams agree with each other — see [Do the diagrams agree?](#do-the-diagrams-agree--optionscrosscheck). `scope: "file"` spans every page (opt-in: it must `loadAllPagesAsync`, which is slow on a big file). Each entry is `{ nodeId, kind, title, spec }`; a frame drawn before models were stored comes back flagged `stale`/`unreadable` rather than being omitted. |
+| `get_slides` | — | **Figma Slides only.** The deck's slide grid: `{ rows: [[{ id, name, row, col, skipped?, childCount }]], slideCount }`. Draw on a slide with `create({ parentId: <slide id> })`; add one with `figma.createSlide({ name, row?, col?, fill? })`. Refuses with a next step in Design/FigJam. |
+| `get_comments` | `url` or `fileKey` (else the open window's file) | **REST, needs the token** (plugin panel → REST Token, or `FIGMA_TOKEN`). Comment threads, newest first: `{ threads: [{ id, message, author, createdAt, resolvedAt?, nodeId?, replies }], total, returned }`. A link's `node-id` (or `nodeId`) keeps the threads pinned to that node; `unresolved: true`, `limit` (50). Never served from the read cache. Reply or post with `figma.postComment(...)` in `figma_write`. |
+| `get_versions` | `url` or `fileKey` (else the open window's file) | **REST, needs the token.** Version history: `{ versions: [{ id, label?, description?, createdAt, author }], hasMore }`. `limit` (30), `namedOnly: true` for labelled versions only. |
+| `search_design_index` | `query` (optional `kinds`: `component`/`style`/`variable`, `file`, `limit` (30)) | **Local, server-answered.** Searches every file whose components / styles / variables this machine has read — through the plugin or REST — kept as metadata in `.figma-cache/` (or `$FIGMA_CACHE_DIR`; `FIGMA_CACHE=off` disables it). Hits carry `fileKey`, `fileName`, `id`, `key`, so the result can be read or instantiated. Accent-insensitive (`nut bam` finds "Nút bấm"). |
+| `index_design_file` | — or `url` / `fileKey` | Index one file now: with a link, a CLOSED file through REST (components, component sets, styles); without, the open window via `get_design_system_kit`. `get_components` / `get_styles` / `get_variables` / `get_design_system_kit` / `find_component` reads are indexed automatically. |
 
 ### `layout_audit(nodeId)` — the structured verify tool
 
@@ -425,6 +446,30 @@ These mirror the `figma_read` operations one-to-one, so you can read and write i
 await figma.overlay({ parentId: screen.id, color: "#000000", opacity: 0.5, insertAt: "top" });
 ```
 
+#### REST: comments, versions (token from the plugin panel or `FIGMA_TOKEN`)
+
+| Method | Signature | Notes |
+|---|---|---|
+| `getComments` | `getComments({ url?, fileKey?, nodeId?, unresolved?, limit? })` | Same as `figma_read get_comments`. The file defaults to the window this call runs in. |
+| `postComment` | `postComment({ url?, fileKey?, message, nodeId?, x?, y?, replyTo? })` | Start a thread pinned to `nodeId` (at `x`,`y` inside it) or reply to `replyTo`. The token needs the `file_comments:write` scope; a 403 says so. Everyone on the file sees it — post only when the user asked. |
+| `getVersions` | `getVersions({ url?, fileKey?, limit?, namedOnly? })` | Same as `figma_read get_versions`. |
+
+#### Slides
+
+| Method | Signature | Notes |
+|---|---|---|
+| `createSlide` | `createSlide({ name?, row?, col?, fill?, focus? })` | Figma Slides only. Returns `{ id, name, width, height }`; draw into it with `create({ parentId: id, ... })`. `figma_read get_slides` lists the grid. |
+
+#### Code Connect, html → Figma, BYOK generation
+
+| Method | Signature | Notes |
+|---|---|---|
+| `exportCodeConnect` | `exportCodeConnect({ dir, importFrom?, importPaths?, map?, url?, fileKey?, overwrite? })` | Writes one Code Connect file `<Component>.figma.tsx` per mapped component — `figma.connect(Button, "<node url>", { props: { size: figma.enum("Size", { "Small": "sm" }) }, example })` — from the component map (`map`, else the session's `useComponentMap`, else `exportComponentMap()`). URLs point at the component SET. `dir` must be absolute; existing files are kept (`skipped`) unless `overwrite: true`; components not found in the file come back in `missing`. |
+| `readCodeConnect` | `readCodeConnect({ dir } \| { sources: [string] }, use?)` | Finds `*.figma.{tsx,ts,jsx,js}` under `dir` (skips `node_modules` and dot-folders, 500 max), parses `figma.connect` calls and rebuilds a component map (Figma names read from the nodes). `use: true` makes it the session's map for `render()`. |
+| `htmlToFigma` | `htmlToFigma(url, { width? (1280), height?, selector?, waitMs?, maxNodes? (600), parentId?, x?, y?, name?, fallbackFont? })` | Opens an http(s) page in headless Chromium (**Playwright, optional** — `npm i -D playwright && npx playwright install chromium`), reads every element's box and computed CSS, and builds ONE `create()` tree: flex containers → auto-layout (direction, gap, padding, alignment), stacked blocks → vertical auto-layout, the rest absolute; text with its font/size/weight/colour; images as named placeholders. The smallest elements are dropped first past `maxNodes` (with a warning). |
+| `generateImage` | `generateImage(prompt, { size?, quality?, parentId, x, y, w, h, name? })` | BYOK: OpenAI Images (`OPENAI_API_KEY` / `FIGMA_MCP_OPENAI_API_KEY`, model `FIGMA_MCP_IMAGE_MODEL`, default `gpt-image-1`), placed with `load_image`. |
+| `generateSvg` | `generateSvg(prompt, { width?, height?, style?, parentId, x, y, name? })` | BYOK: Anthropic Messages (`ANTHROPIC_API_KEY` / `FIGMA_MCP_ANTHROPIC_API_KEY`, model `FIGMA_MCP_SVG_MODEL`, default `claude-sonnet-5-5`). The SVG is made inert (no scripts, handlers, `foreignObject` or external refs) and created as a vector node. Keys can also live in the JSON file `FIGMA_MCP_BYOK_CONFIG` names. Keys are only request headers: never logged or returned. |
+
 ### Layout helpers (used inside `create`/`move` specs)
 
 | Helper | Values | Effect |
@@ -439,6 +484,8 @@ Auto-layout sizing: setting `layoutMode: "VERTICAL" | "HORIZONTAL"` turns a fram
 ---
 
 ## `figma_diagram`
+
+> **In a FigJam window**, `userflow`, `activity`, `state` and `sitemap` are drawn with FigJam's own nodes — shapes-with-text (decision → diamond, start/end → ellipse), connectors that follow their shapes natively, everything inside a section named after the title (the activity lane owner leads each label, FigJam has no swimlanes). The model is still proof-read by the kind's checker (`warnings`, `checkFirst`, `dryRun` work as usual); the answer carries `native: "figjam"`, `sectionId` and `nodeIds`. `update`/`patch` and the other kinds keep the Figma Design drawing.
 
 **Nine** diagram kinds behind one tool with a `type`, because every tool description is paid for in tokens in every session and the shapes differ far more than the call does. `figma_userflow` was a separate tool up to 0.1.0; it is `type: "userflow"` here, with the same fields.
 
@@ -1066,11 +1113,12 @@ Every failure — from a tool call, a `figma.*` proxy call, or a bridge/plugin e
 | `INVALID_PARAMS` | Params failed validation (wrong shape, missing required field, empty `nodeId`, etc). | Fix the shape per `figma_docs(section: "api")` or the message's `path`. | ❌ No |
 | `PLUGIN_TIMEOUT` | The plugin didn't respond within the operation's timeout budget. | Retry; if it recurs, check `figma_status` for a stale heartbeat (Figma window minimized/asleep). | ✅ Yes |
 | `QUEUE_FULL` | Too many pending operations queued to the plugin. | Batch related ops with `figma.batch()` instead of firing many individual calls; wait and retry. | ✅ Yes |
+| `RATE_LIMITED` | Figma's **REST** quota for the token is used up (HTTP 429). The message says when to retry (from `Retry-After` — measured at **4.6 days** on a Starter plan), the plan tier and the limit type. Short waits (≤ 20 s) are retried automatically before this is raised. | Don't retry now. Read through the plugin instead (open the file in Figma Desktop with the plugin running — no REST quota). `figma_status.restToken.retryAt` says when REST works again. | ❌ No (not before `retryAt`) |
 | `PAGE_LIMIT` | `createPage` hit the file's page-count limit. | Handled gracefully already — `createPage` returns `{ fallback: "current-page", reason }` instead of throwing; use the current page. | ❌ No (graceful fallback) |
 | `PLAN_LIMIT` | A Figma API the file's pricing tier caps. Currently raised by variable **modes**: a collection may hold N modes and N depends on the plan (one on Starter). | The message names the limit Figma itself reported and lists the modes that exist. Send one value per token instead of a per-mode map (`"surface": "#FFFFFF"` rather than `{ light, dark }`), or a subset of modes that fits. Not a bug to retry around — the answer is fewer modes or a different plan. | ❌ No |
 | `CONFIRM_REQUIRED` | A destructive op needs a second, explicit step: `deletePage` on a page with layers, or `deleteUnusedStyles` with a missing/stale `confirm` token. | Show the user what would be lost and ask. Then `force: true` (page) or preview again and pass the new `confirmToken`. | ❌ No (ask the user) |
 | `COMPONENT_IN_USE` | A component/component-set operation conflicts with existing instances (also a variable or style still in use). | Inspect via `get_components`/`get_selection` before retrying the mutation. | ⚠️ Maybe |
-| `UNAUTHORIZED` | A follower's `/rpc` request lacked a valid bridge auth token (auto-refresh from `leader-<port>.json` already failed). | Restart the server so a fresh `leader-<port>.json` token is written; don't hand-edit that file. | ✅ Yes (after restart) |
+| `UNAUTHORIZED` | A follower's `/rpc` request lacked a valid bridge auth token (auto-refresh from `leader-<port>.json` already failed) — **or** a Figma REST call was refused: no token, an expired/revoked token, a token **missing a scope** (the message names the scope and lists the ones the token has), or no access to the file. | Bridge: restart the server so a fresh `leader-<port>.json` token is written. REST: follow the hint — usually the user creates a token with the named scope / a fresh one and saves it in the plugin panel. | ✅ Bridge: after restart. REST: after the user fixes the token |
 | `SANDBOX_ERROR` | The `figma_write` code threw inside the `vm` sandbox (syntax error, runtime exception, or hit a banned global). | Read the message; check for `require`/`process`/`fetch`/`setTimeout`/`eval` usage — those are banned; everything else in modern JS is fine. | ❌ No |
 | `UNSUPPORTED_OPERATION` | An unknown `op` name was passed to `figma_read` or inside a `batch` item. | Check spelling against the operation tables above; `figma_docs(section: "api")` lists the full surface. | ❌ No |
 | `INTERNAL` | Unclassified server-side error. | Treat as a bug; the `message` carries the underlying detail. | ⚠️ Maybe |
@@ -1091,6 +1139,7 @@ Every failure — from a tool call, a `figma.*` proxy call, or a bridge/plugin e
 - `NODE_NOT_FOUND` — agent must fetch fresh ids
 - `UNSUPPORTED_OPERATION` — agent used wrong op name
 - `PLAN_LIMIT` — the plan caps it; agent must ask for less (fewer modes), not again
+- `RATE_LIMITED` — Figma's REST quota; read through the plugin instead, or wait until `restToken.retryAt`
 
 **Contextual:**
 - `CONFIRM_REQUIRED` — never retry on your own; the user decides

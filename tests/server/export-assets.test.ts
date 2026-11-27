@@ -176,7 +176,8 @@ describe("figma.exportAssets through the REST API", () => {
     const res = await executeWrite(
       `return await figma.exportAssets(["1:1"], { dir: ${JSON.stringify(dir)}, fileKey: "F" });`,
       new SessionRegistry().get(),
-      { runOp: r.runOp, figmaToken: "bad", restFetch: async () => new Response("no", { status: 403 }) },
+      // The body Figma really sends for a rejected token (measured 2026-11-27).
+      { runOp: r.runOp, figmaToken: "bad", restFetch: async () => new Response('{"status":403,"err":"Invalid token"}', { status: 403 }) },
     );
     expect(res.error?.code).toBe("UNAUTHORIZED");
     expect(res.error?.hint).toMatch(/FIGMA_TOKEN/);

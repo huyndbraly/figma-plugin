@@ -8,7 +8,9 @@
 
 // v5: component and instance operations (find_component … swap_component).
 // v6: quality audits, component map, create_board (usecase/journey/persona).
-export const PROTOCOL_VERSION = 6;
+// v7: FigJam/Slides (create_figjam_diagram, get_slides, create_slide), the
+//     REST token messages (set_rest_token, rest_status, rest_event).
+export const PROTOCOL_VERSION = 7;
 
 /** Default bridge port; server falls back to +1..+9 when busy. */
 export const DEFAULT_PORT = 38470;
@@ -54,6 +56,8 @@ export const READ_OPERATIONS = [
   "audit_design_system",
   "export_component_map",
   "check_component_map",
+  // Figma Slides: the deck's slide grid.
+  "get_slides",
 ] as const;
 
 /** Write operations executed by the plugin. */
@@ -124,6 +128,10 @@ export const WRITE_OPERATIONS = [
   "responsive_audit",
   // Static diagram kinds drawn from server-side layout (use case, journey, persona).
   "create_board",
+  // FigJam-native diagram: shapes-with-text + connectors in a section.
+  "create_figjam_diagram",
+  // Figma Slides: append a slide to the grid.
+  "create_slide",
 ] as const;
 
 export type ReadOperation = (typeof READ_OPERATIONS)[number];
@@ -152,6 +160,11 @@ export enum ErrorCode {
   INVALID_PARAMS = "INVALID_PARAMS",
   PLUGIN_TIMEOUT = "PLUGIN_TIMEOUT",
   QUEUE_FULL = "QUEUE_FULL",
+  /**
+   * Figma's REST quota for the token is used up. Retry-After can be DAYS on
+   * a Starter plan, so this is not a "retry soon" — read through the plugin.
+   */
+  RATE_LIMITED = "RATE_LIMITED",
   PAGE_LIMIT = "PAGE_LIMIT",
   /** A Figma API refused because the file's pricing tier caps it. */
   PLAN_LIMIT = "PLAN_LIMIT",
@@ -221,6 +234,61 @@ export interface PluginHello {
    * only knew the channel name from GET /health).
    */
   resumeToken?: string | null;
+  /**
+   * The Figma REST personal access token saved in this plugin's
+   * clientStorage (REST Token field in the panel). Sent only when one is
+   * saved; the server keeps it in RAM and never echoes it back. Clearing it
+   * is an explicit SetRestToken { token: null }, never an absent field — a
+   * window that has not heard about a newer token must not wipe it.
+   */
+  restToken?: string | null;
+  /** When the saved token expires (epoch ms) — the user picks it at Save; Figma cannot be asked. */
+  restTokenExpiresAt?: number | null;
+}
+
+/** Plugin → server: the user saved (string) or cleared (null) the REST token. */
+export interface SetRestToken {
+  type: "set_rest_token";
+  token: string | null;
+  /** Epoch ms the user said the token expires (1/7/30/90 days); null = not stated. */
+  expiresAt?: number | null;
+}
+
+/** Token state as the plugin panel shows it. Never carries the token itself. */
+export interface RestStatusWire {
+  state: "not_set" | "unverified" | "checking" | "valid" | "invalid" | "rate_limited" | "error";
+  source: "plugin" | "env" | null;
+  masked?: string;
+  handle?: string;
+  httpStatus?: number;
+  message?: string;
+  checkedAt?: number;
+  scopes?: string[];
+  missingScopes?: string[];
+  expiresAt?: number;
+  retryAt?: number;
+  planTier?: string;
+  rateLimitType?: string;
+}
+
+/** Server → plugin: the REST token's state changed (or a window just joined). */
+export interface RestStatusUpdate {
+  type: "rest_status";
+  status: RestStatusWire;
+}
+
+/** Server → plugin: one Figma REST request finished (counters + activity log). */
+export interface RestEventWire {
+  type: "rest_event";
+  at: number;
+  op: string;
+  method: string;
+  fileKey?: string;
+  status: number;
+  ms: number;
+  ok: boolean;
+  kind: "read" | "write";
+  message?: string;
 }
 
 /** Server → plugin after hello: the channel this connection is joined to. */
@@ -290,6 +358,9 @@ export type WireMessage =
   | ChannelsUpdate
   | BindRequest
   | PluginContext
+  | SetRestToken
+  | RestStatusUpdate
+  | RestEventWire
   | Heartbeat;
 
 /** Heartbeat cadence (ms). Plugin sends ping; server answers pong. */
@@ -333,6 +404,7 @@ export const OP_TIMEOUTS: Partial<Record<Operation, number>> = {
   export_component_map: 60_000,
   check_component_map: 60_000,
   create_board: 60_000,
+  create_figjam_diagram: 60_000,
 };
 
 /** Batch requests are split into chunks of this size and streamed. */

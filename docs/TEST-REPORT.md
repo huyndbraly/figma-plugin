@@ -8,8 +8,8 @@ mỗi khi thêm test, sửa lỗi, hoặc thử thật trên Figma (xem [Cách c
 
 | | |
 |---|---|
-| Commit đã kiểm | `05a3742` (main, 2026-11-27) |
-| Bộ test | **1669 test / 129 file — tất cả qua** (`npm run verify` = typecheck + vitest) |
+| Commit đã kiểm | `c08f67c` + nâng cấp REST token / FigJam / Slides / Code Connect (chưa commit, 2026-11-27) |
+| Bộ test | **1813 test / 139 file — tất cả qua** (`npm run verify` = typecheck + vitest) |
 | CI | GitHub Actions `verify` trên Node 20 và 22, mỗi PR và mỗi push vào `main` |
 | Dependency | `npm audit`: 0 lỗ hổng (zod 4, MCP SDK 1.32) |
 | Thời gian chạy full | ~25–30 s; phần lớn nằm ở vài file chậm (xem [Test chậm](#test-chậm-và-chập-chờn)) |
@@ -42,6 +42,12 @@ nhưng trong lúc làm chỉ cần nhóm liên quan.
 | `src/shared/<graph kind>/` (activity, sequence, state, erd, sitemap, userflow) | `tests/shared/<kind>*.test.ts` + `tests/shared/diagram-*.test.ts tests/shared/connector.test.ts tests/shared/header-height.test.ts` |
 | `src/shared/{usecase,journey,persona,board}/`, `src/server/board.ts`, `handlers/board.ts` | `tests/shared/boards.test.ts tests/plugin/board-draw.test.ts` |
 | `src/shared/model/` (cross-check) | `tests/shared/model-consistency.test.ts tests/shared/sitemap-consistency.test.ts tests/shared/sitemap-coverage.test.ts tests/server/diagram-consistency.test.ts tests/shared/boards.test.ts` |
+| `src/server/rest-hub.ts`, `src/shared/rest-token.ts` (token PAT, telemetry REST) | `tests/server/rest-hub.test.ts tests/server/figma-links.test.ts tests/server/export-assets.test.ts` |
+| `plugin/ui.html` ô REST Token, `src/plugin/main.ts` (clientStorage token) | `tests/plugin/ui-rest-token.test.ts tests/plugin/ui-socket.test.ts` |
+| `src/server/rest-features.ts` (comments, versions, design.md qua REST) | `tests/server/rest-features.test.ts tests/server/figma-links.test.ts` |
+| `src/shared/figjam/`, `src/plugin/handlers/surfaces.ts` (FigJam, Slides) | `tests/shared/figjam.test.ts tests/plugin/handlers/surfaces.test.ts tests/server/figjam-diagram.test.ts` |
+| `src/plugin/motion-util.ts`, `serialize.ts` (motion) | `tests/plugin/motion-util.test.ts tests/plugin/serialize-design.test.ts` |
+| `src/shared/code-connect.ts`, `src/server/design-index.ts`, `html-capture.ts`, `src/shared/html-to-figma.ts`, `byok.ts` | `tests/shared/code-connect.test.ts tests/shared/html-to-figma.test.ts tests/server/phase4-tools.test.ts` |
 | Docs, README, skills, `figma_diagram` schema | `tests/server/docs-claims.test.ts tests/server/docs-sections.test.ts tests/server/skills-*.test.ts tests/server/tool-schema.test.ts` |
 
 ## Bộ test theo khu vực
@@ -59,6 +65,9 @@ nhưng trong lúc làm chỉ cần nhóm liên quan.
 | Sơ đồ dạng đồ thị (6 loại) + định tuyến mũi tên + live reflow | activity (42), sequence (34), sequence-text (9), state (21), state-final-captions (6), erd (20), userflow (41), userflow-route (21), sitemap-layout (20), sitemap-check (19), sitemap-text (14), connector (119), diagram-overlap (13), diagram-place (9), diagram-text (11), diagram-labels (3), diagram-model (3), diagram-spec-keys (3), diagram-bughunt (20), diagram-review (12), header-height (28), metrics-wrap (3), policy-fill (9), activity-draw (16), diagram-pin (12), diagram-redraw (15), diagram-malformed-redraw (6), live-pause (13), live-undo-nested (6), live-delete-sweep (8), reflow-midwrite (10), reflow-restore-per-box (4), userflow-reflow (17), sitemap-reflow (11), marker-list (4), activity-tool (8), userflow-tool (6), sitemap-schema (11), diagram-patch (41), patch-rename-cascade (9), diagram-verify (11) | 688 |
 | Sơ đồ dạng bảng (use case, journey, persona) | boards (21), board-draw (3) | 24 |
 | Kiểm tra chéo giữa sơ đồ | model-consistency (28), sitemap-consistency (12), sitemap-coverage (12), diagram-consistency (8) | 60 |
+| REST token (PAT) + REST hybrid | rest-hub (37), ui-rest-token (12), rest-features (18) | 67 |
+| FigJam, Slides, motion | figjam (9), surfaces (7), figjam-diagram (5), motion-util (6) | 27 |
+| Code Connect, chỉ mục design system, html → Figma, BYOK | code-connect (5), html-to-figma (6), phase4-tools (20) | 31 |
 | Docs, skill, schema tool | docs-claims (9), docs-sections (7), skills-claims (8), skills-examples (3), tool-schema (6) | 33 |
 
 ## Đã thử trên Figma thật
@@ -76,6 +85,13 @@ Test tự động dùng Figma giả lập. Những gì dưới đây đã chạy
 | `exportAssets` (plugin, iOS + Android naming) | ✅ | 8 file / 102 ms |
 | Đọc và export bằng link Figma (file đang mở) | ✅ | |
 | Đọc / export qua **REST** (`FIGMA_TOKEN`) | ❌ chưa | Chỉ test với API giả lập — chưa có token thật |
+| REST token PAT thật (hạn 1 ngày, 15 scope) qua `RestHub` + `RestClient` | ✅ 2026-11-27 | `/v1/me` → Valid (@handle), dò được đủ 15 scope; thiếu scope → báo đúng scope cần + danh sách scope đang có, token vẫn Valid; token giả → invalid 401; 404 file → NODE_NOT_FOUND; không lần nào in ra token. Phát hiện & sửa: (1) 403 thiếu scope bị báo nhầm "Figma refused the token"; (2) không có cách biết hạn token qua API → thêm ô chọn hạn; (3) plugin dev trả `fileKey: null` → bật `enablePrivatePluginApi` |
+| Đọc file **chưa mở** qua link thật (`figma_read` → REST, gói Starter) | ✅ 2026-11-27 | `get_document_info`, `get_node`, `get_design_context`, `generate_design_md`, `get_comments` (0 thread), `get_versions` (4 bản), `index_design_file` + `search_design_index`, `screenshot` — tất cả OK, mỗi call 0,3–6 s, mọi request có log `[REST]`. Phát hiện & sửa: font style ra `400` thay vì `Regular`; component set mất variant; log ghi `component_sets` thành `get_file`; **429 với `Retry-After: 399946` (4,6 ngày, `plan-tier: starter`, `limit-type: low`)** trước đây làm agent treo ~4 phút rồi báo lỗi chung → giờ dừng ngay với mã `RATE_LIMITED` |
+| `postComment` trên file thật | ❌ chưa | Chưa được phép post (comment hiện cho mọi người trong file) |
+| Ô **REST Token** trong panel Figma Desktop thật | ❌ chưa | Cần chạy lại MCP server + plugin bản mới |
+| FigJam (`figma_diagram` native), Slides (`get_slides` / `createSlide`) | ❌ chưa | Chỉ test với `figma` giả; cần mở plugin trong một FigJam board và một deck Slides |
+| `motion` trên prototype thật | ❌ chưa | Đơn vị (ms trigger / s transition) theo tài liệu Plugin API — cần đối chiếu với 1 prototype thật |
+| `htmlToFigma` (Playwright thật), `generateImage` / `generateSvg` (key thật) | ❌ chưa | Test với Playwright và provider giả |
 | File lớn (ArtMate, 2469 component) | ⚠️ một phần | Chỉ `find_component` (đọc); chưa đo hiệu năng ghi |
 | Nhiều cửa sổ / nhiều session cùng lúc sau các bản sửa kết nối | ⚠️ một phần | Có test tự động; chưa thử tay với 2 file mở cùng lúc |
 
@@ -91,6 +107,8 @@ Mỗi lỗi có test hồi quy; tên file test ở cột cuối để biết tes
 | #4 | Đọc/export bằng link Figma; REST fallback nén về dạng gọn | figma-links |
 | #5 | Test 401 chập chờn: cổng ngẫu nhiên chồng nhau → keep-alive cũ | bridge (dùng `listen(0)`) |
 | #6 | Test startup chập chờn: cổng ngẫu nhiên đè dải cổng cố định | bughunt-batch2, follower-forward |
+| (chưa có PR) | Thử PAT thật: lỗi thiếu scope (403 "Invalid scope") bị coi là token hỏng/không có quyền; thêm phân loại lỗi theo body thật, dò scope khi kiểm token, hạn token do người dùng chọn lúc Save, `enablePrivatePluginApi` cho `fileKey` | rest-hub ("reading Figma's failures…", "scopes and expiry…"), ui-rest-token ("token expiry…"), rest-features, export-assets |
+| (chưa có PR) | Nâng cấp REST token / FigJam / Slides / Code Connect. Lỗi tìm được khi viết test: (1) token thay trong lúc đang kiểm `/v1/me` thì token mới không bao giờ được kiểm (dùng chung promise của lần kiểm cũ) — giờ mỗi token có lượt kiểm riêng; (2) `htmlToFigma` lấy khoảng cách trung vị trên (khoảng lớn hơn) khi chỉ có 2 khoảng — giờ lấy trung vị dưới | rest-hub ("drops the result of a check…"), html-to-figma ("block children that stack…") |
 
 ### Chi tiết PR #2 (review toàn bộ)
 
@@ -128,7 +146,12 @@ không kiểm `fixed`.
 
 ## Còn chưa làm / hạn chế đã biết
 
-- **REST với token thật** chưa thử (xem bảng trên).
+- **Hạn mức REST gói Starter rất nhỏ** cho các endpoint đọc file (Tier 1): khoảng một chục lệnh đọc khi test đã hết quota, `Retry-After` 4,6 ngày. `generate_design_md` qua REST tốn ~5 request Tier 1. Khi file đang mở, tool luôn ưu tiên đường plugin (không tốn quota); comments/versions thuộc tier khác, vẫn chạy được.
+- Style chưa publish chỉ đọc được qua REST nếu đang được dùng trong 2 tầng node đầu (`/styles` chỉ trả style đã publish).
+- Sự kiện `[REST]` của một **follower** dùng `FIGMA_TOKEN` riêng (khi leader không có token) chỉ phát trong process follower, không hiện ở panel (follower không có bridge). Request chạy qua token của leader thì hiện bình thường.
+- Cửa sổ plugin thứ hai mở từ trước khi lưu token mới, nếu kết nối lại, gửi lại token cũ trong `hello` (không xoá được token, nhưng có thể ghi đè token mới bằng token cũ) — bấm Save lại ở cửa sổ đó.
+- FigJam native chỉ cho userflow / activity / state / sitemap; `update` + `patch` trong FigJam vẫn đi đường vẽ Figma Design. Slides chỉ đọc lưới + tạo slide.
+- `htmlToFigma` không chụp pixel ảnh (ảnh là placeholder), không đọc pseudo-element, gradient hay shadow.
 - Các hàm reflow riêng từng loại sơ đồ vẫn parse graph thêm 1 lần (2 lần/lượt thay vì 4–6).
 - Khoá lưu channel của plugin theo tên file: 2 file trùng tên mở cùng lúc → cửa sổ thứ hai nhận
   channel mới (không còn mất channel, nhưng không resume được channel cũ).

@@ -4,7 +4,11 @@
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
-  "editorType": ["figma"],
+  "editorType": [
+    "figma",
+    "figjam",
+    "slides"
+  ],
   "capabilities": [],
   "enableProposedApi": false,
   "documentAccess": "dynamic-page",
@@ -32,5 +36,6 @@
       "ws://localhost:38479"
     ],
     "reasoning": "Connects to the local Figma Plugin MCP bridge (WebSocket) on localhost:38470 with +1..+9 port fallback."
-  }
+  },
+  "enablePrivatePluginApi": true
 }

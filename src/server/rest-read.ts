@@ -10,11 +10,14 @@
  * pays through the plugin.
  *
  * Supported: get_document_info, get_node, get_nodes, get_design_context,
- * screenshot. Anything else needs the plugin and says so.
+ * generate_design_md (rest-features.ts), screenshot, export_node. Anything else needs the plugin and says so.
  */
 import { ErrorCode, OpError } from "./errors.js";
+import { restGenerateDesignMd } from "./rest-features.js";
+import { restError, retryDelayMs } from "./rest-hub.js";
 
-export type RestFetch = (url: string, init: RequestInit) => Promise<Response>;
+export type { RestFetch } from "./rest-hub.js";
+import type { RestFetch } from "./rest-hub.js";
 export type Detail = "sparse" | "compact" | "full" | "design";
 
 const BASE = "https://api.figma.com/v1";
@@ -22,7 +25,7 @@ const CACHE_TTL_MS = 60_000;
 export const REST_MAX_NODES = 3000;
 const SCREENSHOT_MAX_SIDE = 4096;
 
-export const REST_READ_OPS = new Set(["get_document_info", "get_node", "get_nodes", "get_design_context", "screenshot", "export_node"]);
+export const REST_READ_OPS = new Set(["get_document_info", "get_node", "get_nodes", "get_design_context", "screenshot", "export_node", "generate_design_md"]);
 
 type Json = Record<string, unknown>;
 
@@ -48,7 +51,8 @@ export class RestClient {
   ) {}
 
   /** GET with the token; 429 retried with Retry-After; errors that say what to do. Cached 60 s. */
-  get(path: string, signal?: AbortSignal): Promise<unknown> {
+  get(path: string, signal?: AbortSignal, opts: { fresh?: boolean } = {}): Promise<unknown> {
+    if (opts.fresh) return this.fetchJson(path, signal);
     const hit = this.cache.get(path);
     if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.value;
     const value = this.fetchJson(path, signal);
@@ -61,18 +65,14 @@ export class RestClient {
   private async fetchJson(path: string, signal?: AbortSignal): Promise<unknown> {
     for (let attempt = 0; ; attempt++) {
       const res = await this.fetchImpl(`${BASE}${path}`, { headers: { "X-Figma-Token": this.token }, ...(signal ? { signal } : {}) });
-      if (res.status === 429 && attempt < 4) {
-        const retry = Number(res.headers.get("retry-after"));
-        await wait(Math.min(60, Number.isFinite(retry) && retry > 0 ? retry : 2 ** attempt * 2) * 1000, signal);
-        continue;
+      if (res.status === 429) {
+        const ms = retryDelayMs(res.headers, attempt);
+        if (ms !== null) {
+          await wait(ms, signal);
+          continue;
+        }
       }
-      if (res.status === 403) {
-        throw new OpError(ErrorCode.UNAUTHORIZED, "Figma refused the token (403).", "Check FIGMA_TOKEN is a valid personal access token that can read this file.");
-      }
-      if (res.status === 404) {
-        throw new OpError(ErrorCode.NODE_NOT_FOUND, "Figma has no such file (404).", "Check the link — the file key is the part after /design/ or /file/.");
-      }
-      if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `Figma REST ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      if (!res.ok) throw restError(res.status, await res.text().catch(() => ""), "read this file", res.headers);
       return res.json();
     }
   }
@@ -304,6 +304,9 @@ export async function restRead(op: string, params: Json, fileKey: string, d: Res
     }
     return { tree: t.tree, nodeCount: t.count, ...(t.truncated ? { truncated: true } : {}), ...source };
   }
+  if (op === "generate_design_md") {
+    return restGenerateDesignMd(d.client, fileKey, params, d.signal);
+  }
   if (op === "screenshot" || op === "export_node") {
     if (!nodeId) throw new OpError(ErrorCode.INVALID_PARAMS, "A REST render needs a node.", "Use a link with ?node-id=…, or pass nodeId.");
     const format = op === "screenshot" ? "png" : String(params.format ?? "PNG").toLowerCase().replace("jpeg", "jpg");
@@ -331,7 +334,7 @@ export async function restRead(op: string, params: Json, fileKey: string, d: Res
   }
   throw new OpError(
     ErrorCode.UNSUPPORTED_OPERATION,
-    `"${op}" needs the file open in Figma with the plugin running; the REST fallback reads get_document_info, get_node, get_nodes, get_design_context, screenshot and export_node.`,
+    `"${op}" needs the file open in Figma with the plugin running; the REST fallback reads get_document_info, get_node, get_nodes, get_design_context, generate_design_md, screenshot and export_node.`,
     "Open the file in Figma Desktop and run Figma Plugin MCP, then call again with the same link.",
   );
 }

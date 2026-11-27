@@ -85,8 +85,10 @@ diamond, which attaches at its tip.
 
 ## The arrows follow the boxes
 
-Figma Design has no connector object — \`figma.createConnector()\` is FigJam
-only — so each arrow is an ordinary vector. To make it behave like a FigJam
+In a FigJam window none of this applies: the flow is drawn with FigJam's own
+shapes and connectors (\`native: "figjam"\`), which follow their shapes by
+themselves. Figma Design has no connector object — \`figma.createConnector()\`
+is FigJam only — so there each arrow is an ordinary vector. To make it behave like a FigJam
 connector anyway, the frame remembers its own graph and the plugin re-routes:
 
 - **while the plugin is open**, dragging or resizing a box re-routes every

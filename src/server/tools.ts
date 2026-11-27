@@ -31,6 +31,10 @@ import { getDoc, DOC_SECTION_NAMES, type DocLevel } from "./docs-content/index.j
 import type { SessionRegistry } from "./session.js";
 import { fileNameKey, parseFigmaLink, type FigmaLink } from "../shared/figma-url.js";
 import { RestClient, restRead, type RestFetch } from "./rest-read.js";
+import { restHub, type TokenStatus } from "./rest-hub.js";
+import { DesignIndex, itemsFromResult, type IndexedItem } from "./design-index.js";
+import { isFigjamNativeKind, layoutFigjam, toFigjamGraph, type FigjamNativeKind } from "../shared/figjam/index.js";
+import { isRestOnlyReadOp, getComments, getVersions, restComponentsAndStyles, type RestOnlyReadOp } from "./rest-features.js";
 import { fetchImageFollowingSafeRedirects } from "./executor.js";
 
 /** Everything the tool handlers need from the running server. */
@@ -41,6 +45,11 @@ export interface ToolContext {
   runWrite: (code: string, sessionId?: string, route?: RouteArg) => Promise<unknown>;
   sessions: SessionRegistry;
   diagnostics: () => Promise<Diagnostics>;
+  /**
+   * The local multi-file design-system index (.figma-cache/). Absent in
+   * tests unless injected; createServer() supplies one unless FIGMA_CACHE=off.
+   */
+  designIndex?: DesignIndex | null;
   /** Injectable for tests — the REST fallback for Figma links (default: FIGMA_TOKEN + global fetch). */
   rest?: { token?: string; fetch?: RestFetch; download?: (url: string) => Promise<Uint8Array> };
 }
@@ -105,6 +114,8 @@ export interface Diagnostics {
   boundChannel?: string;
   /** Leader-side session summaries (followers read these over /rpc). */
   sessions?: Array<{ id: string; writeCount: number; stateKeys: number; lastUsedMs: number }>;
+  /** The Figma REST token's state — never the token (see rest-hub.ts). */
+  restToken?: TokenStatus;
 }
 
 // ---- figma_status ----
@@ -155,6 +166,7 @@ export async function handleStatus(ctx: ToolContext): Promise<Record<string, unk
     sessions: d.sessions ?? ctx.sessions.summaries(),
     ...(d.defaultSessionId ? { mySessionId: d.defaultSessionId } : {}),
     ...(d.boundChannel ? { myBoundChannel: d.boundChannel } : {}),
+    restToken: d.restToken ?? null,
     hints,
   };
 }
@@ -268,10 +280,51 @@ function buildHints(d: Diagnostics, apiVersionMatch: boolean | null): string[] {
       hints.push(`${d.queueLength} operation(s) queued — the plugin is busy; batch related ops to reduce round-trips.`);
     }
   }
+  const rt = d.restToken;
+  if (rt?.state === "invalid") {
+    hints.push(
+      `The Figma REST token${rt.source === "plugin" ? " saved in the plugin panel" : " (FIGMA_TOKEN)"} was rejected${rt.httpStatus ? ` (${rt.httpStatus})` : ""} — links to files that are not open, comments and versions will fail. Ask the user to paste a fresh personal access token into the plugin panel (REST Token → Save).`,
+    );
+  } else if (rt?.state === "rate_limited") {
+    hints.push("Figma is rate-limiting the REST token (429). REST reads retry with Retry-After; prefer the open file (plugin path) for repeated reads.");
+  }
+  if (rt && rt.state !== "invalid" && rt.state !== "not_set") {
+    for (const h of restTokenHints(rt, Date.now())) hints.push(h);
+  }
   if (hints.length === 0) {
     hints.push("All systems nominal. Draw with figma_write; verify with figma_read layout_audit.");
   }
   return hints;
+}
+
+/** What each REST feature needs, by Figma's scope names. */
+export const REST_FEATURE_SCOPES: Array<{ feature: string; scope: string }> = [
+  { feature: "reading closed files / renders (get_node, get_design_context, screenshot, exportAssets)", scope: "file_content:read" },
+  { feature: "get_comments", scope: "file_comments:read" },
+  { feature: "postComment", scope: "file_comments:write" },
+  { feature: "get_versions", scope: "file_versions:read" },
+  { feature: "published components/styles of a closed file (generate_design_md, index_design_file)", scope: "library_content:read" },
+];
+
+/** Expiry and scope hints for a token that works (state not invalid/not_set). */
+export function restTokenHints(rt: TokenStatus, now: number): string[] {
+  const out: string[] = [];
+  if (rt.expiresAt) {
+    const left = rt.expiresAt - now;
+    if (left <= 0) {
+      out.push("The REST token's expiry date (as the user entered it at Save) has passed. Figma will start answering 401/403 — ask the user to generate a new personal access token and save it in the plugin panel.");
+    } else if (left < 86_400_000) {
+      out.push(`The REST token expires in about ${Math.max(1, Math.round(left / 3_600_000))}h (the date the user entered at Save). Long REST work may fail midway; mention it to the user.`);
+    }
+  }
+  if (rt.missingScopes?.length) {
+    out.push(`The REST token was refused for missing scope(s) ${rt.missingScopes.join(", ")}. Features needing them fail until the user creates a token with them checked and saves it in the plugin panel.`);
+  }
+  if (rt.scopes?.length) {
+    const lacking = REST_FEATURE_SCOPES.filter((f) => !rt.scopes!.includes(f.scope) && !(rt.missingScopes ?? []).includes(f.scope));
+    if (lacking.length) out.push(`The REST token lacks ${lacking.map((f) => `${f.scope} (${f.feature})`).join("; ")}.`);
+  }
+  return out;
 }
 
 // ---- figma_read ----
@@ -282,12 +335,22 @@ export async function handleRead(
   params: Record<string, unknown>,
   route?: RouteArg,
 ): Promise<unknown> {
+  // Comments and versions exist only in the REST API: answered here, on
+  // whichever process got the call (a follower's requests run on the leader's
+  // token through restHub).
+  if (isRestOnlyReadOp(op)) return handleRestOnlyRead(ctx, op, params, route);
+  if (op === "search_design_index" || op === "index_design_file") return handleIndexOp(ctx, op, params, route);
   if (!isReadOp(op)) {
     throw new OpError(
       ErrorCode.INVALID_PARAMS,
       `"${op}" is not a read operation.`,
       "Use figma_write for mutations. Read ops: see figma_docs(section=\"api\").",
     );
+  }
+  // `fileKey` (+ nodeId) is a link without the URL: same path.
+  if (params.url === undefined && params.link === undefined && typeof params.fileKey === "string" && params.fileKey) {
+    const { fileKey, ...rest } = params;
+    params = { ...rest, url: linkFor(fileKey as string, typeof rest.nodeId === "string" ? rest.nodeId : undefined) };
   }
   // A Figma link ("Copy link to selection") in params: read the node it names,
   // in whichever place has the file — the open window, else the REST API.
@@ -299,6 +362,7 @@ export async function handleRead(
   }
   // validateOperation is applied inside runValidated (the choke point).
   const result = await ctx.runValidated(op, params, undefined, route);
+  if (ctx.designIndex && INDEXED_OPS.has(op)) void recordIntoIndex(ctx, op, resultOf(result), route);
 
   // The plugin hands back what each frame stores; deriving what the PAGE knows
   // from it is the server's job, and it is what makes "the hold becomes 15
@@ -341,14 +405,29 @@ export function setLinkWindowGraceMs(ms: number): void {
   LINK_WINDOW_GRACE_MS = ms;
 }
 
-function restFor(ctx: ToolContext): { client: RestClient; download: (url: string) => Promise<Uint8Array> } | null {
-  const token = ctx.rest?.token ?? process.env.FIGMA_TOKEN;
-  if (!token) return null;
-  const key = ctx.rest?.fetch ? `${token}|injected` : token;
-  let client = restClients.get(key);
-  if (!client || ctx.rest?.fetch) {
+/**
+ * The REST client for this call, or null when no token is reachable. The
+ * token is the plugin panel's (held by the leader) else FIGMA_TOKEN; requests
+ * go through restHub.fetch, which injects it and reports each call to the
+ * plugin panel. Tests inject `ctx.rest`.
+ */
+export async function restFor(ctx: ToolContext): Promise<{ client: RestClient; download: (url: string) => Promise<Uint8Array> } | null> {
+  let client: RestClient;
+  if (ctx.rest?.fetch || ctx.rest?.token !== undefined) {
+    const token = ctx.rest?.token ?? restHub.token();
+    if (!token) return null;
     client = new RestClient(token, ctx.rest?.fetch);
-    if (!ctx.rest?.fetch) restClients.set(key, client);
+  } else {
+    if (!(await restHub.available())) return null;
+    // One cache per token: a new token may see files the old one could not.
+    const key = `hub|${restHub.generation()}`;
+    const cached = restClients.get(key);
+    if (cached) client = cached;
+    else {
+      restClients.clear();
+      client = new RestClient("", restHub.fetch);
+      restClients.set(key, client);
+    }
   }
   const download =
     ctx.rest?.download ??
@@ -374,7 +453,7 @@ async function readViaLink(
   raw: Record<string, unknown>,
   route?: RouteArg,
 ): Promise<{ done: true; result: unknown } | { done: false; params: Record<string, unknown>; route?: RouteArg }> {
-  const { url, link: linkParam, ...params } = raw;
+  const { url, link: linkParam, source: wantSource, ...params } = raw;
   const link = parseFigmaLink(url ?? linkParam);
   if (!link) {
     throw new OpError(
@@ -387,7 +466,19 @@ async function readViaLink(
     if (op === "get_nodes" && params.nodeIds === undefined) params.nodeIds = [link.nodeId];
     else if (op !== "get_nodes" && op !== "get_document_info" && params.nodeId === undefined) params.nodeId = link.nodeId;
   }
-  const rest = restFor(ctx);
+  const rest = await restFor(ctx);
+  // source:"rest" reads through the API even when the file is open (what a
+  // teammate without the file open would see; the last SAVED version).
+  if (wantSource === "rest") {
+    if (!rest) {
+      throw new OpError(
+        ErrorCode.UNAUTHORIZED,
+        'source: "rest" needs a Figma REST token.',
+        "Save a personal access token in the plugin panel (REST Token), or set FIGMA_TOKEN on the MCP server.",
+      );
+    }
+    return { done: true, result: await restRead(op, params, link.fileKey, rest) };
+  }
   // A link without the name slug can still be matched by asking REST for the name.
   let name = link.slug;
   if (!name && rest) {
@@ -414,11 +505,135 @@ async function readViaLink(
     throw new OpError(
       ErrorCode.NOT_CONNECTED,
       `The file in this link${name ? ` ("${name}")` : ""} is not open in any connected Figma window.`,
-      "Open it in Figma Desktop and run Figma Plugin MCP (then call again with the same link) — or set FIGMA_TOKEN on the MCP server so links can be read through the REST API without the file open.",
+      "Open it in Figma Desktop and run Figma Plugin MCP (then call again with the same link) — or save a personal access token in the plugin panel (REST Token) / set FIGMA_TOKEN on the MCP server so links can be read through the REST API without the file open.",
     );
   }
   // Ops REST cannot answer throw from restRead with a "needs the plugin" hint.
   return { done: true, result: await restRead(op, params, link.fileKey, rest) };
+}
+
+function linkFor(fileKey: string, nodeId?: string): string {
+  return `https://www.figma.com/design/${encodeURIComponent(fileKey)}/${nodeId ? `?node-id=${encodeURIComponent(nodeId.replace(/:/g, "-"))}` : ""}`;
+}
+
+/**
+ * The file a REST-only op is about: the link / fileKey in params, else the
+ * open window this call routes to (its plugin knows its own file key).
+ */
+async function fileKeyFor(ctx: ToolContext, params: Record<string, unknown>, route?: RouteArg): Promise<{ fileKey: string; nodeId?: string }> {
+  const raw = params.url ?? params.link;
+  if (raw !== undefined) {
+    const link = parseFigmaLink(raw);
+    if (!link) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, "`url` is not a Figma link.", "Pass the file's link, e.g. https://www.figma.com/design/<fileKey>/<name>.");
+    }
+    return { fileKey: link.fileKey, ...(link.nodeId ? { nodeId: link.nodeId } : {}) };
+  }
+  if (typeof params.fileKey === "string" && params.fileKey.trim()) return { fileKey: params.fileKey.trim() };
+  const listed = await ctx.runValidated("list_channels", {}).catch(() => []);
+  const list = (Array.isArray(listed) ? listed : []) as Array<{ channel?: string; plugin?: { fileKey?: string | null; fileName?: string }; focused?: boolean }>;
+  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
+  const pick =
+    (r.channel && list.find((c) => c.channel === r.channel)) ||
+    (r.file && list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!))) ||
+    (list.length === 1 ? list[0] : list.find((c) => c.focused));
+  const key = pick?.plugin?.fileKey;
+  if (key) return { fileKey: key };
+  throw new OpError(
+    ErrorCode.INVALID_PARAMS,
+    "Which file? Comments and versions are read through the REST API and need the file's key.",
+    "Pass { url: <the file's Figma link> } or { fileKey }. (An open window whose plugin reports its fileKey is used automatically when it is the only one.)",
+  );
+}
+
+async function handleRestOnlyRead(ctx: ToolContext, op: RestOnlyReadOp, params: Record<string, unknown>, route?: RouteArg): Promise<unknown> {
+  const { fileKey, nodeId } = await fileKeyFor(ctx, params, route);
+  const rest = await restFor(ctx);
+  if (!rest) {
+    throw new OpError(
+      ErrorCode.UNAUTHORIZED,
+      `"${op}" reads the Figma REST API, and no token is set.`,
+      "Ask the user to paste a personal access token into the plugin panel (REST Token → Save), or set FIGMA_TOKEN on the MCP server.",
+    );
+  }
+  const p = { ...params, ...(nodeId && params.nodeId === undefined ? { nodeId } : {}) };
+  return op === "get_comments" ? getComments(rest.client, fileKey, p) : getVersions(rest.client, fileKey, p);
+}
+
+// ---- local design-system index ----
+
+/** Reads whose answer is worth remembering across files. */
+const INDEXED_OPS = new Set(["get_components", "get_styles", "get_variables", "get_design_system_kit", "find_component"]);
+
+/** Which open window a call routed to (file name + key), from list_channels. */
+async function routedWindow(ctx: ToolContext, route?: RouteArg): Promise<{ fileKey: string | null; fileName: string } | null> {
+  const listed = await ctx.runValidated("list_channels", {}).catch(() => []);
+  const list = (Array.isArray(listed) ? listed : []) as Array<{ channel?: string; plugin?: { fileName?: string; fileKey?: string | null }; focused?: boolean }>;
+  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
+  const pick =
+    (r.channel && list.find((c) => c.channel === r.channel)) ||
+    (r.file && list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!))) ||
+    (list.length === 1 ? list[0] : list.find((c) => c.focused));
+  return pick?.plugin?.fileName ? { fileKey: pick.plugin.fileKey ?? null, fileName: pick.plugin.fileName } : null;
+}
+
+/** Best effort and off the response path: an index that cannot be written must never fail a read. */
+async function recordIntoIndex(ctx: ToolContext, op: string, result: unknown, route?: RouteArg): Promise<void> {
+  try {
+    const items = itemsFromResult(op, result);
+    if (!items.length) return;
+    const win = await routedWindow(ctx, route);
+    if (!win) return;
+    await ctx.designIndex?.record({ ...win, source: "plugin" }, items);
+  } catch {
+    /* the cache is a convenience */
+  }
+}
+
+async function handleIndexOp(ctx: ToolContext, op: "search_design_index" | "index_design_file", params: Record<string, unknown>, route?: RouteArg): Promise<unknown> {
+  const index = ctx.designIndex;
+  if (!index) {
+    throw new OpError(ErrorCode.UNSUPPORTED_OPERATION, "The local design index is off.", "Unset FIGMA_CACHE=off on the MCP server to turn it on.");
+  }
+  if (op === "search_design_index") {
+    const query = typeof params.query === "string" ? params.query : "";
+    const kinds = Array.isArray(params.kinds) ? (params.kinds as unknown[]).map(String) : typeof params.kind === "string" ? [params.kind] : undefined;
+    const res = await index.search(query, {
+      ...(kinds ? { kinds } : {}),
+      ...(typeof params.limit === "number" ? { limit: params.limit } : {}),
+      ...(typeof params.file === "string" ? { file: params.file } : {}),
+    });
+    return {
+      query,
+      ...res,
+      cacheDir: index.dir,
+      ...(res.files.length === 0
+        ? { hint: 'Nothing indexed yet. Read a file\'s components/styles (figma_read get_components / get_styles / get_design_system_kit), or index one that is not open with figma_read index_design_file { url }.' }
+        : {}),
+    };
+  }
+  // index_design_file: a closed file through REST, else the open window through the plugin.
+  const named = params.url !== undefined || params.link !== undefined || typeof params.fileKey === "string";
+  if (named) {
+    const { fileKey } = await fileKeyFor(ctx, params, route);
+    const rest = await restFor(ctx);
+    if (!rest) {
+      throw new OpError(ErrorCode.UNAUTHORIZED, "Indexing a file that is not open reads the REST API, and no token is set.", "Save a personal access token in the plugin panel (REST Token), or open the file with the plugin running and call without url.");
+    }
+    const r = await restComponentsAndStyles(rest.client, fileKey);
+    const items: IndexedItem[] = [
+      ...r.components.map((c) => ({ kind: (c.type === "COMPONENT_SET" ? "component_set" : "component") as IndexedItem["kind"], name: c.name, id: c.id, ...(c.key ? { key: c.key } : {}), type: c.type, ...(c.description ? { description: c.description } : {}) })),
+      ...r.styles.map((st) => ({ kind: "style" as const, name: st.name, type: st.type.toUpperCase(), ...(st.description ? { description: st.description } : {}) })),
+    ];
+    const entry = await index.record({ fileKey, fileName: r.fileName, source: "rest" }, items);
+    return { fileKey, fileName: r.fileName, indexed: entry?.items.length ?? 0, source: "rest", cacheDir: index.dir };
+  }
+  const kit = resultOf(await ctx.runValidated("get_design_system_kit", { includeScreens: false, includeComponentUsage: false, includeInstances: false }, undefined, route));
+  const win = await routedWindow(ctx, route);
+  const k = (kit ?? {}) as { file?: { name?: string; key?: string | null } };
+  const file = { fileKey: win?.fileKey ?? k.file?.key ?? null, fileName: win?.fileName ?? k.file?.name ?? "untitled" };
+  const entry = await index.record({ ...file, source: "plugin" }, itemsFromResult("get_design_system_kit", kit));
+  return { ...file, indexed: entry?.items.length ?? 0, source: "plugin", cacheDir: index.dir };
 }
 
 // ---- figma_write ----
@@ -486,7 +701,58 @@ export async function handleDiagram(
       'One diagram: { type: "sequence", title, ... }. Several at once: { diagrams: [{ type: "erd", ... }, { type: "state", ... }], place: "column", x, y }.',
     );
   }
+  // In a FigJam window the graph kinds are drawn with FigJam's own shapes and
+  // connectors (which follow their shapes natively). The model is still
+  // proof-read by the kind's checker first.
+  if (isFigjamNativeKind(type) && (await targetEditor(ctx, channel)) === "figjam") {
+    return drawFigjamNative(ctx, type, spec, channel);
+  }
   return drawWithChecks(ctx, spec, channel, (s) => runDiagramType(ctx, type, s, channel));
+}
+
+/** editorType of the window this call routes to ("figma" | "figjam" | "slides"), if known. */
+export async function targetEditor(ctx: ToolContext, route?: RouteArg): Promise<string | undefined> {
+  const listed = await ctx.runValidated("list_channels", {}).catch(() => []);
+  const list = (Array.isArray(listed) ? listed : []) as Array<{ channel?: string; plugin?: { fileName?: string; editorType?: string }; focused?: boolean }>;
+  if (!list.length) return undefined;
+  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
+  const pick =
+    (r.channel && list.find((c) => c.channel === r.channel)) ||
+    (r.file && list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!))) ||
+    (list.length === 1 ? list[0] : list.find((c) => c.focused));
+  return pick?.plugin?.editorType;
+}
+
+async function drawFigjamNative(ctx: ToolContext, type: FigjamNativeKind, spec: unknown, channel?: RouteArg): Promise<unknown> {
+  const options = readOptions(spec);
+  const checked = (await runDiagramType(ctx, type, withOptions(spec, { dryRun: true }), channel)) as DiagramResult;
+  if (options.dryRun === true) return { ...checked, native: "figjam" };
+  const findings = checked.warnings ?? [];
+  if (options.checkFirst === true && findings.length) {
+    return { ...checked, dryRun: undefined, checkedOnly: true, native: "figjam", hint: "Nothing was drawn: checkFirst was set and the model has findings. Fix them (or drop checkFirst to draw anyway) and call again." };
+  }
+  const model = (spec && typeof spec === "object" ? spec : {}) as Record<string, unknown>;
+  // Positions are relative to the section; the plugin places the section.
+  const laid = layoutFigjam(toFigjamGraph(type, model));
+  const drawn = resultOf(
+    await ctx.runValidated(
+      "create_figjam_diagram",
+      {
+        kind: type,
+        title: laid.graph.title,
+        nodes: laid.graph.nodes,
+        edges: laid.graph.edges,
+        width: laid.width,
+        height: laid.height,
+        ...(typeof model.x === "number" ? { x: model.x } : {}),
+        ...(typeof model.y === "number" ? { y: model.y } : {}),
+      },
+      undefined,
+      channel,
+    ),
+  ) as Record<string, unknown>;
+  const warnings = [...findings, ...laid.warnings];
+  return { native: "figjam", ...drawn, ...(checked.stats ? { stats: checked.stats } : {}), ...(warnings.length ? { warnings } : {}) };
 }
 
 /**

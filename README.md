@@ -20,6 +20,9 @@ Dự án này ra đời vì phần lớn các Figma MCP khác đẩy trách nhi�
 | **Code ↔ Figma** | Bản đồ ánh xạ giữa code component và Figma component (props ↔ variants và properties): xuất bản đồ khởi đầu, đối chiếu với file Figma, và dùng `render("Button", { tone, size, children })` để vẽ đúng variant Figma tương ứng |
 | **Tài nguyên (Assets)** | Icons, hình ảnh, overlays, gradients, đổi màu (recolor), prototype reactions; xóa pages và styles, dọn dẹp styles không dùng |
 | **Sơ đồ BA / UX** | Userflow, activity có swimlanes, sequence, ERD, sitemap, state machine, use case, journey map, persona set; mũi tên tự bám theo khối hộp; chỉnh sửa sơ đồ tại chỗ; kiểm tra chéo mâu thuẫn giữa các sơ đồ |
+| **REST hybrid (PAT)** | Dán Figma personal access token ngay trong panel plugin (ô `REST Token`, Save/Clear, badge `Valid (@handle)` / `Expired / Invalid` / `Rate-limited`); token chỉ lưu trên máy bạn (`figma.clientStorage`), server giữ trong RAM, không ghi file, không log, không trả về cho agent. Đọc comments, trả lời/tạo comment, lịch sử phiên bản, đọc file **chưa mở** qua link hoặc `fileKey` (kể cả `generate_design_md`); mọi request REST hiện trong ACTIVITY với nhãn `[REST]` |
+| **FigJam · Slides · Motion** | Trong FigJam, `figma_diagram` vẽ bằng node gốc (shape-with-text, sticky, connector tự bám); đọc/tạo slide trong Figma Slides; đọc `motion` của prototype (trigger, SMART_ANIMATE, duration, easing bezier/spring, chuỗi CSS) để sinh code animation |
+| **Mở rộng** | Xuất/đọc file Code Connect `.figma.tsx` từ component map; chỉ mục design system đa file cục bộ (`.figma-cache/`, `search_design_index`); `htmlToFigma(url)` dựng trang web đang chạy thành cây auto-layout (Playwright tùy chọn); sinh ảnh/SVG bằng API key của bạn (BYOK) rồi chèn lên canvas |
 | **Claude skills** | `/figma-userflow`, `/figma-activity`, `/figma-sequence`, `/figma-erd`, `/figma-sitemap`, `/figma-state`, `/figma-usecase`, `/figma-journey`, `/figma-persona` |
 
 ## Tại sao chọn dự án này
@@ -47,13 +50,13 @@ Xem [`ARCHITECTURE.md`](./ARCHITECTURE.md) để hiểu đầy đủ lý do thi�
 | Nhóm & Tính năng | Figma REST API (PAT) | Official / Typical Figma MCP | Figma Plugin MCP (Repo này) |
 |---|---|---|---|
 | **Cài đặt, Xác thực & Kiến trúc** | | | |
-| Xác thực bằng Personal Access Token (PAT) / OAuth | ✅ (High) — PAT / OAuth | ✅ (High) — OAuth / Tài khoản Figma | ✅ (Medium) — Cầu nối local + phiên Figma Desktop |
-| Truy cập từ xa qua URL Figma (không cần cài plugin local) | ✅ (High) | ✅ (High) — Remote MCP qua URL | ❌ (Cần build local + mở plugin trên Figma Desktop) |
-| Chạy Headless / CI-CD (không cần mở Figma Desktop) | ✅ (High) | ✅ (Medium — với Remote MCP đọc file) | ❌ (Cần mở cửa sổ plugin trên Figma Desktop) |
+| Xác thực bằng Personal Access Token (PAT) / OAuth | ✅ (High) — PAT / OAuth | ✅ (High) — OAuth / Tài khoản Figma | ✅ (Medium) — Cầu nối local + phiên Figma Desktop; **PAT tùy chọn** dán trong panel plugin (lưu trên máy bạn, badge báo hợp lệ / scope / hạn / 429, không lộ cho AI); dự phòng `FIGMA_TOKEN`. Chưa có OAuth |
+| Truy cập từ xa qua URL Figma (không cần cài plugin local) | ✅ (High) | ✅ (High) — Remote MCP qua URL | ⚠️ (Medium, cần PAT) — Đọc file **chưa mở** qua link/`fileKey` (`get_node`, `get_design_context`, `generate_design_md`, `screenshot`, `exportAssets`, comments, versions); MCP server vẫn chạy local, thao tác ghi vẫn cần plugin. Phụ thuộc hạn mức REST của gói |
+| Chạy Headless / CI-CD (không cần mở Figma Desktop) | ✅ (High) | ✅ (Medium — với Remote MCP đọc file) | ⚠️ (Low–Medium, cần PAT / `FIGMA_TOKEN`) — Đọc, render, xuất asset, comments, versions chạy được không cần Figma Desktop; mọi thao tác ghi canvas vẫn cần mở plugin. Bị giới hạn quota ở gói Starter |
 | Hỗ trợ nhiều IDE / nhiều AI agent cùng lúc | ✅ (High) — HTTP không trạng thái | ✅ (Medium — Remote MCP) / ❌ (Low — Desktop local) | ✅ (High) — Cơ chế Leader/Follower qua `/rpc` |
 | Quản trị Enterprise SSO, phân quyền seat & audit log | ✅ (High) | ✅ (High) — Chuẩn quyền Figma Cloud | ❌ (Chạy cầu nối cục bộ, không qua cloud governance) |
 | Độ đơn giản khi cài đặt | ✅ (High) — Chỉ cần HTTP token | ✅ (High) — Hosted / bật 1 chạm trong Figma | ✅ (Medium) — Clone, build server + import manifest |
-| Chịu tải / không lo bị giới hạn Rate-limit | ❌ (Low — giới hạn chặt theo REST quota) | ✅ (Medium) | ✅ (High — WebSocket cục bộ, không tốn REST quota) |
+| Chịu tải / không lo bị giới hạn Rate-limit | ❌ (Low — giới hạn chặt theo REST quota) | ✅ (Medium) | ✅ (High — đường plugin qua WebSocket cục bộ, không tốn quota REST; luôn được ưu tiên khi file đang mở). Đường REST tùy chọn chịu quota của gói — **rất nhỏ ở Starter** (đo thực tế: `429`, `Retry-After` ≈ 4,6 ngày sau khoảng chục lệnh đọc file) — và báo ngay `RATE_LIMITED` kèm thời điểm thử lại thay vì treo |
 | **Agent Đọc dữ liệu & Mức độ sử dụng Token** | | | |
 | Đọc pages, layers, styles & metadata | ✅ (High) — JSON toàn bộ file | ✅ (High) | ✅ (High) |
 | Đọc vùng đang chọn trên canvas (`read_selection`) | ❌ (Phải tự truyền thủ công node ID) | ✅ (Medium) | ✅ (High — quy trình selection-first) |
@@ -74,11 +77,11 @@ Xem [`ARCHITECTURE.md`](./ARCHITECTURE.md) để hiểu đầy đủ lý do thi�
 | Tạo & gắn (bind) Variables / Text & Effect Styles | ❌ | ✅ (Medium) | ✅ (High — `setupTokens`, `applyVariable`, import/export) |
 | Tạo Component Sets, Variants & Properties | ❌ | ✅ (Medium) | ✅ (High — xếp lưới + tự bind property vào layer) |
 | Tạo Instance theo tên (tự giải mã variant & key `#id`) | ❌ | ❌ (Phải dùng ID/key thô) | ✅ (High — `instantiate("Button", { variant, properties })`) |
-| Tìm kiếm thư viện Design System toàn team/org trên Cloud | ✅ (Medium) — Team/file endpoints | ✅ (High) — `search_design_system`, `get_libraries` | ❌ (Chỉ đọc được trong file đang mở) |
-| Ánh xạ Code ↔ Figma component | ❌ | ✅ (High) — Code Connect đồng bộ Cloud Dev Mode | ✅ (Medium) — `export_component_map` + `render()` cục bộ |
+| Tìm kiếm thư viện Design System toàn team/org trên Cloud | ✅ (Medium) — Team/file endpoints | ✅ (High) — `search_design_system`, `get_libraries` | ⚠️ (Low–Medium) — Chỉ mục đa file cục bộ (`search_design_index`) gồm mọi file máy này đã đọc; thêm file chưa mở qua PAT (`index_design_file`). Không tìm toàn org trên cloud |
+| Ánh xạ Code ↔ Figma component | ❌ | ✅ (High) — Code Connect đồng bộ Cloud Dev Mode | ✅ (Medium) — `export_component_map` + `render()` cục bộ, xuất/đọc file Code Connect `.figma.tsx` (không publish lên cloud) |
 | Kiểm tra tuân thủ Design System & tự động bind | ❌ | ❌ | ✅ (High — `audit_design_system` + auto-bind 1 lệnh) |
 | **Kiểm chứng & Chất lượng Sản phẩm Đầu ra** | | | |
-| Xuất ảnh / Chụp màn hình (Screenshot) | ✅ (High — render PNG/SVG từ server) | ✅ (High) | ✅ (High) |
+| Xuất ảnh / Chụp màn hình (Screenshot) | ✅ (High — render PNG/SVG từ server) | ✅ (High) | ✅ (High) — render qua plugin; file chưa mở render qua REST bằng PAT |
 | Kiểm tra layout bằng code (tràn khung / cắt chữ) | ❌ | ❌ (Agent tự nhìn ảnh chụp để đoán) | ✅ (High — `layout_audit` trả về tọa độ & cờ lỗi từng node) |
 | Kiểm tra Accessibility (độ tương phản WCAG, nút 44pt) | ❌ | ❌ | ✅ (High — `a11y_audit`) |
 | Kiểm tra Responsive đa màn hình | ❌ | ❌ | ✅ (High — tự kéo giãn bản sao sang phone/tablet/desktop) |
@@ -92,21 +95,22 @@ Xem [`ARCHITECTURE.md`](./ARCHITECTURE.md) để hiểu đầy đủ lý do thi�
 | Quy tắc nghiệp vụ tập trung một nguồn (`@policies`) | ❌ | ❌ | ✅ (High — chống lệch số liệu giữa các sơ đồ) |
 | Đường nối thông minh (kéo hộp thì mũi tên tự chạy theo) | ❌ | ✅ (Medium — connector của FigJam) | ✅ (High — tự động định tuyến lại khi di chuyển) |
 | **Sáng tạo AI, Media & Đa nền tảng Figma (Bản chính thức / Trả phí)** | | | |
-| Tạo ảnh AI & minh họa vector AI (`generate_image`, `generate_vector_illustration`) | ❌ | ✅ (High) | ❌ |
-| Đọc ngữ cảnh Motion / Animation & keyframes (`get_motion_context`) | ❌ | ✅ (High) | ❌ |
+| Tạo ảnh AI & minh họa vector AI (`generate_image`, `generate_vector_illustration`) | ❌ | ✅ (High) | ✅ (Medium, BYOK) — `generateImage` (key OpenAI của bạn) / `generateSvg` (key Anthropic, SVG đã làm sạch), chèn thẳng lên canvas |
+| Đọc ngữ cảnh Motion / Animation & keyframes (`get_motion_context`) | ❌ | ✅ (High) | ✅ (Medium) — transition của prototype dạng `motion` (SMART_ANIMATE, duration, bezier/spring, CSS); chưa có keyframes |
 | Tạo Custom Shaders, Generative Plugins & Weave AI workflows | ❌ | ✅ (High) | ❌ |
-| Chuyển Web/HTML chạy thực tế thành Figma Design (`generate_figma_design`) | ❌ | ✅ (High) | ❌ (Phải tự dựng frame bằng JS hoặc `render()`) |
+| Chuyển Web/HTML chạy thực tế thành Figma Design (`generate_figma_design`) | ❌ | ✅ (High) | ✅ (Medium) — `htmlToFigma(url)` với Playwright tùy chọn: flex → auto-layout, font/màu theo CSS thật; ảnh là placeholder |
 | Xuất Video (`export_video`) | ❌ | ✅ (High) | ❌ |
-| Hỗ trợ FigJam, Figma Slides, tạo file mới & Branching (`create_branch`) | ❌ (Chỉ đọc) | ✅ (High) — Hỗ trợ gốc FigJam, Slides, Branching | ❌ (Chỉ tập trung vào canvas Figma Design) |
+| Hỗ trợ FigJam, Figma Slides, tạo file mới & Branching (`create_branch`) | ❌ (Chỉ đọc) | ✅ (High) — Hỗ trợ gốc FigJam, Slides, Branching | ✅ (Medium) — Sơ đồ FigJam bằng node gốc (shape + connector), đọc/tạo slide cơ bản; chưa tạo file mới / branching |
 | **Cộng tác & Dữ liệu Đám mây (Cloud Metadata)** | | | |
-| Bình luận (comments), lịch sử phiên bản & webhooks | ✅ (High) | ✅ (High) — Đọc/tương tác comments & cloud metadata | ❌ (Tập trung vào canvas trực tiếp & design systems) |
+| Bình luận (comments), lịch sử phiên bản & webhooks | ✅ (High) | ✅ (High) — Đọc/tương tác comments & cloud metadata | ✅ (Medium) — Đọc/đăng comments & lịch sử phiên bản qua PAT dán trong panel plugin; chưa có webhooks |
 
 ### Tóm tắt lựa chọn theo nhu cầu sử dụng
 
-- **Dùng hệ sinh thái Figma Cloud, AI sáng tạo & làm việc đa bề mặt:** **Official / Paid Figma MCP** vượt trội khi bạn cần kết nối từ xa qua URL không cần cài plugin local, tìm kiếm thư viện Design System toàn công ty (`search_design_system`), đồng bộ Code Connect trên cloud, sinh ảnh/vector/shader/motion AI, chuyển trang web sống thành layer Figma, hoặc làm việc với FigJam, Slides và Branching.
+- **Dùng hệ sinh thái Figma Cloud, AI sáng tạo & làm việc đa bề mặt:** **Official / Paid Figma MCP** vẫn mạnh hơn khi cần truy cập từ xa không cần cài đặt, tìm thư viện Design System toàn công ty (`search_design_system`), Code Connect đồng bộ cloud, shader / video / motion keyframe và Branching. **Figma Plugin MCP** nay đã có bản cơ bản chạy local cho nhiều mục trong số đó — sơ đồ FigJam gốc, Slides, motion của prototype, file Code Connect, HTML → Figma, sinh ảnh/SVG BYOK — ở mức hoàn thiện thấp hơn.
 - **Agent đọc Figma để viết code từ file hiện tại:** Cả **Official Figma MCP** và **Figma Plugin MCP** đều vượt trội hoàn toàn so với **REST API** vì tránh được việc tải các cục JSON thô khổng lồ làm cháy token của LLM. **Figma Plugin MCP** có thêm lợi thế xuất file snapshot `design-kit.md` ổn định và đọc được Variables ngay cả khi không dùng gói Enterprise.
 - **Agent thiết kế UI chính xác & vẽ sơ đồ BA/UX trên Figma Design:** **REST API** không vẽ được lên canvas. **Figma Plugin MCP** cho sản phẩm đầu ra ít lỗi bố cục hơn hẳn nhờ `layout_audit`, `a11y_audit`, `audit_design_system`, các mặc định an toàn (chống đè khung, chống mờ frame) và hệ thống sơ đồ gắn model giúp bắt lỗi cắt chữ, tương phản màu và logic nghiệp vụ trước khi con người xem ảnh chụp.
 - **Tự động hóa không cần giao diện (CI/CD, webhooks, lịch sử phiên bản):** **Figma REST API (PAT)** là lựa chọn phù hợp khi không có sẵn phiên Figma Desktop đang mở.
+- **Figma Plugin MCP + PAT tùy chọn:** plugin vẫn là đường chính (không tốn quota, ghi được canvas, đọc đủ design system); token bổ sung comments, lịch sử phiên bản và đọc file chưa mở. Lưu ý gói tài khoản: ở **Starter**, quota đọc file qua REST hết sau vài lệnh (phải chờ nhiều ngày), nên hãy mở file khi có thể và coi REST là đường dự phòng thỉnh thoảng mới dùng.
 
 ## Bắt đầu nhanh (Quickstart)
 
@@ -140,14 +144,16 @@ claude mcp add figma-plugin -s user -- /absolute/path/to/figma-plugin/scripts/fi
 
 **Kiểm tra kết nối:** yêu cầu agent gọi `figma_status`. Hướng dẫn chi tiết và cách xử lý sự cố: [`docs/SETUP.md`](./docs/SETUP.md) và [`docs/INSTALL.md`](./docs/INSTALL.md). Chạy nhiều IDE cùng lúc: [`docs/MULTI-AGENT.md`](./docs/MULTI-AGENT.md).
 
+**(Tùy chọn) REST token:** trong panel plugin, dán Figma personal access token (`figd_…`) vào ô **REST Token (PAT)** → **Save**. Badge chuyển sang `Valid (@handle)` khi server kiểm tra xong qua `GET /v1/me`. Token dùng cho comments, lịch sử phiên bản và đọc file chưa mở; thay cho biến môi trường `FIGMA_TOKEN` (vẫn dùng làm dự phòng).
+
 > **Mỗi phiên làm việc:** mở file Figma của bạn → **Plugins → Development → Figma Plugin MCP** → giữ nguyên cửa sổ đó. Figma không tự động khởi chạy plugin.
 
 ## Công cụ (Tools)
 
 | Công cụ | Mục đích |
 |---|---|
-| `figma_status` | Chẩn đoán kết nối chi tiết — trạng thái kết nối plugin, chế độ leader/follower, heartbeat, hàng đợi, sessions và danh sách `hints` theo thứ tự. Không bao giờ chỉ trả về mỗi boolean. |
-| `figma_read` | Đọc canvas thông qua tham số `op` (`get_document_info`, `get_selection`, `read_selection`, `get_design_context`, `get_design_system_kit`, `generate_design_md`, `search_nodes`, `find_component`, `get_instance_overrides`, `a11y_audit`, `audit_design_system`, `export_component_map`, `screenshot`, `layout_audit`, `get_diagram_spec`, `get_page_model`, ...) với phản hồi tiết kiệm token. |
+| `figma_status` | Chẩn đoán kết nối chi tiết — trạng thái kết nối plugin, chế độ leader/follower, heartbeat, hàng đợi, sessions, trạng thái REST token (`restToken`: state/handle/bản che `figd_…a1b2`, không bao giờ là token) và danh sách `hints` theo thứ tự. Không bao giờ chỉ trả về mỗi boolean. |
+| `figma_read` | Đọc canvas thông qua tham số `op` (`get_document_info`, `get_selection`, `read_selection`, `get_design_context`, `get_design_system_kit`, `generate_design_md`, `search_nodes`, `find_component`, `get_instance_overrides`, `a11y_audit`, `audit_design_system`, `export_component_map`, `screenshot`, `layout_audit`, `get_diagram_spec`, `get_page_model`, `get_slides`, REST: `get_comments`, `get_versions`, chỉ mục cục bộ: `search_design_index`, `index_design_file`, ...) với phản hồi tiết kiệm token. Truyền `{ url }` hoặc `{ fileKey }` để đọc file chưa mở qua REST. |
 | `figma_write` | Thực thi JavaScript (ES hiện đại) thông qua proxy `figma.*` để tạo/chỉnh sửa canvas — bao gồm components, variants, properties và instances. Biến `state` được giữ lại xuyên suốt phiên. |
 | `figma_rules` | Bảng quy tắc design system chỉ với một lần gọi (styles + variables + components) dưới dạng markdown — đọc trước khi vẽ để tái sử dụng thay vì hardcode. Để lưu đặc tả lâu dài, dùng `figma_read` với `op: "generate_design_md"` và lưu kết quả thành `design-kit.md`. |
 | `figma_diagram` | Vẽ **chín** loại sơ đồ từ mô hình mà **bạn** rút trích từ spec, mỗi loại đều kèm kiểm tra lỗi về *nội dung*, không chỉ là hình vẽ. `type:"activity"` — quy trình nghiệp vụ, có hoặc không có swimlanes: mỗi làn một chủ thể, luồng bàn giao giữa các làn; báo cáo chuyển giao chưa gắn nhãn, bước không có người phụ trách, nhánh rẽ không hợp nhất. `type:"sequence"` — trao đổi theo thời gian: các thành phần theo cột, thông điệp theo thứ tự liệt kê, thanh kích hoạt tự suy từ lời gọi và phản hồi, khối alt/loop; báo cáo lời gọi không có phản hồi, phản hồi không có lời gọi, alt thiếu else. `type:"state"` — vòng đời của MỘT thực thể: các trạng thái có thể giữ và mọi chuyển đổi hợp lệ viết theo `event [guard] / action`; báo cáo trạng thái không thể đi tới, trạng thái không thể thoát ra, hai chuyển đổi xung đột trên cùng một sự kiện. `type:"erd"` — mô hình dữ liệu: bảng, cột, khóa, quan hệ crow's-foot; báo cáo các lỗi dễ sập sau migration (thiếu khóa chính, khóa ngoại trỏ tới cột không tồn tại, quan hệ nhiều-nhiều thiếu bảng trung gian). `type:"userflow"` — các màn hình người dùng đi qua, từ đồ thị hoặc mermaid `flowchart`; báo cáo câu hỏi chỉ có một lối ra, ngõ cụt, màn hình không thể truy cập. `type:"sitemap"` — cấu trúc trang của sản phẩm và quan hệ chứa nhau, vẽ dạng cây gọn gàng; báo cáo trang mồ côi, mục rỗng không có trang con, độ sâu quá lớn khó điều hướng, và đối chiếu chéo với userflows trên cùng trang. `type:"usecase"` — tác nhân (actors), use cases trong ranh giới hệ thống, `«include»`/`«extend»`/kế thừa; báo cáo actor không dùng gì và use case không ai khởi tạo được. `type:"journey"` — hành trình một persona qua một kịch bản kèm đường cong cảm xúc; báo cáo điểm trũng cảm xúc chưa có pain point và pain point chưa có cơ hội cải thiện. `type:"persona"` — thẻ chân dung người dùng mục tiêu; báo cáo thiếu nguồn nghiên cứu, thiếu persona chính, persona thiếu mục tiêu hoặc nỗi đau. Có thể viết ở dạng `text` rút gọn chỉ tốn ~1/3 lượng token, vẽ cả bộ trong một lần gọi (`diagrams: [...]`, tự động sắp xếp vị trí), và **chỉnh sửa** bằng `update` + `patch` thay vì vẽ lại từ đầu. Mọi lần vẽ đều được kiểm tra chéo với các sơ đồ khác trên trang. Với 6 loại sơ đồ đồ thị, mũi tên luôn tự bám vào hộp: kéo hộp đi đâu, các đường nối tự định tuyến lại theo đó. |

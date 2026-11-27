@@ -21,6 +21,8 @@ what these are for.
 "correct", the findings loop, frame placement, verification, redrawing. Each `SKILL.md`
 references it and carries only what is genuinely its own.
 
+**FigJam:** run the plugin inside a FigJam board and `/figma-userflow`, `/figma-activity`, `/figma-state` and `/figma-sitemap` draw with FigJam's native shapes and connectors (the model is still checked first). The other kinds draw as in Figma Design.
+
 ## Install
 
 Copy the whole directory into your workspace's skills folder, keeping the layout — the
