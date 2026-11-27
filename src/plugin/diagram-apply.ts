@@ -552,7 +552,8 @@ export function readDiagramSource(node: BaseNode): {
         native: "figjam",
       };
     } catch {
-      return {};
+      // Unreadable marker: still OUR FigJam section (no model) — never a Design frame.
+      return { native: "figjam" };
     }
   }
   return {};

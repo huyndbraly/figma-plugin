@@ -374,3 +374,14 @@ describe("review fixes (second pass)", () => {
     expect(badge()).not.toBe("No answer from server");
   });
 });
+
+describe("review fixes (fourth pass)", () => {
+  it("a socket that closes mid-check does not leave the badge on Checking… forever", () => {
+    const ws = connected();
+    main({ kind: "rest-token", token: TOKEN, savedAt: 1, reason: "saved" });
+    expect(badge()).toBe("Checking…");
+    ws.serverClose();
+    expect(badge()).not.toBe("Checking…");
+    expect(badge()).toMatch(/not checked/i);
+  });
+});

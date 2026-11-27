@@ -117,6 +117,11 @@ function safeAttrValue(name: string, value: string): boolean {
   return true;
 }
 
+/** A code point XML 1.0 allows in a character reference. */
+function xmlCharOk(cp: number): boolean {
+  return cp === 0x9 || cp === 0xa || cp === 0xd || (cp >= 0x20 && cp <= 0xd7ff) || (cp >= 0xe000 && cp <= 0xfffd) || (cp >= 0x10000 && cp <= 0x10ffff);
+}
+
 /**
  * Keep only an inert, self-contained SVG: the first <svg> element (up to the
  * </svg> that closes IT — not the last one in the reply), rebuilt from an
@@ -186,7 +191,16 @@ export function sanitizeSvg(raw: string): string {
     }
     if (dropDepth || whole.startsWith("<")) continue; // comments, CDATA, doctype, PIs, stray "<"
     // Text: a bare `&` (AT&T) or an HTML-only entity (&nbsp;) is not XML.
-    out += whole.replace(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);)/gi, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    out += whole
+      .replace(/&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-f]+));|&/gi, (m, named, dec, hex) => {
+        if (named) return m;
+        if (dec === undefined && hex === undefined) return "&amp;";
+        // A numeric reference must name a character XML allows, or the whole SVG fails to parse.
+        const cp = dec !== undefined ? Number(dec) : parseInt(hex, 16);
+        return xmlCharOk(cp) ? m : "&amp;" + m.slice(1);
+      })
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
   }
   // A reply cut off mid-element (or an unclosed dropped element that ate the
   // rest): close what is open so the result is still one well-formed <svg>.

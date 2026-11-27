@@ -338,27 +338,37 @@ describe("third pass: rest-hub", () => {
 
   it("a follower WITH its own FIGMA_TOKEN keys its cache on the leader's token (that is what its requests use)", async () => {
     let leaderGen = 1;
-    const f = new RestHub({ env: () => B, fetch: async () => json({}) });
+    let now = 1_000;
+    const f = new RestHub({ env: () => B, now: () => now, fetch: async () => json({}) });
     f.setRemote(() => async () => ({ noToken: true }), async () => ({ state: "valid", source: "plugin", masked: "figd_…same", tokenGen: leaderGen }));
     const k1 = await f.cacheKey();
     leaderGen = 2;
-    await new Promise((r) => setTimeout(r, 0));
-    (f as unknown as { remoteStatusCache?: unknown }).remoteStatusCache = undefined; // skip the 5 s status cache
+    now += 6_000; // past the 5 s leader-status cache
     expect(await f.cacheKey()).not.toBe(k1); // same mask, different token: different key
   });
 
   it("a Retry-After longer than a timer can wait is reached in steps, never early", async () => {
-    let now = 0;
-    const h = new RestHub({ env: () => undefined, now: () => now, fetch: async (u) => (u.endsWith("/me") ? json({ handle: "h" }) : u.includes("/teams/") ? json({}, 404) : json({}, 429, { "retry-after": "3000000" })) });
-    h.setPluginToken(A);
-    await settle(h);
-    await h.fetch("https://api.figma.com/v1/files/K", {});
-    // Fire the timer by hand at a time BEFORE retryAt: the limit must hold.
-    const timer = (h as unknown as { agingTimer?: { _onTimeout?: () => void } }).agingTimer;
-    expect(typeof timer?._onTimeout).toBe("function"); // Node timer internals: fail loudly if they change
-    now = 2_147_483_000;
-    timer!._onTimeout!();
-    expect(h.getStatus().state).toBe("rate_limited");
+    vi.useFakeTimers();
+    try {
+      let now = 0;
+      const h = new RestHub({ env: () => undefined, now: () => now, fetch: async (u) => (u.endsWith("/me") ? json({ handle: "h" }) : u.includes("/teams/") ? json({}, 404) : json({}, 429, { "retry-after": "3000000" })) });
+      h.setPluginToken(A);
+      await settle(h);
+      await h.fetch("https://api.figma.com/v1/files/K", {});
+      const retryAt = h.getStatus().retryAt!;
+      expect(retryAt).toBe(3_000_000_000);
+      // The first timer fires at the longest wait a timer allows — before retryAt.
+      now = 2_147_483_000;
+      await vi.advanceTimersByTimeAsync(2_147_483_000);
+      expect(h.getStatus().state).toBe("rate_limited"); // held…
+      expect(vi.getTimerCount()).toBeGreaterThan(0); // …and the next step is scheduled
+      // The second step reaches retryAt: the limit is lifted.
+      now = retryAt;
+      await vi.advanceTimersByTimeAsync(retryAt - 2_147_483_000);
+      expect(h.getStatus().state).not.toBe("rate_limited");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("anySignal's Node 18 path removes its listeners once the combined signal aborts", () => {

@@ -208,3 +208,21 @@ describe("legacy FigJam sections, third pass (review)", () => {
     expect(calls).toContain("create_userflow");
   });
 });
+
+describe("FigJam redraw, fourth pass (review)", () => {
+  it("an OLDER plugin's legacy-section error still redraws into the section, not as a Design frame", async () => {
+    const calls: Array<[string, any]> = [];
+    const ctx = {
+      runValidated: vi.fn(async (op: string, params: any) => {
+        calls.push([op, params]);
+        if (op === "list_channels") return [{ channel: "c1", plugin: { fileName: "Board", editorType: "figjam" } }];
+        if (op === "get_diagram_spec") throw Object.assign(new Error('"Checkout" is a FigJam section drawn before the model was stored on it.'), { code: "INVALID_PARAMS" });
+        if (op === "create_figjam_diagram") return { sectionId: params.intoSectionId ?? "new", redrawn: !!params.intoSectionId };
+        return {};
+      }),
+    } as unknown as ToolContext;
+    await handleDiagram(ctx, "userflow", { ...FLOW, update: "7:7" });
+    expect(calls.find((c) => c[0] === "create_figjam_diagram")![1].intoSectionId).toBe("7:7");
+    expect(calls.map((c) => c[0])).not.toContain("create_userflow");
+  });
+});

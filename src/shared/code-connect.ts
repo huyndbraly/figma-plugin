@@ -221,10 +221,10 @@ function skipNonCode(src: string, i: number): number {
   if (c === "`") return skipTemplate(src, i);
   if (c === '"' || c === "'") {
     const str = readString(src, i);
-    if (str) return str.end;
-    // Unterminated on its line: skip to the line end, so the rest is not misread.
-    const nl = src.indexOf("\n", i);
-    return nl < 0 ? src.length : nl;
+    // Unterminated on its line — an apostrophe in JSX text (`<B>Don't</B>`)
+    // or a regex (`/'/`): a plain character, so the braces and commas after
+    // it on the same line still count.
+    return str ? str.end : i;
   }
   return i;
 }
@@ -257,7 +257,10 @@ function skipBlock(src: string, open: number): number {
   return src.length;
 }
 
-/** The first match of `re` that starts in CODE (not in a comment, string or template). */
+/**
+ * The first match of `re` that starts in CODE (not in a comment, string or
+ * template) and at a word start (`props:` does not match inside `ownprops:`).
+ */
 function searchCode(src: string, re: RegExp): number {
   for (let i = 0; i < src.length; i++) {
     const past = skipNonCode(src, i);
@@ -265,6 +268,7 @@ function searchCode(src: string, re: RegExp): number {
       i = past - 1;
       continue;
     }
+    if (/[\w$]/.test(src[i - 1] ?? "")) continue;
     if (re.test(src.slice(i, i + 80))) return i;
   }
   return -1;

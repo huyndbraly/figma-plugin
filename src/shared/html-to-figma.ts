@@ -283,10 +283,15 @@ function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, paren
     // *-reverse lays the DOM order out backwards; auto-layout follows child
     // order — so reorder by POSITION (left→right / top→bottom), which also
     // keeps the measured gap below positive.
-    // Two keys, so a wrapped reversed row sorts line by line instead of
-    // interleaving its lines (rows: top, then left; columns: left, then top).
+    // A WRAPPED reversed row sorts line by line (rows: top, then left;
+    // columns: left, then top). A single line sorts on the main axis only:
+    // children of different heights (align-items: center) have different
+    // tops, and must not be ordered by them.
     if (/reverse/.test(st.flexDirection ?? "")) {
-      kids = [...kids].sort((a, b) => (row ? a.rect.y - b.rect.y || a.rect.x - b.rect.x : a.rect.x - b.rect.x || a.rect.y - b.rect.y));
+      const wraps = /wrap/.test(st.flexWrap ?? "") && !/nowrap/.test(st.flexWrap ?? "");
+      const main = (a: CapturedNode, b: CapturedNode) => (row ? a.rect.x - b.rect.x : a.rect.y - b.rect.y);
+      const cross = (a: CapturedNode, b: CapturedNode) => (row ? a.rect.y - b.rect.y : a.rect.x - b.rect.x);
+      kids = [...kids].sort((a, b) => (wraps ? cross(a, b) || main(a, b) : main(a, b)));
     }
     spec.layoutMode = row ? "HORIZONTAL" : "VERTICAL";
     const gap = px(row ? st.columnGap ?? st.gap : st.rowGap ?? st.gap);

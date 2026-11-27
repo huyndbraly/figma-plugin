@@ -428,10 +428,14 @@ export async function restFor(ctx: ToolContext): Promise<{ client: RestClient; d
   } else {
     if (!(await restHub.available())) return null;
     // One cache per token: a new token may see files the old one could not.
-    const key = `hub|${await restHub.cacheKey()}`;
-    const cached = restClients.get(key);
+    const id = await restHub.cacheKey();
+    const key = id === null ? null : `hub|${id}`;
+    const cached = key === null ? undefined : restClients.get(key);
     if (cached) client = cached;
-    else {
+    else if (key === null) {
+      // The leader's token is unknown right now: a client of its own, uncached.
+      client = new RestClient("", restHub.fetch);
+    } else {
       restClients.clear();
       client = new RestClient("", restHub.fetch);
       restClients.set(key, client);
@@ -851,13 +855,18 @@ async function handleDiagramUpdate(
     // Only a kind that HAS a FigJam drawing can be a FigJam section: other
     // kinds skip the round trip. A FigJam section always ANSWERS (with
     // `native`), so an INVALID_PARAMS here is a Design frame without a stored
-    // model — fine to redraw from this full spec. Anything else (a missing
-    // node, a timeout) must not fall through to a Design drawing.
+    // model — fine to redraw from this full spec (unless an older plugin's
+    // message names FigJam). Anything else (a missing node, a timeout) must
+    // not fall through to a Design drawing.
     storedMark = (await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel)
       .then(resultOf)
       .catch((e: unknown) => {
-        if ((e as { code?: string }).code === ErrorCode.INVALID_PARAMS) return undefined;
-        throw e;
+        if ((e as { code?: string }).code !== ErrorCode.INVALID_PARAMS) throw e;
+        // A plugin built before FigJam sections answered with `native` says
+        // so in words: still a FigJam section, never a Design frame to draw over.
+        // (Its exact sentence: a frame NAMED "…FigJam…" must not match.)
+        if (/" is a FigJam section drawn before the model was stored on it\.$/.test(String((e as Error).message ?? ""))) return { native: "figjam", spec: null };
+        return undefined;
       })) as typeof storedMark;
   }
   const nativeFigjam = storedMark?.native === "figjam";

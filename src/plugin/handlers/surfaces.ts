@@ -166,16 +166,25 @@ export async function createFigjamDiagram(ctx: HandlerContext): Promise<unknown>
     }
     return tag ? idMap[tag] : undefined;
   };
-  for (const c of section.children) {
-    if (c.type !== "CONNECTOR" || prevIds.has(c.id) || drawnNow.includes(c)) continue;
+  // A connector can live anywhere on the page (a user arrow from another
+  // section), not only in this one. One that cannot be moved is reported, not
+  // thrown: the new drawing is complete by now and must replace the old.
+  let dangling = 0;
+  for (const c of connectorsAround(section)) {
+    if (prevIds.has(c.id) || drawnNow.includes(c)) continue;
     for (const end of ["connectorStart", "connectorEnd"] as const) {
       const e = c[end] as { endpointNodeId?: string; magnet?: "NONE" | "AUTO" | "TOP" | "LEFT" | "BOTTOM" | "RIGHT" | "CENTER" };
-      if (e.endpointNodeId && prevIds.has(e.endpointNodeId)) {
-        const to = newIdFor(e.endpointNodeId);
-        if (to) c[end] = { endpointNodeId: to, magnet: e.magnet ?? "AUTO" };
+      if (!e || !e.endpointNodeId || !prevIds.has(e.endpointNodeId)) continue;
+      const to = newIdFor(e.endpointNodeId);
+      try {
+        if (!to) throw new Error("no new shape");
+        c[end] = { endpointNodeId: to, magnet: e.magnet && e.magnet !== "NONE" ? e.magnet : "AUTO" };
+      } catch {
+        dangling++;
       }
     }
   }
+  if (dangling) ctx.warn(`${dangling} end(s) of connectors you drew pointed at shapes this redraw removed and could not be moved to a new shape (the shape is gone from the model, or the connector is locked) — check them.`);
   for (const n of previous) if (!n.removed) n.remove();
   section.setPluginData(
     FIGJAM_MARKER,
@@ -213,9 +222,25 @@ function toolDrawn(section: SectionNode): SceneNode[] {
   }
   if (listed) {
     const ids = new Set(listed);
-    return section.children.filter((c) => ids.has(c.id));
+    const found = section.children.filter((c) => ids.has(c.id));
+    // A DUPLICATED section (Cmd+D) carries the original's list, but its
+    // children have new ids: none match. Fall back to the tags.
+    if (found.length || !listed.length) return found;
   }
   return toolDrawnByTag(section);
+}
+
+/** Every connector on the section's page (this section's when the page cannot be reached). */
+function connectorsAround(section: SectionNode): ConnectorNode[] {
+  try {
+    let p: BaseNode | null = section.parent;
+    while (p && p.type !== "PAGE") p = p.parent;
+    const page = p as (PageNode & { findAllWithCriteria?: PageNode["findAllWithCriteria"] }) | null;
+    if (page && typeof page.findAllWithCriteria === "function") return page.findAllWithCriteria({ types: ["CONNECTOR"] }) as ConnectorNode[];
+  } catch {
+    /* fall through to the section's own */
+  }
+  return section.children.filter((c): c is ConnectorNode => c.type === "CONNECTOR");
 }
 
 function toolDrawnByTag(section: SectionNode): SceneNode[] {

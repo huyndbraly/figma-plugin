@@ -11,7 +11,7 @@
  * Metadata only — names, ids, keys, types, descriptions. No node trees, no
  * images, no token. The folder is gitignored; `FIGMA_CACHE=off` disables it.
  */
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileNameKey } from "../shared/figma-url.js";
 
@@ -127,10 +127,15 @@ export function itemsFromResult(op: string, result: unknown): IndexedItem[] {
   return out;
 }
 
-/** How long a lock file may sit before it is taken for a crashed writer's. */
-const LOCK_STALE_MS = 3_000;
-/** How long to wait for another process's lock (longer than LOCK_STALE_MS, so a dead writer's lock is always broken in time). */
+/**
+ * How old a lock may get while its writer is still running before it is
+ * taken for a hung one. Far above any index write — a live writer is never
+ * broken in practice; a DEAD writer's lock is broken at once (pid check).
+ */
+const LOCK_STALE_MS = 30_000;
+/** How long to wait for another process's lock before writing without it. */
 const LOCK_WAIT_MS = 5_000;
+const LOCK_POLL_MS = 25;
 
 /** Is the process that wrote this lock still running? */
 function alive(pid: number): boolean {
@@ -143,46 +148,84 @@ function alive(pid: number): boolean {
   }
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let lockSeq = 0;
+
+/** The pid a lock's content names, or null when it does not name one. */
+export function lockOwner(content: string): number | null {
+  const m = /^(\d+)(?::|$)/.exec(content);
+  return m ? Number(m[1]) : null;
+}
+
 /**
- * Run `fn` holding an exclusive lock file (O_EXCL create).
+ * Run `fn` holding an exclusive lock file.
  *
+ * - The lock is written COMPLETE to a private file, then hard-linked into
+ *   place (`link` fails with EEXIST when it is taken). Nobody can ever read
+ *   a half-written lock. Its content is `<pid>:<unique token>`.
  * - Only EEXIST means "someone else holds it" and is waited on; any other
- *   error (a read-only or locked cache folder) skips the lock at once instead
- *   of stalling every write for the whole wait.
- * - A lock whose writer is dead, or that is older than LOCK_STALE_MS, is
- *   broken ATOMICALLY: renamed to a unique name first, so two waiters cannot
- *   both break it and both go on to "hold" it.
+ *   error (a read-only or locked cache folder) skips the lock at once.
+ * - A lock is broken only when its writer is dead (or it is LOCK_STALE_MS
+ *   old). It is renamed away first, then checked: if the file renamed is not
+ *   the one judged dead (someone took the lock in between), it is put back.
+ * - A lock is released only when it is still OURS (its token).
  * - The index is a cache: after LOCK_WAIT_MS the write goes ahead unlocked,
  *   and `fn` is told so.
  */
 export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) => Promise<T>): Promise<T> {
+  const token = `${process.pid}:${Date.now().toString(36)}${(lockSeq++).toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const mine = `${lockPath}.${process.pid}.${lockSeq}.tmp`;
   let held = false;
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  while (!held && Date.now() < deadline) {
-    try {
-      await writeFile(lockPath, String(process.pid), { flag: "wx" });
-      held = true;
-      break;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") break;
-    }
-    try {
-      const [st, owner] = await Promise.all([stat(lockPath), readFile(lockPath, "utf8")]);
-      if (!alive(Number(owner)) || Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-        const grave = `${lockPath}.${process.pid}.${Date.now()}.stale`;
-        // Whoever wins the rename broke it; the loser's rename fails (ENOENT).
-        await rename(lockPath, grave).then(() => unlink(grave).catch(() => undefined), () => undefined);
-        continue;
+  try {
+    await writeFile(mine, token, { flag: "wx" });
+  } catch {
+    return fn(false); // the folder cannot be written: no lock to be had
+  }
+  try {
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    while (Date.now() < deadline) {
+      try {
+        await link(mine, lockPath);
+        held = true;
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") break;
       }
-    } catch {
-      continue; // released between the calls: try again at once
+      let owner: string;
+      let mtime: number;
+      try {
+        const [st, content] = await Promise.all([stat(lockPath), readFile(lockPath, "utf8")]);
+        owner = content;
+        mtime = st.mtimeMs;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; // released between the calls
+        break; // unreadable: do not spin on it
+      }
+      const pid = lockOwner(owner);
+      const dead = pid !== null && !alive(pid);
+      if (dead || Date.now() - mtime > LOCK_STALE_MS) {
+        const grave = `${lockPath}.${process.pid}.${Date.now()}.${lockSeq++}.stale`;
+        const moved = await rename(lockPath, grave).then(() => true, () => false);
+        if (moved) {
+          const got = await readFile(grave, "utf8").catch(() => null);
+          // Someone took the lock between our read and our rename: give it back.
+          if (got !== null && got !== owner) await link(grave, lockPath).catch(() => undefined);
+          await unlink(grave).catch(() => undefined);
+          continue;
+        }
+      }
+      await sleep(LOCK_POLL_MS);
     }
-    await new Promise((r) => setTimeout(r, 25));
+  } finally {
+    await unlink(mine).catch(() => undefined);
   }
   try {
     return await fn(held);
   } finally {
-    if (held) await unlink(lockPath).catch(() => undefined);
+    if (held) {
+      const still = await readFile(lockPath, "utf8").catch(() => null);
+      if (still === token) await unlink(lockPath).catch(() => undefined);
+    }
   }
 }
 

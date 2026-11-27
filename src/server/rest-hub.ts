@@ -365,8 +365,12 @@ export class RestHub {
   private lastRecheckAt = 0;
   private agingTimer?: NodeJS.Timeout;
   private status: TokenStatus;
-  /** Bumped on every token change; stale checks and caches compare it. */
-  private gen = 0;
+  /**
+   * Bumped on every token change; stale checks and caches compare it. Starts
+   * at a random point per process, so a NEW leader's first generation is not
+   * the old leader's (a follower keys its cache on it).
+   */
+  private gen = 1 + Math.floor(Math.random() * 2 ** 40);
   private checking?: Promise<TokenStatus>;
   private checkingGen = -1;
   private recheckTimer?: NodeJS.Timeout;
@@ -454,7 +458,7 @@ export class RestHub {
   private baseStatus(): TokenStatus {
     const token = this.token();
     if (!token) return { state: "not_set", source: null };
-    return { state: "unverified", source: this.source(), masked: maskToken(token), ...this.expiryField() };
+    return { state: "unverified", source: this.source(), masked: maskToken(token), ...this.expiryField(), tokenGen: this.gen };
   }
 
   private expiryField(): { expiresAt?: number } {
@@ -582,15 +586,17 @@ export class RestHub {
    * leader's, so a token change there must not serve 60 s of reads cached
    * under the old one.
    */
-  async cacheKey(): Promise<string> {
+  async cacheKey(): Promise<string | null> {
     // The same condition fetch() uses to forward: without a plugin token, a
     // follower's requests run on the LEADER's token even when it has its own
     // FIGMA_TOKEN — so that is the token the cache must follow.
     if (this.pluginToken || !this.remote()) return `local|${this.gen}`;
     // The leader's token GENERATION (changes only with the token; not on
     // re-checks, and unlike a 4-character mask it cannot collide).
+    // null — do not cache — while the leader's token cannot be told apart.
     const leader = await this.leaderStatus();
-    return `leader|${leader?.tokenGen ?? leader?.masked ?? "?"}|${this.gen}`;
+    const id = leader?.tokenGen ?? leader?.masked;
+    return id === undefined ? null : `leader|${id}|${this.gen}`;
   }
 
   onStatus(fn: (s: TokenStatus) => void): () => void {
@@ -607,7 +613,7 @@ export class RestHub {
     this.status = { ...s, tokenGen: this.gen };
     for (const fn of this.statusListeners) {
       try {
-        fn({ ...s });
+        fn({ ...this.status });
       } catch {
         /* a listener must not break the hub */
       }

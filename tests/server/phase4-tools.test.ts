@@ -415,7 +415,7 @@ describe("review fixes (second pass): index from capped and incomplete reads", (
 
 
 describe("third pass: lock file and index_design_file", () => {
-  it("a lock that cannot be created for another reason (EACCES/EROFS) does not stall the write", async () => {
+  it("a lock that cannot be created (missing folder) does not stall the write", async () => {
     const { withFileLock } = await import("../../src/server/design-index.js");
     const started = Date.now();
     const out = await withFileLock(join(dir, "no-such-dir", "x.lock"), async (locked) => locked);
@@ -423,14 +423,65 @@ describe("third pass: lock file and index_design_file", () => {
     expect(Date.now() - started).toBeLessThan(1000); // not the 5 s contention wait
   });
 
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("a read-only cache folder (EACCES) does not stall the write", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { mkdir: md, chmod } = await import("node:fs/promises");
+    const ro = join(dir, "ro");
+    await md(ro);
+    await chmod(ro, 0o500);
+    try {
+      const started = Date.now();
+      expect(await withFileLock(join(ro, "x.lock"), async (locked) => locked)).toBe(false);
+      expect(Date.now() - started).toBeLessThan(1000);
+    } finally {
+      await chmod(ro, 0o700);
+    }
+  });
+
   it("a lock left by a DEAD process is broken at once", async () => {
     const { withFileLock } = await import("../../src/server/design-index.js");
     const { writeFile: wf } = await import("node:fs/promises");
+    const { spawnSync } = await import("node:child_process");
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid; // ran and exited
     const lock = join(dir, "y.lock");
-    await wf(lock, "999999"); // a pid that is not running
+    await wf(lock, `${dead}:old`);
     const started = Date.now();
     expect(await withFileLock(lock, async (locked) => locked)).toBe(true);
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("an EMPTY lock file (a writer mid-write, older builds) is not taken for a dead owner", async () => {
+    const { lockOwner } = await import("../../src/server/design-index.js");
+    expect(lockOwner("")).toBeNull();
+    expect(lockOwner("123:abc")).toBe(123);
+    expect(lockOwner("123")).toBe(123);
+  });
+
+  it("a LIVE writer's lock is waited on, not broken, and is not deleted by the waiter", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf, readFile: rf } = await import("node:fs/promises");
+    const lock = join(dir, "z.lock");
+    await wf(lock, `${process.pid}:someone-else`); // alive (this process), fresh
+    const { rm } = await import("node:fs/promises");
+    setTimeout(() => void rm(lock, { force: true }), 120); // the holder releases
+    let inside = "";
+    expect(
+      await withFileLock(lock, async (locked) => {
+        inside = await rf(lock, "utf8");
+        return locked;
+      }),
+    ).toBe(true);
+    expect(inside).not.toBe(`${process.pid}:someone-else`); // our own token, taken after the release
+  });
+
+  it("releasing never deletes a lock that is no longer ours", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf, readFile: rf } = await import("node:fs/promises");
+    const lock = join(dir, "w.lock");
+    await withFileLock(lock, async () => {
+      await wf(lock, `${process.pid}:another-holder`); // ours was broken and re-taken
+    });
+    expect(await rf(lock, "utf8")).toBe(`${process.pid}:another-holder`);
   });
 
   it("index_design_file with a failed REST sub-read only ADDS", async () => {

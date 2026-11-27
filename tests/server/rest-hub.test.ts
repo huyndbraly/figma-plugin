@@ -721,7 +721,7 @@ describe("review fixes: followers", () => {
     expect(await follower.available()).toBe(true); // unknown → try the request
     fail = false;
     expect(await follower.effectiveStatus()).toMatchObject({ state: "valid" });
-    expect(await follower.cacheKey()).toBe("leader|figd_…1234|0"); // an old leader without tokenGen: the mask is all there is
+    expect(await follower.cacheKey()).toMatch(/^leader\|figd_…1234\|\d+$/); // an old leader without tokenGen: the mask is all there is
   });
 });
 

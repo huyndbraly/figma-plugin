@@ -282,3 +282,49 @@ describe("redraw, third pass (review)", () => {
     expect(c2.warnings.join("\n")).toMatch(/not cross-checked/);
   });
 });
+
+describe("redraw, fourth pass (review)", () => {
+  it("a DUPLICATED section (marker list names the original's ids) still replaces its own drawing", async () => {
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const original = made.find((n) => n.id === first.sectionId);
+    const dup = (globalThis as any).figma.createSection();
+    dup.data["figma-plugin.figjam"] = original.data["figma-plugin.figjam"]; // copied plugin data
+    for (const c of original.children) {
+      const k = base(c.type);
+      k.data = { ...c.data };
+      dup.appendChild(k); // new ids, same tags
+    }
+    const before = dup.children.length;
+    await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: dup.id }));
+    expect(dup.children.length).toBe(before); // replaced, not doubled
+    expect(original.children.length).toBe(before); // the original is untouched
+  });
+
+  it("a user connector OUTSIDE the section is re-pointed too; one that cannot be moved is a warning", async () => {
+    const page: any = { type: "PAGE", children: [] as any[], findAllWithCriteria: ({ types }: { types: string[] }) => made.filter((n) => types.includes(n.type) && !n.removed) };
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    section.parent = page;
+    const outside = base("CONNECTOR"); // on the page, not in the section
+    outside.connectorStart = { endpointNodeId: "elsewhere", magnet: "AUTO" };
+    outside.connectorEnd = { endpointNodeId: first.nodeIds.cart, magnet: "AUTO" };
+    const locked = base("CONNECTOR");
+    locked.connectorStart = { endpointNodeId: first.nodeIds.ok, magnet: "AUTO" };
+    let end = { endpointNodeId: "elsewhere", magnet: "AUTO" };
+    Object.defineProperty(locked, "connectorEnd", { get: () => end, set: () => { throw new Error("locked"); } });
+    Object.defineProperty(locked, "connectorStart", { get: () => ({ endpointNodeId: first.nodeIds.ok, magnet: "AUTO" }), set: () => { throw new Error("locked"); } });
+    const c2 = ctx({ ...DIAGRAM, intoSectionId: section.id });
+    const again = (await createFigjamDiagram(c2)) as any;
+    expect(outside.connectorEnd.endpointNodeId).toBe(again.nodeIds.cart);
+    expect(again.redrawn).toBe(true); // the locked connector did not abort the redraw
+    expect(c2.warnings.join("\n")).toMatch(/1 end\(s\) of connectors you drew/);
+    void end;
+  });
+
+  it("a section whose marker JSON is corrupt reads back as FigJam, not as a Design frame", async () => {
+    const { readDiagramSource } = await import("../../../src/plugin/diagram-apply.js");
+    const s = (globalThis as any).figma.createSection();
+    s.setPluginData("figma-plugin.figjam", "{not json");
+    expect(readDiagramSource(s)).toEqual({ native: "figjam" });
+  });
+});

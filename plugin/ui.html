@@ -742,6 +742,16 @@
     }
   }
 
+  // The socket went away mid-check: nobody is checking any more, so the
+  // badge must not stay on "Checking…" (the timer that ended it is cleared).
+  // "Saved, not checked" until the next server answers.
+  function settleCheckingOffline() {
+    if (restStatus && restStatus.state === "checking") {
+      restStatus = { state: "unverified", source: "plugin" };
+      renderToken();
+    }
+  }
+
   // One Figma REST request the server made: counters + an activity row.
   function onRestEvent(e) {
     if (!e || typeof e !== "object") return;
@@ -1195,6 +1205,7 @@
       // no-answer diagnosis; the token is sent again after the next `assigned`.
       clearTimeout(restAnswerTimer);
       restAnswerTimer = null;
+      settleCheckingOffline();
       clearTimeout(connectTimer);
       stopHeartbeat();
       if (connectedPort != null) {
@@ -1235,6 +1246,7 @@
     if (assignedSock === old) assignedSock = null;
     clearTimeout(restAnswerTimer);
     restAnswerTimer = null;
+    settleCheckingOffline();
     if (!old) return;
     old.onopen = old.onmessage = old.onerror = old.onclose = null;
     try { old.close(); } catch (e) { /* already closing */ }
