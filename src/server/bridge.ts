@@ -607,9 +607,12 @@ export class Bridge {
   async listen(startPort: number, authToken: string): Promise<number> {
     this.authToken = authToken;
     await this.tryListen(startPort);
-    this.boundPort = startPort;
+    // Port 0 asks the OS for a free one (tests do); report the real port.
+    const addr = this.http?.address();
+    const bound = addr && typeof addr === "object" ? addr.port : startPort;
+    this.boundPort = bound;
     this.startHeartbeatMonitor();
-    return startPort;
+    return bound;
   }
 
   private tryListen(port: number): Promise<void> {

@@ -66,7 +66,7 @@ async function newBridge(opts: BridgeOptions = {}): Promise<{ bridge: Bridge; po
   const bridge = new Bridge({}, { livenessProbeMs: 300, ...opts });
   bridges.push(bridge);
   // Random-ish start port to avoid collisions across tests.
-  const port = await bridge.listen(41000 + Math.floor(Math.random() * 500), "token-" + Math.random());
+  const port = await bridge.listen(0, "token-" + Math.random());
   return { bridge, port };
 }
 
@@ -716,7 +716,7 @@ describe("bridge /health + /rpc", () => {
     bridges.pop();
     const b = new Bridge();
     bridges.push(b);
-    const p = await b.listen(41850 + Math.floor(Math.random() * 80), token);
+    const p = await b.listen(0, token);
     const plugin = new FakePlugin();
     await plugin.connect(p, { channel: "secret-chan", fileName: "Secret File", pageName: "Hidden" });
 
@@ -738,7 +738,7 @@ describe("bridge /health + /rpc", () => {
   it("rejects /rpc without a valid Bearer token (401)", async () => {
     const bridge = new Bridge({ onRpc: async () => ({ ran: true }) });
     bridges.push(bridge);
-    const port = await bridge.listen(41800 + Math.floor(Math.random() * 100), "secret-token");
+    const port = await bridge.listen(0, "secret-token");
 
     const bad = await fetch(`http://127.0.0.1:${port}/rpc`, {
       method: "POST",
@@ -802,7 +802,7 @@ describe("bridge hardening", () => {
   it("terminates a staged socket that never sends hello", async () => {
     const bridge = new Bridge({}, { helloTimeoutMs: 60 });
     bridges.push(bridge);
-    const port = await bridge.listen(41900 + Math.floor(Math.random() * 80), "t");
+    const port = await bridge.listen(0, "t");
 
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
     await new Promise<void>((resolve, reject) => {

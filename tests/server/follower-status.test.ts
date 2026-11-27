@@ -26,7 +26,7 @@ async function leaderBridge(
 ): Promise<{ bridge: Bridge; info: LeaderInfo }> {
   const bridge = new Bridge({ onRpc });
   bridges.push(bridge);
-  const port = await bridge.listen(43000 + Math.floor(Math.random() * 500), token);
+  const port = await bridge.listen(0, token);
   return { bridge, info: { port, token, pid: 1234, startedAt: Date.now(), version: "0.0.0" } };
 }
 
