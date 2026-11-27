@@ -328,3 +328,46 @@ describe("redraw, fourth pass (review)", () => {
     expect(readDiagramSource(s)).toEqual({ native: "figjam" });
   });
 });
+
+describe("redraw, fifth pass (review)", () => {
+  it("an ORIGINAL section whose tool shapes the user deleted keeps the copies they pasted", async () => {
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    for (const c of [...section.children]) c.remove(); // the user deleted the whole drawing…
+    const copy = base("SHAPE_WITH_TEXT");
+    copy.data["figjam-id"] = "cart"; // …but kept a pasted copy
+    section.appendChild(copy);
+    await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: section.id }));
+    expect(section.children).toContain(copy);
+  });
+
+  it("a connector inside an INSTANCE is not touched or counted", async () => {
+    const page: any = { type: "PAGE", children: [] as any[], findAllWithCriteria: ({ types }: { types: string[] }) => made.filter((n) => types.includes(n.type) && !n.removed) };
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    section.parent = page;
+    const inst = base("INSTANCE");
+    inst.parent = page;
+    const inner = base("CONNECTOR");
+    inner.parent = inst;
+    inner.connectorStart = { endpointNodeId: "x", magnet: "AUTO" };
+    inner.connectorEnd = { endpointNodeId: first.nodeIds.cart, magnet: "AUTO" };
+    const c2 = ctx({ ...DIAGRAM, intoSectionId: section.id });
+    await createFigjamDiagram(c2);
+    expect(inner.connectorEnd.endpointNodeId).toBe(first.nodeIds.cart);
+    expect(c2.warnings.join("\n")).not.toMatch(/end\(s\) of connectors/);
+  });
+
+  it("a FigJam section with an unreadable marker is listed as unreadable by get_page_model", async () => {
+    const { getPageModel } = await import("../../../src/plugin/handlers/page-model.js");
+    const page: any = { type: "PAGE", name: "P", id: "0:1", children: [] as any[], findAllWithCriteria: ({ types }: { types: string[] }) => made.filter((n) => types.includes(n.type) && n.parent === page) };
+    const bad = (globalThis as any).figma.createSection();
+    bad.name = "Broken";
+    bad.parent = page;
+    page.children.push(bad);
+    bad.setPluginData("figma-plugin.figjam", "{oops");
+    (globalThis as any).figma.currentPage = page;
+    const out = (await getPageModel(ctx({}))) as any;
+    expect(out.diagrams).toContainEqual(expect.objectContaining({ nodeId: bad.id, unreadable: true }));
+  });
+});

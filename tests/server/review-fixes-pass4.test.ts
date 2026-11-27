@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { parseCodeConnect } from "../../src/shared/code-connect.js";
 import { RestHub } from "../../src/server/rest-hub.js";
 import { sanitizeSvg } from "../../src/server/byok.js";
-import { domToFigma } from "../../src/shared/html-to-figma.js";
+import { domToFigma, reverseFlexOrder, type CapturedNode } from "../../src/shared/html-to-figma.js";
 
 describe("Code Connect, fourth pass", () => {
   it("an apostrophe in JSX text does not swallow the rest of its line", () => {
@@ -106,3 +106,55 @@ describe("htmlToFigma, fourth pass", () => {
     expect((spec.children as Array<{ name: string }>).map((c) => c.name)).toEqual(["i#b", "i#a"]);
   });
 });
+
+describe("fifth pass", () => {
+  it("two apostrophes on one JSX line do not pair up and hide the code between", () => {
+    const { connections } = parseCodeConnect(`
+      figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {
+        props: { label: figma.string("Label") },
+        example: () => <B>Don't</B> }), x = <C>Won't</C>
+      figma.connect(Other, "https://www.figma.com/design/K/x?node-id=2-2", { props: { size: figma.enum("Size", { 'S': 's' }) } })`);
+    expect(connections.map((c) => c.component)).toEqual(["Btn", "Other"]);
+    expect(Object.keys(connections[1]!.props)).toEqual(["size"]);
+  });
+
+  it("a string after `return` / `case` is still a string", () => {
+    const { connections } = parseCodeConnect(`
+      figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {
+        props: { a: figma.string("A") },
+        example: () => { return '}' },
+      })
+      figma.connect(Other, "https://www.figma.com/design/K/x?node-id=2-2", {})`);
+    expect(connections.map((c) => c.component)).toEqual(["Btn", "Other"]);
+  });
+
+  it("SVG: entity names and the hex x are case-sensitive, as in XML", () => {
+    const out = sanitizeSvg("<svg><text>&AMP; &#X41; &#x41; &#x4a;</text></svg>");
+    expect(out).toContain("&amp;AMP;");
+    expect(out).toContain("&amp;#X41;");
+    expect(out).toContain("&#x41;");
+    expect(out).toContain("&#x4a;");
+  });
+
+  const box = (x: number, y: number, w: number, h: number) => ({ x, y, w, h });
+  const k = (id: string, r: ReturnType<typeof box>): CapturedNode => ({ tag: "i", id, rect: r, style: {} });
+
+  it("a wrap-enabled reversed row that FITS on one line sorts left to right, whatever the heights", () => {
+    const kids = [k("a", box(200, 40, 100, 20)), k("b", box(100, 0, 100, 100)), k("c", box(0, 30, 100, 40))];
+    expect(reverseFlexOrder(kids, true, true).map((n) => n.id)).toEqual(["c", "b", "a"]);
+  });
+
+  it("a really wrapped reversed row goes line by line, even with mixed heights in a line", () => {
+    const kids = [
+      k("a", box(100, 10, 100, 30)), k("b", box(0, 0, 100, 50)), // line 1 (y 0–50)
+      k("c", box(100, 60, 100, 40)), k("d", box(0, 70, 100, 20)), // line 2 (y 60–100)
+    ];
+    expect(reverseFlexOrder(kids, true, true).map((n) => n.id)).toEqual(["b", "a", "d", "c"]);
+  });
+
+  it("children at the same position keep the REVERSED DOM order (what is drawn)", () => {
+    const kids = [k("first", box(0, 0, 0, 10)), k("second", box(0, 0, 0, 10))];
+    expect(reverseFlexOrder(kids, true, false).map((n) => n.id)).toEqual(["second", "first"]);
+  });
+});
+

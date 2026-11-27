@@ -747,7 +747,16 @@
   // "Saved, not checked" until the next server answers.
   function settleCheckingOffline() {
     if (restStatus && restStatus.state === "checking") {
-      restStatus = { state: "unverified", source: "plugin" };
+      // Keep what is known (source, mask, expiry): only the state changes.
+      var next = {};
+      for (var k in restStatus) if (Object.prototype.hasOwnProperty.call(restStatus, k)) next[k] = restStatus[k];
+      next.state = "unverified";
+      next.settledOffline = true;
+      // The same preview the server gives (maskRestToken), never the token.
+      if (!next.masked && restToken && next.source === "plugin") {
+        next.masked = restToken.length < 12 ? "••••" : (restToken.indexOf("figd_") === 0 ? "figd_" : restToken.slice(0, 2)) + "…" + restToken.slice(-4);
+      }
+      restStatus = next;
       renderToken();
     }
   }
@@ -1032,7 +1041,8 @@
           // Keep what was typed: one wrong character should be fixable, not retyped.
           el.tokenInput.placeholder = msg.error || t("tokenRejected");
           el.tokenInput.title = msg.error || t("tokenRejected");
-          if (restStatus && restStatus.state === "checking") restStatus = pendingStatus;
+          // (Also after a disconnect turned that "Checking…" into "not checked".)
+          if (restStatus && (restStatus.state === "checking" || restStatus.settledOffline)) restStatus = pendingStatus;
           renderToken();
           break;
         }

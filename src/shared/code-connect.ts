@@ -220,13 +220,31 @@ function skipNonCode(src: string, i: number): number {
   const c = src[i];
   if (c === "`") return skipTemplate(src, i);
   if (c === '"' || c === "'") {
+    // Only where an expression can start: after a word (`Don't`, `won't` in
+    // JSX text), `)`, `]`, `}` or a regex's `/` a quote is a plain character —
+    // two apostrophes on one line must not pair up and hide the code between.
+    if (!stringCanStart(src, i)) return i;
     const str = readString(src, i);
-    // Unterminated on its line — an apostrophe in JSX text (`<B>Don't</B>`)
-    // or a regex (`/'/`): a plain character, so the braces and commas after
-    // it on the same line still count.
+    // Unterminated on its line: a plain character too.
     return str ? str.end : i;
   }
   return i;
+}
+
+const STRING_AFTER_WORD = new Set(["return", "case", "typeof", "in", "of", "else", "void", "yield", "await", "delete", "throw", "new", "instanceof", "do", "export", "default", "from", "import"]);
+
+/** Can a string literal start at `i` (judged by what comes before it)? */
+function stringCanStart(src: string, i: number): boolean {
+  let k = i - 1;
+  while (k >= 0 && /\s/.test(src[k]!)) k--;
+  if (k < 0) return true;
+  const p = src[k]!;
+  if (/[\w$]/.test(p)) {
+    let w = k;
+    while (w >= 0 && /[\w$]/.test(src[w]!)) w--;
+    return STRING_AFTER_WORD.has(src.slice(w + 1, k + 1));
+  }
+  return "([{,=:;?!&|+-*%<>~^".includes(p);
 }
 
 function skipTemplate(src: string, i: number): number {

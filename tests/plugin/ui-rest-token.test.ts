@@ -385,3 +385,25 @@ describe("review fixes (fourth pass)", () => {
     expect(badge()).toMatch(/not checked/i);
   });
 });
+
+describe("review fixes (fifth pass)", () => {
+  it("a disconnect mid-check keeps the token preview in the tooltip (never the token)", () => {
+    const ws = connected();
+    main({ kind: "rest-token", token: TOKEN, savedAt: 1, reason: "saved" });
+    ws.serverClose();
+    const title = String(els["token-badge"]!.title);
+    expect(title).toContain("figd_…" + TOKEN.slice(-4));
+    expect(title).not.toContain(TOKEN);
+  });
+
+  it("a Save refused AFTER a disconnect turned Checking… into 'not checked' restores the previous badge", () => {
+    const ws = connected();
+    ws.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h", masked: "figd_…abcd" } });
+    els["token-input"]!.value = TOKEN;
+    (els["token-save"]!.onclick as () => void)();
+    ws.serverClose();
+    main({ kind: "rest-token", reason: "rejected", error: "Not a token" });
+    expect(badge()).toBe("Valid (@h)");
+  });
+});
+

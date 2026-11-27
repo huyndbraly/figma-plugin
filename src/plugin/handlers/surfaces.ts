@@ -156,26 +156,28 @@ export async function createFigjamDiagram(ctx: HandlerContext): Promise<unknown>
   // The user's own connectors that ended on a shape about to go: move their
   // end to the new shape with the same diagram id, so they stay attached.
   const prevIds = new Set(previous.map((n) => n.id));
-  const newIdFor = (oldId: string): string | undefined => {
-    const old = previous.find((n) => n.id === oldId);
-    let tag = "";
+  const drawnIds = new Set(drawnNow.map((n) => n.id));
+  // old shape id → its diagram id, once (not one scan per connector end).
+  const tagOf = new Map<string, string>();
+  for (const n of previous) {
     try {
-      tag = old ? old.getPluginData("figjam-id") : "";
+      const tag = n.getPluginData("figjam-id");
+      if (tag) tagOf.set(n.id, tag);
     } catch {
-      tag = "";
+      /* no tag: its connectors cannot be moved */
     }
-    return tag ? idMap[tag] : undefined;
-  };
+  }
   // A connector can live anywhere on the page (a user arrow from another
   // section), not only in this one. One that cannot be moved is reported, not
   // thrown: the new drawing is complete by now and must replace the old.
   let dangling = 0;
   for (const c of connectorsAround(section)) {
-    if (prevIds.has(c.id) || drawnNow.includes(c)) continue;
+    if (prevIds.has(c.id) || drawnIds.has(c.id) || insideInstance(c)) continue;
     for (const end of ["connectorStart", "connectorEnd"] as const) {
       const e = c[end] as { endpointNodeId?: string; magnet?: "NONE" | "AUTO" | "TOP" | "LEFT" | "BOTTOM" | "RIGHT" | "CENTER" };
       if (!e || !e.endpointNodeId || !prevIds.has(e.endpointNodeId)) continue;
-      const to = newIdFor(e.endpointNodeId);
+      const tag = tagOf.get(e.endpointNodeId);
+      const to = tag ? idMap[tag] : undefined;
       try {
         if (!to) throw new Error("no new shape");
         c[end] = { endpointNodeId: to, magnet: e.magnet && e.magnet !== "NONE" ? e.magnet : "AUTO" };
@@ -184,13 +186,14 @@ export async function createFigjamDiagram(ctx: HandlerContext): Promise<unknown>
       }
     }
   }
-  if (dangling) ctx.warn(`${dangling} end(s) of connectors you drew pointed at shapes this redraw removed and could not be moved to a new shape (the shape is gone from the model, or the connector is locked) — check them.`);
+  if (dangling) ctx.warn(`${dangling} end(s) of connectors you drew pointed at shapes this redraw removed and could not be moved to a new shape (the shape is no longer in the model, or Figma refused the change) — check them.`);
   for (const n of previous) if (!n.removed) n.remove();
   section.setPluginData(
     FIGJAM_MARKER,
     // `drawn`: the node ids THIS drawing made — the next redraw removes those
     // and nothing else (a copy the user pasted carries the figjam-id tag too).
-    JSON.stringify({ kind: p.kind ?? null, title: p.title ?? null, ...(p.source !== undefined ? { source: p.source } : {}), native: "figjam", drawn: drawnNow.map((n) => n.id) }),
+    // `section`: whose list it is — a DUPLICATED section carries the copy.
+    JSON.stringify({ kind: p.kind ?? null, title: p.title ?? null, ...(p.source !== undefined ? { source: p.source } : {}), native: "figjam", drawn: drawnNow.map((n) => n.id), section: section.id }),
   );
   // The other diagrams on the page, for the server's cross-check — the same
   // hand-back a Figma Design draw gives, so FigJam diagrams are compared too.
@@ -213,21 +216,35 @@ export async function createFigjamDiagram(ctx: HandlerContext): Promise<unknown>
  */
 function toolDrawn(section: SectionNode): SceneNode[] {
   let listed: string[] | undefined;
+  let owner: string | undefined;
   try {
     const raw = section.getPluginData(FIGJAM_MARKER);
-    const drawn = raw ? (JSON.parse(raw) as { drawn?: unknown }).drawn : undefined;
-    if (Array.isArray(drawn)) listed = drawn.map(String);
+    const mark = raw ? (JSON.parse(raw) as { drawn?: unknown; section?: unknown }) : undefined;
+    if (Array.isArray(mark?.drawn)) listed = mark!.drawn.map(String);
+    if (typeof mark?.section === "string") owner = mark.section;
   } catch {
     listed = undefined;
   }
   if (listed) {
     const ids = new Set(listed);
     const found = section.children.filter((c) => ids.has(c.id));
-    // A DUPLICATED section (Cmd+D) carries the original's list, but its
-    // children have new ids: none match. Fall back to the tags.
-    if (found.length || !listed.length) return found;
+    // A DUPLICATED section (Cmd+D) carries the original's list (and id), but
+    // its children have new ids. Only then fall back to the tags: an original
+    // whose tool shapes the user deleted keeps its pasted copies.
+    const duplicated = owner !== undefined ? owner !== section.id : !found.length && listed.length > 0;
+    if (!duplicated) return found;
   }
   return toolDrawnByTag(section);
+}
+
+/** Inside an instance: not the user's to re-point (and not editable). */
+function insideInstance(n: BaseNode): boolean {
+  try {
+    for (let p = n.parent; p && p.type !== "PAGE"; p = p.parent) if (p.type === "INSTANCE") return true;
+  } catch {
+    /* unreachable parent: treat as free */
+  }
+  return false;
 }
 
 /** Every connector on the section's page (this section's when the page cannot be reached). */

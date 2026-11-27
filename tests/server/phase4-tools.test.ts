@@ -474,12 +474,38 @@ describe("third pass: lock file and index_design_file", () => {
     expect(inside).not.toBe(`${process.pid}:someone-else`); // our own token, taken after the release
   });
 
+  it("the lock holds just the pid, so an OLDER build (Number(content)) reads it as a live owner", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { readFile: rf } = await import("node:fs/promises");
+    const lock = join(dir, "v.lock");
+    let content = "";
+    await withFileLock(lock, async () => {
+      content = await rf(lock, "utf8");
+    });
+    expect(content).toBe(String(process.pid));
+    expect(Number.isInteger(Number(content))).toBe(true);
+  });
+
+  it("a lock that names no pid is broken once it is 3 s old (not after the full wait)", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf, utimes } = await import("node:fs/promises");
+    const lock = join(dir, "u.lock");
+    await wf(lock, "");
+    const old = new Date(Date.now() - 10_000);
+    await utimes(lock, old, old);
+    const started = Date.now();
+    expect(await withFileLock(lock, async (locked) => locked)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it("releasing never deletes a lock that is no longer ours", async () => {
     const { withFileLock } = await import("../../src/server/design-index.js");
     const { writeFile: wf, readFile: rf } = await import("node:fs/promises");
     const lock = join(dir, "w.lock");
+    const { rm } = await import("node:fs/promises");
     await withFileLock(lock, async () => {
-      await wf(lock, `${process.pid}:another-holder`); // ours was broken and re-taken
+      await rm(lock); // ours was broken…
+      await wf(lock, `${process.pid}:another-holder`); // …and re-taken: a NEW file
     });
     expect(await rf(lock, "utf8")).toBe(`${process.pid}:another-holder`);
   });

@@ -192,7 +192,8 @@ export function sanitizeSvg(raw: string): string {
     if (dropDepth || whole.startsWith("<")) continue; // comments, CDATA, doctype, PIs, stray "<"
     // Text: a bare `&` (AT&T) or an HTML-only entity (&nbsp;) is not XML.
     out += whole
-      .replace(/&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-f]+));|&/gi, (m, named, dec, hex) => {
+      // Case-sensitive, as XML is: `&AMP;` and `&#X41;` are not references.
+      .replace(/&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-fA-F]+));|&/g, (m, named, dec, hex) => {
         if (named) return m;
         if (dec === undefined && hex === undefined) return "&amp;";
         // A numeric reference must name a character XML allows, or the whole SVG fails to parse.

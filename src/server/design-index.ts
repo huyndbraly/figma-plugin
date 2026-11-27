@@ -149,67 +149,100 @@ function alive(pid: number): boolean {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-let lockSeq = 0;
+/** A lock that names no pid (empty: an older build mid-write) is broken once this old. */
+const LOCK_NO_PID_MS = 3_000;
+/** link() errors that mean "this filesystem has no hard links" (exFAT, FAT, some network mounts). */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS", "EINVAL"]);
 
 /** The pid a lock's content names, or null when it does not name one. */
 export function lockOwner(content: string): number | null {
-  const m = /^(\d+)(?::|$)/.exec(content);
+  const m = /^(\d+)(?::|\s*$)/.exec(content);
   return m ? Number(m[1]) : null;
 }
 
 /**
- * Run `fn` holding an exclusive lock file.
+ * Run `fn` holding an exclusive lock file — best effort: the index is a
+ * cache, so a lost race costs at most one index update, never a read.
  *
- * - The lock is written COMPLETE to a private file, then hard-linked into
- *   place (`link` fails with EEXIST when it is taken). Nobody can ever read
- *   a half-written lock. Its content is `<pid>:<unique token>`.
+ * - The lock's content is just the writer's pid (what every build reads).
+ *   It is written COMPLETE to a private file, then hard-linked into place
+ *   (`link` fails with EEXIST when it is taken), so nobody reads it half
+ *   written. Where the filesystem has no hard links, an O_EXCL create is used.
+ * - Ownership is the lock file's INODE (a hard link shares ours): a lock is
+ *   released only while it is still ours, and a broken lock that turns out to
+ *   be a different file than the one judged dead is put back.
  * - Only EEXIST means "someone else holds it" and is waited on; any other
- *   error (a read-only or locked cache folder) skips the lock at once.
- * - A lock is broken only when its writer is dead (or it is LOCK_STALE_MS
- *   old). It is renamed away first, then checked: if the file renamed is not
- *   the one judged dead (someone took the lock in between), it is put back.
- * - A lock is released only when it is still OURS (its token).
- * - The index is a cache: after LOCK_WAIT_MS the write goes ahead unlocked,
- *   and `fn` is told so.
+ *   error (a read-only cache folder) skips the lock at once.
+ * - A lock is broken when its writer is dead, when it names no pid and is
+ *   LOCK_NO_PID_MS old, or when it is LOCK_STALE_MS old.
+ * - After LOCK_WAIT_MS the write goes ahead unlocked, and `fn` is told so.
+ * - Not covered (no compare-and-rename on a filesystem): a third process
+ *   taking the lock in the instant it is put back or released, and a cache
+ *   folder shared by several MACHINES (pids are per machine).
  */
 export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) => Promise<T>): Promise<T> {
-  const token = `${process.pid}:${Date.now().toString(36)}${(lockSeq++).toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-  const mine = `${lockPath}.${process.pid}.${lockSeq}.tmp`;
+  const pid = String(process.pid);
+  const mine = `${lockPath}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}.tmp`;
   let held = false;
+  let myIno: number | undefined;
   try {
-    await writeFile(mine, token, { flag: "wx" });
+    await writeFile(mine, pid, { flag: "wx" });
+    myIno = (await stat(mine)).ino;
   } catch {
+    await unlink(mine).catch(() => undefined);
     return fn(false); // the folder cannot be written: no lock to be had
   }
+  let hardLinks = true;
+  /** true = taken, false = someone holds it, undefined = cannot lock here. */
+  const take = async (): Promise<boolean | undefined> => {
+    if (hardLinks) {
+      try {
+        await link(mine, lockPath);
+        return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code ?? "";
+        if (code === "EEXIST") return false;
+        if (!NO_HARD_LINKS.has(code)) return undefined;
+        hardLinks = false;
+      }
+    }
+    try {
+      await writeFile(lockPath, pid, { flag: "wx" });
+      myIno = (await stat(lockPath)).ino;
+      return true;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === "EEXIST" ? false : undefined;
+    }
+  };
   try {
     const deadline = Date.now() + LOCK_WAIT_MS;
     while (Date.now() < deadline) {
-      try {
-        await link(mine, lockPath);
+      const got = await take();
+      if (got) {
         held = true;
         break;
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") break;
       }
+      if (got === undefined) break;
       let owner: string;
-      let mtime: number;
+      let seen: { ino: number; mtimeMs: number };
       try {
         const [st, content] = await Promise.all([stat(lockPath), readFile(lockPath, "utf8")]);
         owner = content;
-        mtime = st.mtimeMs;
+        seen = st;
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; // released between the calls
         break; // unreadable: do not spin on it
       }
-      const pid = lockOwner(owner);
-      const dead = pid !== null && !alive(pid);
-      if (dead || Date.now() - mtime > LOCK_STALE_MS) {
-        const grave = `${lockPath}.${process.pid}.${Date.now()}.${lockSeq++}.stale`;
+      const ownerPid = lockOwner(owner);
+      const age = Date.now() - seen.mtimeMs;
+      const breakable = (ownerPid !== null && !alive(ownerPid)) || (ownerPid === null && age > LOCK_NO_PID_MS) || age > LOCK_STALE_MS;
+      if (breakable) {
+        const grave = `${lockPath}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}.stale`;
         const moved = await rename(lockPath, grave).then(() => true, () => false);
         if (moved) {
-          const got = await readFile(grave, "utf8").catch(() => null);
-          // Someone took the lock between our read and our rename: give it back.
-          if (got !== null && got !== owner) await link(grave, lockPath).catch(() => undefined);
+          const ino = await stat(grave).then((g) => g.ino, () => seen.ino);
+          // Someone took the lock between our look and our rename: give it back.
+          if (ino !== seen.ino) await link(grave, lockPath).catch(() => undefined);
           await unlink(grave).catch(() => undefined);
           continue;
         }
@@ -223,8 +256,8 @@ export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) =>
     return await fn(held);
   } finally {
     if (held) {
-      const still = await readFile(lockPath, "utf8").catch(() => null);
-      if (still === token) await unlink(lockPath).catch(() => undefined);
+      const ino = await stat(lockPath).then((st) => st.ino, () => undefined);
+      if (ino !== undefined && ino === myIno) await unlink(lockPath).catch(() => undefined);
     }
   }
 }

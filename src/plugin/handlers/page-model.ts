@@ -92,7 +92,8 @@ function collect(
     // page that LOOKS compared but has a diagram in it that no check ever saw,
     // which is worse than admitting the gap. One redraw fixes it.
     if (!mark.kind) {
-      if (child.type === "FRAME" && isDiagramFrameName(child.name)) {
+      // A FigJam section whose marker cannot be read is ours too: listed.
+      if ((child.type === "FRAME" && isDiagramFrameName(child.name)) || (child.type === "SECTION" && mark.native === "figjam")) {
         into.push({
           nodeId: child.id,
           name: child.name,

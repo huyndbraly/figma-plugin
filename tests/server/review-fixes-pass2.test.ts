@@ -360,11 +360,14 @@ describe("third pass: rest-hub", () => {
       // The first timer fires at the longest wait a timer allows — before retryAt.
       now = 2_147_483_000;
       await vi.advanceTimersByTimeAsync(2_147_483_000);
-      expect(h.getStatus().state).toBe("rate_limited"); // held…
-      expect(vi.getTimerCount()).toBeGreaterThan(0); // …and the next step is scheduled
-      // The second step reaches retryAt: the limit is lifted.
+      expect(h.getStatus()).toMatchObject({ state: "rate_limited", retryAt }); // held, same deadline
+      // The next step is due exactly at retryAt: one ms before, still held…
+      now = retryAt - 1;
+      await vi.advanceTimersByTimeAsync(retryAt - 1 - 2_147_483_000);
+      expect(h.getStatus().state).toBe("rate_limited");
+      // …and at retryAt the limit is lifted (by THE aging timer: nothing else is due then).
       now = retryAt;
-      await vi.advanceTimersByTimeAsync(retryAt - 2_147_483_000);
+      await vi.advanceTimersByTimeAsync(1);
       expect(h.getStatus().state).not.toBe("rate_limited");
     } finally {
       vi.useRealTimers();
