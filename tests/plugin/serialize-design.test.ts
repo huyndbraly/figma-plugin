@@ -227,3 +227,22 @@ describe("design-detail typography compaction", () => {
     });
   });
 });
+
+describe("motion on serialized nodes (review: tested at the serializer, not only motion-util)", () => {
+  const REACTIONS = [
+    { trigger: { type: "ON_CLICK" }, actions: [{ type: "NODE", destinationId: "9:9", navigation: "NAVIGATE", transition: { type: "SMART_ANIMATE", duration: 0.3, easing: { type: "EASE_OUT" } } }] },
+  ];
+  it("full and design detail carry `motion` next to the compact `reactions`", () => {
+    for (const detail of ["full", "design"] as const) {
+      const out = serializeNode(rect({ reactions: REACTIONS }), detail) as any;
+      expect(out.reactions).toEqual(["ON_CLICK → 9:9 NAVIGATE SMART_ANIMATE"]);
+      expect(out.motion[0].actions[0].transition).toMatchObject({ type: "SMART_ANIMATE", duration: 0.3, css: "300ms cubic-bezier(0, 0, 0.58, 1)" });
+    }
+  });
+
+  it("sparse and compact stay lean, and a node with no reactions pays nothing", () => {
+    expect(serializeNode(rect({ reactions: REACTIONS }), "sparse")).not.toHaveProperty("motion");
+    expect(serializeNode(rect({ reactions: REACTIONS }), "compact")).not.toHaveProperty("motion");
+    expect(serializeNode(rect({ reactions: [] }), "design")).not.toHaveProperty("motion");
+  });
+});

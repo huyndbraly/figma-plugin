@@ -60,7 +60,7 @@ import { domToFigma } from "../shared/html-to-figma.js";
 import { generateImage, generateSvg, loadByokConfig, type AiFetch, type ByokConfig } from "./byok.js";
 import { mapToCodeConnect, parseCodeConnect, codeConnectToMap, type ParsedCodeConnect } from "../shared/code-connect.js";
 import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve, relative, isAbsolute } from "node:path";
 import {
   resolveDir,
   restRenderer,
@@ -1204,16 +1204,19 @@ function buildFigmaProxy(
       source = n > 0 ? "plugin" : "rest";
     }
     if (source === "rest") {
-      // The plugin panel's token (RAM, leader) else FIGMA_TOKEN — restHub.
-      const token = deps.figmaToken ?? restHub.token();
-      if (link && linkFileMatches === false && !token) {
+      // The plugin panel's token (RAM, leader) else FIGMA_TOKEN. On a follower
+      // the token is the LEADER's: restHub.fetch forwards there, so ask the hub
+      // whether one is reachable rather than reading this process's own.
+      const hasToken = deps.figmaToken !== undefined ? !!deps.figmaToken : await restHub.available();
+      const token = deps.figmaToken ?? restHub.token() ?? "";
+      if (link && linkFileMatches === false && !hasToken) {
         throw new OpError(
           ErrorCode.NOT_CONNECTED,
           "The file in this link is not the one this call is working in, and the REST fallback is not set up.",
           "Pass file: \"<that file's name>\" to figma_write (with the file open and the plugin running), or set FIGMA_TOKEN on the MCP server.",
         );
       }
-      if (!o.fileKey || !token) {
+      if (!o.fileKey || !hasToken) {
         throw new OpError(
           ErrorCode.NOT_CONNECTED,
           "No Figma window is connected, and the REST fallback is not set up.",
@@ -1314,8 +1317,14 @@ function buildFigmaProxy(
   // { url | fileKey }, else the file this call's window has open.
   const restFetchFn: RestFetch = deps.restFetch ?? restHub.fetch;
   const restFileKey = async (o: Record<string, unknown>): Promise<{ fileKey: string; nodeId?: string }> => {
-    const link = parseFigmaLink(o.url ?? o.link);
+    const raw = o.url ?? o.link;
+    const link = parseFigmaLink(raw);
     if (link) return { fileKey: link.fileKey, ...(link.nodeId ? { nodeId: link.nodeId } : {}) };
+    // A link that does not parse must not fall through to "the open file":
+    // postComment would then write to a file nobody named.
+    if (raw !== undefined && raw !== null && raw !== "") {
+      throw new OpError(ErrorCode.INVALID_PARAMS, "`url` is not a Figma link.", "Pass the full link, e.g. https://www.figma.com/design/<fileKey>/<name> — or { fileKey }.");
+    }
     if (typeof o.fileKey === "string" && o.fileKey) return { fileKey: o.fileKey };
     const info = (await call("get_document_info", {})) as { fileKey?: string | null };
     if (info?.fileKey) return { fileKey: info.fileKey };
@@ -1331,7 +1340,7 @@ function buildFigmaProxy(
     const o = isObj(opts) ? opts : {};
     await requireRestToken();
     const { fileKey, nodeId } = await restFileKey(o);
-    return getComments(new RestClient("", restFetchFn), fileKey, { ...o, ...(nodeId && o.nodeId === undefined ? { nodeId } : {}) }, deps.signal);
+    return getComments(new RestClient("", restFetchFn), fileKey, o, deps.signal, nodeId);
   };
   proxy["getVersions"] = async (opts?: Record<string, unknown>) => {
     const o = isObj(opts) ? opts : {};
@@ -1360,6 +1369,7 @@ function buildFigmaProxy(
       ...(typeof o.height === "number" ? { height: o.height } : {}),
       ...(typeof o.selector === "string" ? { selector: o.selector } : {}),
       ...(typeof o.waitMs === "number" ? { waitMs: o.waitMs } : {}),
+      ...(typeof o.timeoutMs === "number" ? { timeoutMs: o.timeoutMs } : {}),
     }, deps.playwrightLoader);
     const built = domToFigma(tree, {
       name: typeof o.name === "string" ? o.name : String(url),
@@ -1372,6 +1382,7 @@ function buildFigmaProxy(
       ...(typeof o.x === "number" ? { x: o.x } : {}),
       ...(typeof o.y === "number" ? { y: o.y } : {}),
     })) as Record<string, unknown>;
+    for (const w of built.warnings.map((x) => `htmlToFigma: ${x}`)) if (!warnings.includes(w)) warnings.push(w);
     if (built.dropped) {
       const w = `htmlToFigma: ${built.dropped} small element(s) were left out to stay within maxNodes; raise maxNodes or pass a selector for one part of the page.`;
       if (!warnings.includes(w)) warnings.push(w);
@@ -1423,7 +1434,7 @@ function buildFigmaProxy(
     const idByName: Record<string, string> = {};
     // A set wins over a same-named variant: Code Connect points at the set.
     for (const c of comps) if (!idByName[c.name] || c.type === "COMPONENT_SET") idByName[c.name] = c.id;
-    const { files, missing } = mapToCodeConnect(map, idByName, {
+    const { files, missing, invalid } = mapToCodeConnect(map, idByName, {
       fileKey,
       ...(typeof o.importFrom === "string" ? { importFrom: o.importFrom } : {}),
       ...(isObj(o.importPaths) ? { importPaths: o.importPaths as Record<string, string> } : {}),
@@ -1432,7 +1443,11 @@ function buildFigmaProxy(
     const written: string[] = [];
     const skipped: string[] = [];
     for (const f of files) {
-      const path = join(dir, f.fileName);
+      const path = resolve(dir, f.fileName);
+      // Names are identifiers by now — belt and braces: never write outside `dir`.
+      if (relative(dir, path).startsWith("..") || isAbsolute(relative(dir, path))) {
+        throw new OpError(ErrorCode.INVALID_PARAMS, `Refusing to write "${f.fileName}" outside ${dir}.`, "Component names must be plain identifiers.");
+      }
       try {
         await writeFile(path, f.source, { encoding: "utf8", flag: o.overwrite === true ? "w" : "wx" });
         written.push(path);
@@ -1445,7 +1460,11 @@ function buildFigmaProxy(
       const w = `exportCodeConnect: ${skipped.length} file(s) already existed and were kept — pass overwrite: true to replace them.`;
       if (!warnings.includes(w)) warnings.push(w);
     }
-    return { written, skipped, missing, fileKey };
+    if (invalid.length) {
+      const w = `exportCodeConnect: ${invalid.length} map key(s) are not code identifiers and were skipped: ${invalid.slice(0, 5).map((x) => JSON.stringify(x)).join(", ")}.`;
+      if (!warnings.includes(w)) warnings.push(w);
+    }
+    return { written, skipped, missing, invalid, fileKey };
   };
   proxy["readCodeConnect"] = async (opts?: Record<string, unknown>) => {
     const o = isObj(opts) ? opts : {};
@@ -1469,12 +1488,22 @@ function buildFigmaProxy(
       const r = (await call("get_nodes", { nodeIds: ids, detail: "sparse" })) as { nodes?: Array<{ id: string; name?: string; missing?: boolean }> };
       for (const n of r.nodes ?? []) if (!n.missing && n.name) names[n.id] = n.name;
     }
-    const { map, unresolved } = codeConnectToMap(connections, names);
-    if (o.use === true) {
+    const { map, unresolved, conflicts } = codeConnectToMap(connections, names);
+    for (const c of conflicts) {
+      const w = `readCodeConnect: ${c}`;
+      if (!warnings.includes(w)) warnings.push(w);
+    }
+    // An empty result (no files, nothing resolved) must not wipe a map the
+    // session already uses.
+    const usable = Object.keys(map.components).length > 0;
+    if (o.use === true && usable) {
       session.state.componentMap = map;
       stateOverlay.set("componentMap", map);
+    } else if (o.use === true) {
+      const w = "readCodeConnect: nothing usable was found, so the session's component map was left as it was.";
+      if (!warnings.includes(w)) warnings.push(w);
     }
-    return { files: sources.length, connections: connections.length, map, unresolved, skipped: skippedNotes };
+    return { files: sources.length, connections: connections.length, map, unresolved, ...(conflicts.length ? { conflicts } : {}), skipped: skippedNotes };
   };
 
   // Official-plugin-API muscle memory → the sandbox equivalent. Each entry is

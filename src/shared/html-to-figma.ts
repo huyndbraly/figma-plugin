@@ -47,6 +47,7 @@ export interface CapturedStyle {
   opacity?: string;
   boxShadow?: string;
   overflow?: string;
+  position?: string;
 }
 
 export interface CapturedNode {
@@ -119,7 +120,7 @@ export function fontFamily(stack: string | undefined, fallback = "Inter"): strin
 
 export function fontStyle(weight: string | undefined, italic?: string): string {
   const w = Math.round(px(weight) / 100) * 100 || 400;
-  const name = w >= 900 ? "Black" : w >= 800 ? "Extra Bold" : w >= 700 ? "Bold" : w >= 600 ? "Semi Bold" : w >= 500 ? "Medium" : w <= 200 ? "Light" : w <= 300 ? "Light" : "Regular";
+  const name = w >= 900 ? "Black" : w >= 800 ? "Extra Bold" : w >= 700 ? "Bold" : w >= 600 ? "Semi Bold" : w >= 500 ? "Medium" : w <= 100 ? "Thin" : w <= 200 ? "Extra Light" : w <= 300 ? "Light" : "Regular";
   return italic === "italic" ? (name === "Regular" ? "Italic" : `${name} Italic`) : name;
 }
 
@@ -238,10 +239,25 @@ export function pruneToBudget(root: CapturedNode, max: number): { root: Captured
   return { root: clone, dropped };
 }
 
-function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, parentAuto: boolean, opts: HtmlToFigmaOptions): Spec | null {
+/** What the conversion could not keep, said once each in the result. */
+interface Notes {
+  positioned: number;
+  unparsedColors: Set<string>;
+}
+
+const isPositioned = (c: CapturedNode) => c.style.position === "absolute" || c.style.position === "fixed";
+
+function noteColor(notes: Notes, v: string | undefined): void {
+  if (v && !cssColor(v) && !/^(transparent|none|rgba?\(\s*0,\s*0,\s*0,\s*0\s*\))$/i.test(v.trim())) notes.unparsedColors.add(v.trim().slice(0, 40));
+}
+
+function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, parentAuto: boolean, opts: HtmlToFigmaOptions, notes: Notes): Spec | null {
   if (n.rect.w < 0.5 || n.rect.h < 0.5) return null;
   const rel = parentRect ? { x: r1(n.rect.x - parentRect.x), y: r1(n.rect.y - parentRect.y) } : {};
-  if (n.tag === "#text") return { ...textSpec(n, opts), ...(parentAuto ? {} : rel) };
+  if (n.tag === "#text") {
+    noteColor(notes, n.style.color);
+    return { ...textSpec(n, opts), ...(parentAuto ? {} : rel) };
+  }
   if (MEDIA.has(n.tag)) {
     const label = n.alt || (n.src ? n.src.split("/").pop()?.split("?")[0] : "") || n.tag;
     const spec: Spec = { type: "RECTANGLE", name: `${n.tag}: ${label}`.slice(0, 80), w: r1(n.rect.w), h: r1(n.rect.h), fill: "#e5e7eb", ...(parentAuto ? {} : rel) };
@@ -250,14 +266,24 @@ function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, paren
     return spec;
   }
   const st = n.style;
-  const kids = (n.children ?? []).filter((c) => c.rect.w >= 0.5 && c.rect.h >= 0.5);
+  noteColor(notes, st.backgroundColor);
+  let kids = (n.children ?? []).filter((c) => c.rect.w >= 0.5 && c.rect.h >= 0.5);
   const spec: Spec = { type: "FRAME", name: nameOf(n), w: r1(n.rect.w), h: r1(n.rect.h), ...(parentAuto ? {} : rel) };
   decorate(spec, st);
-  const flex = /flex/.test(st.display ?? "");
+  // Auto-layout cannot hold a child that CSS takes out of the flow
+  // (position: absolute/fixed — badges, overlays). Such a container keeps
+  // absolute positions, so nothing moves.
+  const positioned = kids.filter(isPositioned).length;
+  if (positioned) notes.positioned += positioned;
+  const flex = /flex/.test(st.display ?? "") && !positioned;
   const pad = { top: px(st.paddingTop), right: px(st.paddingRight), bottom: px(st.paddingBottom), left: px(st.paddingLeft) };
   let auto = false;
   if (flex) {
     const row = !/column/.test(st.flexDirection ?? "row");
+    // *-reverse lays the DOM order out backwards; auto-layout follows child
+    // order — so reorder by POSITION (left→right / top→bottom), which also
+    // keeps the measured gap below positive.
+    if (/reverse/.test(st.flexDirection ?? "")) kids = [...kids].sort((a, b) => (row ? a.rect.x - b.rect.x : a.rect.y - b.rect.y));
     spec.layoutMode = row ? "HORIZONTAL" : "VERTICAL";
     const gap = px(row ? st.columnGap ?? st.gap : st.rowGap ?? st.gap);
     spec.itemSpacing = gap > 0 ? r1(gap) : gapBetween(kids, row ? "x" : "y");
@@ -267,7 +293,7 @@ function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, paren
     if (ca && ca !== "BASELINE") spec.counterAxisAlignItems = ca;
     if (/wrap/.test(st.flexWrap ?? "") && row) spec.layoutWrap = "WRAP";
     auto = true;
-  } else if (kids.length > 1 && stacksVertically(kids)) {
+  } else if (!positioned && kids.length > 1 && stacksVertically(kids)) {
     spec.layoutMode = "VERTICAL";
     spec.itemSpacing = gapBetween(kids, "y");
     auto = true;
@@ -278,17 +304,27 @@ function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, paren
     spec.primaryAxisSizingMode = "FIXED";
     spec.counterAxisSizingMode = "FIXED";
   }
-  const children = kids.map((c) => convert(c, n.rect, auto, opts)).filter((c): c is Spec => !!c);
+  const children = kids.map((c) => convert(c, n.rect, auto, opts, notes)).filter((c): c is Spec => !!c);
   if (children.length) spec.children = children;
   return spec;
 }
 
 /** The whole capture → one root FRAME spec (absolute page coordinates dropped). */
-export function domToFigma(root: CapturedNode, opts: HtmlToFigmaOptions = {}): { spec: Spec; nodes: number; dropped: number } {
+export function domToFigma(root: CapturedNode, opts: HtmlToFigmaOptions = {}): { spec: Spec; nodes: number; dropped: number; warnings: string[] } {
   const max = opts.maxNodes && opts.maxNodes > 0 ? Math.floor(opts.maxNodes) : 600;
   const { root: pruned, dropped } = pruneToBudget(root, max);
-  const spec = convert(pruned, null, false, opts) ?? { type: "FRAME", w: 1, h: 1 };
+  const notes: Notes = { positioned: 0, unparsedColors: new Set() };
+  const warnings: string[] = [];
+  let spec = convert(pruned, null, false, opts, notes);
+  if (!spec) {
+    // A body of height 0 (everything in it absolutely positioned) or a
+    // selector that matched an empty element: say so instead of a blank frame.
+    warnings.push(`The captured element has no size (${Math.round(pruned.rect.w)}×${Math.round(pruned.rect.h)}). Pass a selector for the element that holds the content (e.g. "#root", "main").`);
+    spec = { type: "FRAME", w: Math.max(1, pruned.rect.w), h: Math.max(1, pruned.rect.h) };
+  }
   if (opts.name) spec.name = opts.name;
   if (!spec.fill) spec.fill = "#ffffff";
-  return { spec, nodes: countNodes(pruned), dropped };
+  if (notes.positioned) warnings.push(`${notes.positioned} absolutely positioned element(s) kept their place, so their containers use absolute layout instead of auto-layout.`);
+  if (notes.unparsedColors.size) warnings.push(`Colours that could not be read were left out: ${[...notes.unparsedColors].slice(0, 5).join(", ")}.`);
+  return { spec, nodes: countNodes(pruned), dropped, warnings };
 }

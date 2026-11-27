@@ -29,6 +29,13 @@ export async function getDiagramSpec(ctx: HandlerContext): Promise<unknown> {
       "Only frames drawn by figma_diagram carry their model. Pass the frameId it returned.",
     );
   }
+  if (mark.source === undefined && mark.native === "figjam") {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `"${node.name}" is a FigJam section drawn before the model was stored on it.`,
+      "Redraw it once with figma_diagram and the full spec (no update) — the new section carries its model, and can be patched from then on.",
+    );
+  }
   if (mark.source === undefined) {
     throw err(
       ErrorCode.INVALID_PARAMS,
@@ -36,5 +43,5 @@ export async function getDiagramSpec(ctx: HandlerContext): Promise<unknown> {
       "Redraw it once with the current version (figma_diagram with the full spec) and the frame will carry its model from then on.",
     );
   }
-  return { nodeId: node.id, kind: mark.kind, title: mark.title, spec: mark.source };
+  return { nodeId: node.id, kind: mark.kind, title: mark.title, spec: mark.source, ...(mark.native ? { native: mark.native } : {}) };
 }

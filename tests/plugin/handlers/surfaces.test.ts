@@ -16,6 +16,11 @@ let made: any[];
 function base(type: string): any {
   const n: any = { id: `${++seq}:1`, type, name: "", x: 0, y: 0, width: 100, height: 100, fills: [], children: [], data: {} as Record<string, string> };
   n.setPluginData = (k: string, v: string) => (n.data[k] = v);
+  n.getPluginData = (k: string) => n.data[k] ?? "";
+  n.remove = () => {
+    n.removed = true;
+    if (n.parent) n.parent.children.splice(n.parent.children.indexOf(n), 1);
+  };
   n.appendChild = (c: any) => {
     n.children.push(c);
     c.parent = n;
@@ -36,6 +41,7 @@ function install(editorType: string): void {
     mixed: Symbol("mixed"),
     viewport: { center: { x: 500, y: 400 }, slidesView: "grid" },
     loadFontAsync: vi.fn(async () => {}),
+    getNodeByIdAsync: async (id: string) => made.find((n) => n.id === id) ?? null,
     createSection: () => base("SECTION"),
     createShapeWithText: () => base("SHAPE_WITH_TEXT"),
     createSticky: () => base("STICKY"),
@@ -127,5 +133,104 @@ describe("Slides", () => {
   it("refuses outside Slides", async () => {
     install("figjam");
     await expect(getSlides(ctx({}))).rejects.toMatchObject({ code: "UNSUPPORTED_OPERATION" });
+  });
+});
+
+
+describe("create_figjam_diagram: the section remembers its model (review D2)", () => {
+  it("stores { kind, title, source, native } on the section", async () => {
+    const out = (await createFigjamDiagram(ctx({ ...DIAGRAM, source: { title: "Checkout", nodes: [] } }))) as any;
+    const section = made.find((n) => n.id === out.sectionId);
+    expect(JSON.parse(section.data["figma-plugin.figjam"])).toEqual({ kind: "userflow", title: "Checkout", source: { title: "Checkout", nodes: [] }, native: "figjam" });
+  });
+
+  it("intoSectionId redraws in place: same section, old shapes gone", async () => {
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    section.x = 777; // the user moved it
+    const oldIds = section.children.map((c: any) => c.id);
+    const again = (await createFigjamDiagram(ctx({ ...DIAGRAM, title: "Checkout v2", intoSectionId: section.id }))) as any;
+    expect(again).toMatchObject({ sectionId: section.id, redrawn: true });
+    expect(section.x).toBe(777);
+    expect(section.name).toBe("Checkout v2");
+    expect(section.children.some((c: any) => oldIds.includes(c.id))).toBe(false);
+    expect(made.filter((n) => n.type === "SECTION")).toHaveLength(1);
+  });
+
+  it("refuses to redraw into something that is not a FigJam diagram section", async () => {
+    const plain = (globalThis as any).figma.createSection();
+    await expect(createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: plain.id }))).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  });
+
+  it("a failure part-way removes the section it created — no half-drawn diagram", async () => {
+    (globalThis as any).figma.loadFontAsync = vi.fn(async () => {
+      throw new Error("font missing");
+    });
+    await expect(createFigjamDiagram(ctx(DIAGRAM))).rejects.toThrow(/font missing/);
+    expect(made.find((n) => n.type === "SECTION").removed).toBe(true);
+  });
+});
+
+describe("createSlide col without row (review)", () => {
+  it("puts it in row 0 and says so", async () => {
+    install("slides");
+    const c = ctx({ col: 2 });
+    await createSlide(c);
+    expect((globalThis as any).figma.createSlide).toHaveBeenCalledWith(0, 2);
+    expect(c.warnings[0]).toMatch(/row 0/);
+  });
+});
+
+describe("a FigJam section reads back like a diagram frame (review D2)", () => {
+  it("readDiagramSource / get_diagram_spec see kind, model and native:figjam", async () => {
+    const { readDiagramSource } = await import("../../../src/plugin/diagram-apply.js");
+    const out = (await createFigjamDiagram(ctx({ ...DIAGRAM, source: { title: "Checkout", nodes: [{ id: "cart" }] } }))) as any;
+    const section = made.find((n) => n.id === out.sectionId);
+    expect(readDiagramSource(section)).toEqual({ kind: "userflow", title: "Checkout", source: { title: "Checkout", nodes: [{ id: "cart" }] }, native: "figjam" });
+  });
+});
+
+describe("redraw into a section, second pass (review)", () => {
+  it("a failed redraw keeps the PREVIOUS drawing, its name and its stored model", async () => {
+    const first = (await createFigjamDiagram(ctx({ ...DIAGRAM, source: { v: 1 } }))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    const before = section.children.map((c: any) => c.id);
+    const marker = section.data["figma-plugin.figjam"];
+    let calls = 0;
+    (globalThis as any).figma.loadFontAsync = vi.fn(async () => {
+      if (++calls > 1) throw new Error("font missing");
+    });
+    await expect(createFigjamDiagram(ctx({ ...DIAGRAM, title: "v2", source: { v: 2 }, intoSectionId: section.id }))).rejects.toThrow(/font missing/);
+    expect(section.children.map((c: any) => c.id)).toEqual(before);
+    expect(section.name).toBe("Checkout");
+    expect(section.data["figma-plugin.figjam"]).toBe(marker);
+  });
+
+  it("a redraw keeps what the USER added inside the section", async () => {
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    const note = base("STICKY");
+    section.appendChild(note); // the user's own sticky: no figjam-id
+    await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: section.id }));
+    expect(section.children).toContain(note);
+    expect(section.children.filter((c: any) => c.data["figjam-id"] === "cart")).toHaveLength(1); // old copy gone
+  });
+
+  it("a section from the first FigJam build (legacy key) reads back as FigJam with no model", async () => {
+    const { readDiagramSource } = await import("../../../src/plugin/diagram-apply.js");
+    const old = (globalThis as any).figma.createSection();
+    old.setPluginData("figjam-diagram", JSON.stringify({ kind: "userflow", title: "Old" }));
+    expect(readDiagramSource(old)).toEqual({ kind: "userflow", title: "Old", native: "figjam" });
+  });
+
+  it("the draw hands back the page's diagrams (sections included) for the cross-check", async () => {
+    const page = { type: "PAGE", children: [] as any[], findAllWithCriteria: ({ types }: { types: string[] }) => made.filter((n) => types.includes(n.type) && (n.data["figma-plugin.figjam"] || n.data["figjam-diagram"])) };
+    const first = (await createFigjamDiagram(ctx({ ...DIAGRAM, source: { title: "A" } }))) as any;
+    made.find((n) => n.id === first.sectionId).parent = page;
+    const second = (globalThis as any).figma.createSection();
+    second.parent = page;
+    second.setPluginData("figma-plugin.figjam", JSON.stringify({ kind: "state", title: "Order", source: { title: "Order" }, native: "figjam" }));
+    const out = (await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: first.sectionId, source: { title: "A2" } }))) as any;
+    expect(out.pageModel.map((d: any) => d.kind).sort()).toEqual(["state", "userflow"]);
   });
 });

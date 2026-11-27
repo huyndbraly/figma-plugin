@@ -397,7 +397,13 @@
   var replacedByPeer = false;      // this window's channel was taken elsewhere
   var restToken = null;            // PAT from clientStorage (main thread); sent to the server, never shown
   var restExpiresAt = null;        // epoch ms the user said it expires (Figma cannot be asked)
+  var restSavedAt = null;          // when this token / Clear was saved; the server keeps the newest
   var restStatus = null;           // latest rest_status from the server
+  var pendingStatus = null;        // the badge before a Save, restored if the Save is refused
+  var restAnswerTimer = null;      // armed when the token is sent; any rest_status disarms it
+  var assignedSock = null;         // the socket that received `assigned` — only it may carry the token
+  var langChosen = false;          // the user clicked a language; a late stored value must not undo it
+  var REST_ANSWER_MS = 12000;
 
   // ---- DOM ----
   var el = {
@@ -471,6 +477,7 @@
       tokenTitle: "Figma personal access token. Stored on this machine only (figma.clientStorage); the MCP server keeps it in memory and uses it for links to files that are not open, comments and version history.",
       tokenInputTitle: "Paste your Figma Personal Access Token (figd_…). Stored locally in figma.clientStorage, never in the Figma file.",
       tokenPasteFirst: "paste a figd_… token first",
+      tokenRejected: "Not a token — nothing was changed",
       tokenExpiryTitle: "Expiration you picked when creating the token in Figma. Figma's API cannot report it, so the panel counts down from here.",
       expUnknown: "Exp: ?", exp1: "1 day", exp7: "7 days", exp30: "30 days", exp90: "90 days",
       tokenSave: "Save",
@@ -512,6 +519,8 @@
       expiredInvalid: "Expired / Invalid",
       rateLimited: "Rate-limited (429)",
       checkFailed: "Check failed",
+      noAnswer: "No answer from server",
+      noAnswerTitle: "The MCP server did not answer the token within 12 s. It is most likely an older build that does not know REST tokens: restart the MCP server (reconnect it in your editor, or start a new session), then click Save again.",
       retryIn: "retry in ",
       expired: "expired",
       leftSuffix: " left",
@@ -545,6 +554,7 @@
       tokenTitle: "Personal Access Token của Figma. Chỉ lưu trên máy này (figma.clientStorage); MCP server giữ trong RAM để đọc link file chưa mở, comments và lịch sử phiên bản.",
       tokenInputTitle: "Dán Figma Personal Access Token (figd_…). Lưu cục bộ trong figma.clientStorage, không lưu vào file Figma.",
       tokenPasteFirst: "hãy dán token figd_… trước",
+      tokenRejected: "Không phải token — không thay đổi gì",
       tokenExpiryTitle: "Thời hạn bạn đã chọn khi tạo token trên Figma. API Figma không trả về hạn dùng nên bảng sẽ tự đếm ngược từ mốc này.",
       expUnknown: "Hạn: ?", exp1: "1 ngày", exp7: "7 ngày", exp30: "30 ngày", exp90: "90 ngày",
       tokenSave: "Lưu",
@@ -586,6 +596,8 @@
       expiredInvalid: "Hết hạn / Không hợp lệ",
       rateLimited: "Quá giới hạn (429)",
       checkFailed: "Kiểm tra thất bại",
+      noAnswer: "Server không phản hồi",
+      noAnswerTitle: "MCP server không phản hồi token trong 12 giây. Nhiều khả năng đó là bản build cũ chưa hỗ trợ REST token: hãy khởi động lại MCP server (kết nối lại trong editor, hoặc mở session mới), rồi bấm Lưu lại.",
       retryIn: "thử lại sau ",
       expired: "hết hạn",
       leftSuffix: " còn lại",
@@ -601,19 +613,17 @@
     }
   };
 
+  // English until the main thread says what was saved (clientStorage — the
+  // plugin iframe's localStorage does not survive in Figma).
   var lang = "en";
-  try {
-    var savedLang = typeof localStorage !== "undefined" && localStorage.getItem("figma_mcp_ui_lang");
-    if (savedLang === "vi" || savedLang === "en") lang = savedLang;
-  } catch (e) {}
 
   function t(key) {
     return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
   }
 
-  function applyLang(next) {
+  function applyLang(next, fromStorage) {
     if (next === "vi" || next === "en") lang = next;
-    try { if (typeof localStorage !== "undefined") localStorage.setItem("figma_mcp_ui_lang", lang); } catch (e) {}
+    if (!fromStorage && (next === "vi" || next === "en")) toMain({ kind: "save-ui-lang", lang: lang });
     if (el.langEn) el.langEn.className = "lang-btn" + (lang === "en" ? " active" : "");
     if (el.langVi) el.langVi.className = "lang-btn" + (lang === "vi" ? " active" : "");
 
@@ -674,22 +684,23 @@
       case "checking": return { cls: "warn", text: t("checking") };
       case "unverified": return { cls: "warn", text: t("unverified") + env };
       case "valid": {
+        var lacking = !!(st.missingScopes && st.missingScopes.length);
         var exp = st.expiresAt || restExpiresAt;
         if (exp) {
           var left = exp - Date.now();
           // Figma has not refused it yet, but the date the user gave has passed.
           if (left <= 0) return { cls: "bad", text: t("expiredDate") + env };
           var name = st.handle ? t("valid") + " (@" + st.handle + ")" : t("valid");
-          return { cls: left < 86400000 ? "warn" : "ok", text: name + " · " + humanLeft(left) + env };
+          return { cls: left < 86400000 || lacking ? "warn" : "ok", text: name + " · " + humanLeft(left) + env };
         }
-        return { cls: st.missingScopes && st.missingScopes.length ? "warn" : "ok", text: (st.handle ? t("valid") + " (@" + st.handle + ")" : t("valid")) + env };
+        return { cls: lacking ? "warn" : "ok", text: (st.handle ? t("valid") + " (@" + st.handle + ")" : t("valid")) + env };
       }
       case "invalid": return { cls: "bad", text: t("expiredInvalid") + " (" + (st.httpStatus || "401/403") + ")" + env };
       case "rate_limited": {
         var wait = st.retryAt ? st.retryAt - Date.now() : 0;
         return { cls: "warn", text: t("rateLimited") + (wait > 0 ? " · " + t("retryIn") + humanLeft(wait).replace(t("leftSuffix"), "") : "") + env };
       }
-      case "error": return { cls: "bad", text: t("checkFailed") + env };
+      case "error": return { cls: "bad", text: (st.noAnswer ? t("noAnswer") : t("checkFailed")) + env };
       default: return { cls: "", text: String(st.state) };
     }
   }
@@ -699,7 +710,8 @@
     el.tokenBadge.className = "token-badge" + (b.cls ? " " + b.cls : "");
     el.tokenBadge.textContent = b.text;
     var title = restStatus && restStatus.masked ? t("tokenPrefix") + restStatus.masked : t("noToken");
-    if (restStatus && restStatus.message) title += " — " + restStatus.message;
+    if (restStatus && restStatus.noAnswer) title += " — " + t("noAnswerTitle");
+    else if (restStatus && restStatus.message) title += " — " + restStatus.message;
     if (restStatus && restStatus.missingScopes && restStatus.missingScopes.length) title += "\n" + t("missingScopes") + restStatus.missingScopes.join(", ");
     if (restStatus && restStatus.scopes && restStatus.scopes.length) title += "\n" + t("scopes") + restStatus.scopes.join(", ");
     var expAt = (restStatus && restStatus.expiresAt) || restExpiresAt;
@@ -707,9 +719,26 @@
     el.tokenBadge.title = title;
   }
 
+  // Sent only on a socket that has received `assigned` — not in the hello, and
+  // not on a fresh socket whose handshake is still running (the `channel`
+  // variable outlives sockets, so it cannot say that). Sent again after every
+  // reconnect, so a Clear made while offline still reaches the server.
+  // Nothing saved from this plugin (no token, no dated Clear) → nothing to say.
   function sendRestToken() {
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: "set_rest_token", token: restToken, expiresAt: restToken ? restExpiresAt : null }));
+    if (!ws || ws.readyState !== 1 || assignedSock !== ws) return;
+    if (!restToken && !restSavedAt) return;
+    ws.send(JSON.stringify({ type: "set_rest_token", token: restToken, expiresAt: restToken ? restExpiresAt : null, savedAt: restSavedAt }));
+    // A server that never answers (an older build that does not know
+    // set_rest_token) must not leave the badge on "Checking…" forever.
+    clearTimeout(restAnswerTimer);
+    if (restToken) {
+      restAnswerTimer = setTimeout(function () {
+        restAnswerTimer = null;
+        if (!restStatus || restStatus.state === "checking") {
+          restStatus = { state: "error", source: "plugin", noAnswer: true };
+          renderToken();
+        }
+      }, REST_ANSWER_MS);
     }
   }
 
@@ -964,10 +993,6 @@
         // Restore this file's persisted channel (main thread owns storage).
         if (hello.channel && !channel) channel = hello.channel;
         if (hello.resumeToken && !resumeToken) resumeToken = hello.resumeToken;
-        if (typeof hello.restToken === "string" && hello.restToken) {
-          restToken = hello.restToken;
-          restExpiresAt = typeof hello.restTokenExpiresAt === "number" ? hello.restTokenExpiresAt : null;
-        }
         renderMeta();
         // If already connected, (re)send hello so the server has fresh file info.
         if (ws && ws.readyState === 1) sendHello();
@@ -989,18 +1014,31 @@
         break;
       }
       case "rest-token": {
-        // The main thread stored (or refused, or cleared) the PAT.
+        // The main thread stored, cleared or refused the PAT — or, after a
+        // reconnect, says what clientStorage holds right now ("sync").
         if (msg.reason === "rejected") {
-          restStatus = { state: "invalid", source: "plugin", message: msg.error || "Not a token" };
+          // Nothing changed: the token in use (if any) and its badge stay.
+          // The refusal is shown where the user typed.
+          // Keep what was typed: one wrong character should be fixable, not retyped.
+          el.tokenInput.placeholder = msg.error || t("tokenRejected");
+          el.tokenInput.title = msg.error || t("tokenRejected");
+          if (restStatus && restStatus.state === "checking") restStatus = pendingStatus;
           renderToken();
           break;
         }
         restToken = typeof msg.token === "string" && msg.token ? msg.token : null;
         restExpiresAt = restToken && typeof msg.expiresAt === "number" ? msg.expiresAt : null;
-        el.tokenInput.value = "";
-        restStatus = restToken ? { state: "checking", source: "plugin" } : { state: "not_set", source: null };
-        renderToken();
+        restSavedAt = typeof msg.savedAt === "number" ? msg.savedAt : null;
+        if (msg.reason !== "sync") {
+          el.tokenInput.value = "";
+          restStatus = restToken ? { state: "checking", source: "plugin" } : { state: "not_set", source: null };
+          renderToken();
+        }
         sendRestToken();
+        break;
+      }
+      case "ui-lang": {
+        if (!langChosen && (msg.lang === "en" || msg.lang === "vi")) applyLang(msg.lang, true);
         break;
       }
       case "local": {
@@ -1111,10 +1149,14 @@
         // The server confirmed/assigned this window's channel. Persist it so
         // reopening the plugin in this file rejoins the same channel.
         var askedFor = requestedChannel;
+        assignedSock = sock;
         channel = data.channel;
         resumeToken = data.resumeToken || null;
         replacedByPeer = false;
         toMain({ kind: "save-channel", channel: channel, resumeToken: resumeToken });
+        // Joined: now (and only now) the REST token goes over — read fresh
+        // from clientStorage, since another window may have changed it.
+        toMain({ kind: "rest-token-request" });
         renderMeta();
         if (askedFor && askedFor !== channel) {
           // Another window of this file still holds the stored channel (the
@@ -1130,6 +1172,8 @@
         return;
       }
       if (data.type === "rest_status" && data.status) {
+        clearTimeout(restAnswerTimer);
+        restAnswerTimer = null;
         restStatus = data.status;
         renderToken();
         return;
@@ -1146,6 +1190,7 @@
 
     sock.onclose = function (event) {
       if (sock !== ws) return; // a socket we already replaced or dropped
+      if (assignedSock === sock) assignedSock = null;
       clearTimeout(connectTimer);
       stopHeartbeat();
       if (connectedPort != null) {
@@ -1183,6 +1228,7 @@
     var old = ws;
     ws = null;
     connectedPort = null;
+    if (assignedSock === old) assignedSock = null;
     if (!old) return;
     old.onopen = old.onmessage = old.onerror = old.onclose = null;
     try { old.close(); } catch (e) { /* already closing */ }
@@ -1207,11 +1253,8 @@
       pageName: h.pageName || "",
       editorType: h.editorType || "figma",
       channel: channel,
-      resumeToken: resumeToken,
-      // Only a SAVED token travels in the hello; a clear is an explicit
-      // set_rest_token so a window that missed a newer token cannot wipe it.
-      restToken: restToken || undefined,
-      restTokenExpiresAt: restToken && restExpiresAt ? restExpiresAt : undefined
+      resumeToken: resumeToken
+      // No REST token here: it follows `assigned`, in set_rest_token.
     }));
   }
 
@@ -1328,6 +1371,7 @@
       el.tokenInput.placeholder = t("tokenPasteFirst");
       return;
     }
+    pendingStatus = restStatus;
     restStatus = { state: "checking", source: "plugin" };
     renderToken();
     var days = parseInt(el.tokenExpiry.value, 10);
@@ -1341,11 +1385,11 @@
     if (e.key === "Enter") el.tokenSave.onclick();
   };
   renderToken();
-  if (el.langEn) el.langEn.onclick = function () { applyLang("en"); };
-  if (el.langVi) el.langVi.onclick = function () { applyLang("vi"); };
-  applyLang(lang);
+  if (el.langEn) el.langEn.onclick = function () { langChosen = true; applyLang("en"); };
+  if (el.langVi) el.langVi.onclick = function () { langChosen = true; applyLang("vi"); };
+  applyLang(lang, true);
   // The countdown moves on its own.
-  setInterval(function () { if (restStatus && restStatus.state === "valid") renderToken(); }, 60000);
+  setInterval(function () { if (restStatus && (restStatus.state === "valid" || restStatus.state === "rate_limited")) renderToken(); }, 60000);
 
   // Sweep the whole fallback port range immediately instead of waiting on
   // the backoff timer to walk through it one port at a time.

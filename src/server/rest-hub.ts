@@ -226,6 +226,61 @@ export function humanDuration(sec: number): string {
  */
 export const MAX_RETRY_WAIT_S = 20;
 
+/** /v1/me and the scope probe: a hung connection must not leave the badge on "Checking…". */
+export const CHECK_TIMEOUT_MS = 15_000;
+/** Any REST request (renders of big frames can be slow). */
+export const REQUEST_TIMEOUT_MS = 90_000;
+/** At most one /me re-check per this long for plain 403s. */
+export const RECHECK_GAP_MS = 5 * 60_000;
+
+export function timeoutSignal(ms: number): AbortSignal | undefined {
+  return typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(ms) : undefined;
+}
+
+/**
+ * A signal that aborts when ANY of these does. AbortSignal.any exists only
+ * from Node 20.3; on Node 18 (still supported) dropping the timeout would
+ * bring back the hang the timeout exists for, so combine by hand there.
+ */
+export function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const list = signals.filter((x): x is AbortSignal => !!x);
+  if (list.length <= 1) return list[0];
+  const any = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof any === "function") return any(list);
+  const ctl = new AbortController();
+  for (const sig of list) {
+    if (sig.aborted) {
+      ctl.abort(sig.reason);
+      break;
+    }
+    sig.addEventListener("abort", () => ctl.abort(sig.reason), { once: true });
+  }
+  return ctl.signal;
+}
+
+/** The caller's signal AND a timeout. */
+export function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal | undefined {
+  return anySignal([signal, timeoutSignal(ms)]);
+}
+
+/** A 429 that does not say how long: assume this, so the state still ages out. */
+export const DEFAULT_RETRY_AFTER_S = 60;
+
+/** retryAt / tier / type / message for a 429, from its headers. */
+export function rateLimitFields(headers: Headers, now: number): Pick<TokenStatus, "retryAt" | "planTier" | "rateLimitType" | "message"> {
+  const type = headers.get("x-figma-rate-limit-type") ?? undefined;
+  const tier = headers.get("x-figma-plan-tier") ?? undefined;
+  const said = Number(headers.get("retry-after"));
+  const sec = Number.isFinite(said) && said > 0 ? said : DEFAULT_RETRY_AFTER_S;
+  const retryAt = now + sec * 1000;
+  return {
+    retryAt,
+    ...(tier ? { planTier: tier } : {}),
+    ...(type ? { rateLimitType: type } : {}),
+    message: `Rate-limited${retryAt ? ` — REST works again in ${humanDuration(sec)}` : ""}${tier ? ` (plan ${tier}${type ? `, limit ${type}` : ""})` : ""}. Do not retry before then; read through the plugin (open file) instead. Other endpoint tiers (comments, versions) may still work.`,
+  };
+}
+
 /** ms to wait before retrying a 429, or null to give up now. */
 export function retryDelayMs(headers: Headers, attempt: number): number | null {
   if (attempt >= 3) return null;
@@ -285,6 +340,19 @@ export class RestHub {
   private pluginToken: string | null = null;
   /** When the user said the plugin token expires (epoch ms). */
   private pluginExpiresAt?: number;
+  /**
+   * When the plugin's current token (or its Clear) was SAVED, by the panel's
+   * clock. Several windows share one clientStorage but each caches it; a
+   * window that missed a newer Save/Clear re-sends an older one, and must
+   * lose. Undefined = unknown (an older plugin) — then the last message wins.
+   */
+  private pluginSavedAt?: number;
+  /** Scopes already probed for this token generation (one probe per token). */
+  private scopesGen = -1;
+  private scopesCache?: string[];
+  /** Last plain-403 re-check (quota: at most one per RECHECK_GAP_MS). */
+  private lastRecheckAt = 0;
+  private agingTimer?: NodeJS.Timeout;
   private status: TokenStatus;
   /** Bumped on every token change; stale checks and caches compare it. */
   private gen = 0;
@@ -319,10 +387,16 @@ export class RestHub {
   reset(): void {
     this.pluginToken = null;
     this.pluginExpiresAt = undefined;
+    this.pluginSavedAt = undefined;
+    this.scopesGen = -1;
+    this.scopesCache = undefined;
+    this.lastRecheckAt = 0;
     this.gen++;
     this.checking = undefined;
     if (this.recheckTimer) clearTimeout(this.recheckTimer);
     this.recheckTimer = undefined;
+    if (this.agingTimer) clearTimeout(this.agingTimer);
+    this.agingTimer = undefined;
     this.remoteFn = undefined;
     this.remoteStatusFn = undefined;
     this.remoteStatusCache = undefined;
@@ -382,19 +456,66 @@ export class RestHub {
    * that needs a scope a PAT normally lacks (projects:read). Any other
    * answer means "unknown" (or that it HAS projects:read): never a failure.
    */
-  private async probeScopes(token: string): Promise<string[] | undefined> {
+  private async probeScopes(token: string, gen: number): Promise<string[] | undefined> {
+    // One probe per token: a re-check of the same token must not spend quota again.
+    if (this.scopesGen === gen) return this.scopesCache;
+    const started = this.now();
+    let status = 0;
+    let scopes: string[] | undefined;
     try {
-      const res = await this.net(`${REST_API_BASE}/teams/0/projects`, { headers: { "X-Figma-Token": token } });
-      if (res.status !== 403) return undefined;
-      const f = classifyRestFailure(403, await res.text());
-      return f.kind === "scope" ? f.grantedScopes : undefined;
+      const res = await this.net(`${REST_API_BASE}/teams/0/projects`, { headers: { "X-Figma-Token": token }, redirect: "error", signal: timeoutSignal(CHECK_TIMEOUT_MS) });
+      status = res.status;
+      if (res.status === 403) {
+        const f = classifyRestFailure(403, await res.text());
+        scopes = f.kind === "scope" ? f.grantedScopes : undefined;
+      }
     } catch {
-      return undefined;
+      scopes = undefined;
     }
+    // Reported like every other request — but a 403 here is the expected answer, not an error.
+    this.emit({ type: "rest_event", at: this.now(), op: "scope_probe", method: "GET", status, ms: this.now() - started, ok: status === 403 || status === 200 || status === 404, kind: "read", ...(status === 403 ? { message: "scopes read (403 expected)" } : {}) });
+    // Only an ANSWER is remembered: a timeout or a 429 must not mean "never
+    // ask again for this token".
+    const answered = status === 403 || status === 404 || (status >= 200 && status < 300);
+    if (gen === this.gen && answered) {
+      this.scopesGen = gen;
+      this.scopesCache = scopes;
+    }
+    return scopes;
   }
 
   getStatus(): TokenStatus {
+    // A rate limit whose Retry-After has passed is not a rate limit any more:
+    // nothing else would clear it, since agents are told to avoid REST meanwhile.
+    if (this.status.state === "rate_limited" && this.status.retryAt && this.now() >= this.status.retryAt) this.expireRateLimit();
     return { ...this.status };
+  }
+
+  /** rate_limited → unverified, told to every listener (the panels' badges). */
+  private expireRateLimit(): void {
+    if (this.agingTimer) clearTimeout(this.agingTimer);
+    this.agingTimer = undefined;
+    const { retryAt: _r, planTier: _p, rateLimitType: _t, ...rest } = this.status;
+    this.setStatus({ ...rest, state: "unverified", message: "The rate limit's Retry-After has passed; the next request re-checks." });
+  }
+
+  /** A timer at retryAt, so the panels learn the limit is over without anybody asking. */
+  private scheduleAging(retryAt: number | undefined): void {
+    if (this.agingTimer) clearTimeout(this.agingTimer);
+    this.agingTimer = undefined;
+    if (!retryAt) return;
+    const ms = Math.min(2_147_483_000, Math.max(0, retryAt - this.now()));
+    this.agingTimer = setTimeout(() => {
+      this.agingTimer = undefined;
+      if (this.status.state === "rate_limited" && this.status.retryAt === retryAt) this.expireRateLimit();
+    }, ms);
+    this.agingTimer.unref?.();
+  }
+
+  /** Say the current state again — every set_rest_token gets an answer, even "nothing changed". */
+  private rebroadcast(): TokenStatus {
+    this.setStatus(this.getStatus());
+    return this.getStatus();
   }
 
   /**
@@ -402,24 +523,47 @@ export class RestHub {
    * the leader's (that is the one its requests will use).
    */
   async effectiveStatus(): Promise<TokenStatus> {
-    if (this.remote() && this.remoteStatusFn) {
-      const c = this.remoteStatusCache;
-      let leader: TokenStatus | undefined;
-      if (c && this.now() - c.at < 5_000) leader = c.value;
-      else {
-        leader = await this.remoteStatusFn().catch(() => undefined);
-        this.remoteStatusCache = { at: this.now(), value: leader };
-      }
-      if (leader && leader.state !== "not_set") return { ...leader };
-    }
+    const leader = await this.leaderStatus();
+    if (leader && leader.state !== "not_set") return { ...leader };
     return this.getStatus();
+  }
+
+  /** The leader's token status (follower only); undefined = not a follower, or it did not answer. */
+  private async leaderStatus(): Promise<TokenStatus | undefined> {
+    if (!this.remote() || !this.remoteStatusFn) return undefined;
+    const c = this.remoteStatusCache;
+    if (c && this.now() - c.at < 5_000) return c.value;
+    try {
+      const value = await this.remoteStatusFn();
+      // Only an ANSWER is cached: a slow leader must not read as "no token" for 5 s.
+      this.remoteStatusCache = { at: this.now(), value };
+      return value;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Can a REST request be made from this process right now? */
   async available(): Promise<boolean> {
     if (this.token()) return true;
-    const s = await this.effectiveStatus();
-    return s.state !== "not_set";
+    if (!this.remote()) return false;
+    const leader = await this.leaderStatus();
+    // The leader could not be asked: try the request anyway — it answers
+    // noToken if it has none, which is a clearer error than guessing here.
+    return leader === undefined || leader.state !== "not_set";
+  }
+
+  /**
+   * Changes whenever the token REQUESTS use does — on a follower that is the
+   * leader's, so a token change there must not serve 60 s of reads cached
+   * under the old one.
+   */
+  async cacheKey(): Promise<string> {
+    if (this.token() || !this.remote()) return `local|${this.gen}`;
+    // The token (masked), not checkedAt: that changes on every re-check and
+    // would throw the 60 s cache away for nothing.
+    const leader = await this.leaderStatus();
+    return `leader|${leader?.masked ?? "?"}`;
   }
 
   onStatus(fn: (s: TokenStatus) => void): () => void {
@@ -458,31 +602,37 @@ export class RestHub {
    * status right away ("checking" / "not_set"); the check runs in the
    * background and reports through onStatus.
    */
-  setPluginToken(raw: string | null, meta: { expiresAt?: number | null } = {}): TokenStatus {
+  setPluginToken(raw: string | null, meta: { expiresAt?: number | null; savedAt?: number | null } = {}): TokenStatus {
     const token = raw === null ? null : cleanToken(raw);
-    const expiresAt = typeof meta.expiresAt === "number" && Number.isFinite(meta.expiresAt) && meta.expiresAt > 0 ? meta.expiresAt : undefined;
-    if (raw !== null && !token) {
-      this.setStatus({
-        state: "invalid",
-        source: "plugin",
-        message: "That does not look like a Figma personal access token (figd_…).",
-        checkedAt: this.now(),
-      });
-      return this.getStatus();
-    }
-    if (token === this.pluginToken && this.status.state !== "not_set") {
-      if (expiresAt !== undefined && expiresAt !== this.pluginExpiresAt) {
-        this.pluginExpiresAt = expiresAt;
-        this.setStatus({ ...this.status, expiresAt });
+    // Something that is not a token never replaces one: the panel validates
+    // before sending, so this is a stray client. Keep the token AND the state.
+    if (raw !== null && !token) return this.rebroadcast();
+    const savedAt = typeof meta.savedAt === "number" && Number.isFinite(meta.savedAt) && meta.savedAt > 0 ? meta.savedAt : undefined;
+    // A window that missed a newer Save/Clear re-sends what it cached: older loses.
+    if (savedAt !== undefined && this.pluginSavedAt !== undefined && savedAt < this.pluginSavedAt) return this.rebroadcast();
+    if (savedAt !== undefined) this.pluginSavedAt = savedAt;
+    // undefined = not said (keep); null = cleared ("Exp: ?"); number = the date.
+    const expiry = meta.expiresAt === null ? null : typeof meta.expiresAt === "number" && Number.isFinite(meta.expiresAt) && meta.expiresAt > 0 ? meta.expiresAt : undefined;
+    if (token === this.pluginToken && token !== null && this.status.state !== "not_set") {
+      if (expiry !== undefined && (expiry ?? undefined) !== this.pluginExpiresAt) {
+        this.pluginExpiresAt = expiry ?? undefined;
+        const { expiresAt: _old, ...rest } = this.status;
+        this.setStatus({ ...rest, ...this.expiryField() });
       }
-      // Same token again (reconnect hello): keep the state, re-check only if
-      // it never succeeded.
-      if (this.status.state === "error" || this.status.state === "unverified") void this.check();
-      return this.getStatus();
+      // Same token again (a re-sync): keep the state; re-check only if it never
+      // succeeded — or was refused, since the user saving it again says "try it".
+      if (this.status.state === "error" || this.status.state === "unverified" || this.status.state === "invalid") void this.check();
+      return this.rebroadcast();
     }
+    if (token === null && this.pluginToken === null) return this.rebroadcast();
     this.pluginToken = token;
-    this.pluginExpiresAt = token ? expiresAt : undefined;
+    this.pluginExpiresAt = token ? (expiry ?? undefined) : undefined;
     this.gen++;
+    // Nothing of the previous token's state applies to this one — above all
+    // not its rate limit, which would otherwise stop this token being checked.
+    if (this.agingTimer) clearTimeout(this.agingTimer);
+    this.agingTimer = undefined;
+    this.status = this.baseStatus();
     if (!this.token()) {
       this.setStatus({ state: "not_set", source: null });
       return this.getStatus();
@@ -500,6 +650,9 @@ export class RestHub {
     }
     // Share an in-flight check only when it is about the same token.
     if (this.checking && this.checkingGen === this.gen) return this.checking;
+    // Rate-limited until a known time: a check would only spend quota to hear it again.
+    const cur = this.getStatus();
+    if (cur.state === "rate_limited" && cur.retryAt && this.now() < cur.retryAt) return Promise.resolve(cur);
     const gen = this.gen;
     this.checkingGen = gen;
     const source = this.source();
@@ -510,11 +663,11 @@ export class RestHub {
       let next: TokenStatus;
       let status = 0;
       try {
-        const res = await this.net(`${REST_API_BASE}/me`, { headers: { "X-Figma-Token": token } });
+        const res = await this.net(`${REST_API_BASE}/me`, { headers: { "X-Figma-Token": token }, redirect: "error", signal: timeoutSignal(CHECK_TIMEOUT_MS) });
         status = res.status;
         if (res.ok) {
           const me = (await res.json().catch(() => ({}))) as { handle?: unknown; email?: unknown };
-          const scopes = await this.probeScopes(token);
+          const scopes = await this.probeScopes(token, gen);
           next = {
             state: "valid",
             source,
@@ -532,7 +685,7 @@ export class RestHub {
                 { state: "valid", source, masked, httpStatus: res.status, message: "The token works but lacks current_user:read, so its owner is unknown.", checkedAt: this.now(), ...(f.grantedScopes ? { scopes: f.grantedScopes } : {}) }
               : { state: "invalid", source, masked, httpStatus: res.status, message: `Figma rejected the token (${f.detail ?? res.status}) — expired, revoked or mistyped.`, checkedAt: this.now() };
         } else if (res.status === 429) {
-          next = { state: "rate_limited", source, masked, httpStatus: 429, message: "Figma is rate-limiting this token; requests retry with Retry-After.", checkedAt: this.now() };
+          next = { state: "rate_limited", source, masked, httpStatus: 429, ...rateLimitFields(res.headers, this.now()), checkedAt: this.now() };
         } else {
           next = { state: "error", source, masked, httpStatus: res.status, message: `Figma answered HTTP ${res.status} to the token check.`, checkedAt: this.now() };
         }
@@ -552,7 +705,10 @@ export class RestHub {
         ...(ok ? {} : { message: next.state === "invalid" ? "Token expired / invalid" : failureText(status, null) }),
       });
       // A token change while this ran: its result is about a token nobody uses.
-      if (gen === this.gen) this.setStatus({ ...next, ...this.expiryField() });
+      if (gen === this.gen) {
+        this.setStatus({ ...next, ...this.expiryField() });
+        if (next.state === "rate_limited") this.scheduleAging(next.retryAt);
+      }
       return next;
     })();
     this.checking = run;
@@ -567,8 +723,12 @@ export class RestHub {
     if (this.status.state === "unverified" && this.token()) void this.check();
   }
 
-  private scheduleRecheck(): void {
+  private scheduleRecheck(force = false): void {
     if (this.recheckTimer) return;
+    // Quota: a plain 403 ("no access to this file") is common and says nothing
+    // new about the token — re-ask /me at most once per RECHECK_GAP_MS.
+    if (!force && this.now() - this.lastRecheckAt < RECHECK_GAP_MS) return;
+    this.lastRecheckAt = this.now();
     this.recheckTimer = setTimeout(() => {
       this.recheckTimer = undefined;
       void this.check();
@@ -594,8 +754,23 @@ export class RestHub {
     // its own env token only when the leader has none.
     const remote = this.pluginToken ? undefined : this.remote();
     if (remote) {
-      const forwarded = await this.forwardToLeader(remote, url, init, method);
-      if (forwarded) return forwarded;
+      try {
+        const forwarded = await this.forwardToLeader(remote, url, init, method);
+        if (forwarded) return forwarded;
+      } catch (e) {
+        // The leader could not run it. This process's own FIGMA_TOKEN can —
+        // but only when running it again is harmless: a read, or a request the
+        // leader certainly never ran (an older build without __rest_fetch__).
+        // A POST the leader may already have sent would post the comment twice,
+        // and under another account.
+        const code = (e as { code?: string }).code;
+        const neverRan = code === ErrorCode.UNSUPPORTED_OPERATION || /Unknown operation/i.test(String((e as Error).message));
+        if (!this.envToken() || (method !== "GET" && !neverRan)) {
+          throw neverRan
+            ? new OpError(ErrorCode.UNSUPPORTED_OPERATION, "The leader MCP server is an older build that cannot run REST requests for other sessions.", "Restart the MCP server that holds the bridge port (figma_status shows mode/port), or set FIGMA_TOKEN for this session too.")
+            : e;
+        }
+      }
     }
     const token = this.token();
     if (!token) {
@@ -605,12 +780,14 @@ export class RestHub {
         "Paste a personal access token into the plugin panel (REST Token → Save), or set FIGMA_TOKEN in the MCP server's environment.",
       );
     }
-    const headers = new Headers(init.headers ?? {});
-    headers.set("X-Figma-Token", token);
     const gen = this.gen;
     let res: Response;
     try {
-      res = await this.net(url, { ...init, headers });
+      const headers = new Headers(init.headers ?? {});
+      headers.set("X-Figma-Token", token);
+      // The token is a custom header: a redirect would carry it to wherever it
+      // points. api.figma.com does not redirect; refuse if it ever does.
+      res = await this.net(url, { ...init, headers, redirect: "error", signal: withTimeout(init.signal ?? undefined, REQUEST_TIMEOUT_MS) });
     } catch (e) {
       report(0, false, "Network error");
       throw e;
@@ -618,9 +795,13 @@ export class RestHub {
     if (res.ok) {
       report(res.status, true);
       // A real success proves the token works — clear a stale 429 / error.
-      if (gen === this.gen && (this.status.state === "rate_limited" || this.status.state === "error" || this.status.state === "unverified")) {
-        if (this.status.state === "unverified") this.scheduleRecheck();
-        else this.setStatus({ ...this.status, state: "valid", httpStatus: res.status, message: undefined, checkedAt: this.now() });
+      if (gen === this.gen && (this.status.state === "rate_limited" || this.status.state === "error" || this.status.state === "unverified" || this.status.state === "invalid")) {
+        if (this.status.state === "unverified") this.scheduleRecheck(true);
+        else {
+          // Figma just answered 2xx: whatever said invalid / rate-limited is over.
+          const { retryAt: _r, planTier: _p, rateLimitType: _t, ...rest } = this.status;
+          this.setStatus({ ...rest, state: "valid", httpStatus: res.status, message: undefined, checkedAt: this.now() });
+        }
       }
       return res;
     }
@@ -640,25 +821,14 @@ export class RestHub {
           message: `The token lacks ${missing.join(", ")} — create a token with it to use that feature.`,
         });
       } else if (res.status === 403) {
-        // No access to THIS file is not a bad token — ask /me which it is.
+        // No access to THIS file is not a bad token — ask /me which it is (rarely).
         this.scheduleRecheck();
       } else if (res.status === 429) {
-        const type = res.headers.get("x-figma-rate-limit-type") ?? undefined;
-        const tier = res.headers.get("x-figma-plan-tier") ?? undefined;
-        const sec = Number(res.headers.get("retry-after"));
-        const retryAt = Number.isFinite(sec) && sec > 0 ? this.now() + sec * 1000 : undefined;
-        this.setStatus({
-          ...this.status,
-          state: "rate_limited",
-          source: this.source(),
-          masked: maskToken(token),
-          httpStatus: 429,
-          ...(retryAt ? { retryAt } : {}),
-          ...(tier ? { planTier: tier } : {}),
-          ...(type ? { rateLimitType: type } : {}),
-          message: `Rate-limited${retryAt ? ` — retry in ${humanDuration(sec)}` : ""}${tier ? ` (plan ${tier}${type ? `, limit ${type}` : ""})` : ""}. Other endpoint tiers (comments, versions) may still work.`,
-          checkedAt: this.now(),
-        });
+        // Each 429 replaces the last one's Retry-After / tier — never a stale mix.
+        const { retryAt: _r, planTier: _p, rateLimitType: _t, ...rest } = this.status;
+        const rl = rateLimitFields(res.headers, this.now());
+        this.setStatus({ ...rest, state: "rate_limited", source: this.source(), masked: maskToken(token), httpStatus: 429, ...rl, checkedAt: this.now() });
+        this.scheduleAging(rl.retryAt);
       }
     }
     return res;
@@ -699,8 +869,11 @@ export class RestHub {
       throw new OpError(ErrorCode.INVALID_PARAMS, "Only api.figma.com/v1 requests can be forwarded.", "This is a server bug if a follower sent it.");
     }
     const method = (req.method ?? "GET").toUpperCase();
-    if (!["GET", "POST", "DELETE"].includes(method)) {
-      throw new OpError(ErrorCode.INVALID_PARAMS, `Method ${method} cannot be forwarded.`, "GET, POST or DELETE.");
+    // Only what the tools send: reads, and posting a comment. Nothing else
+    // runs with the user's token on behalf of an /rpc caller.
+    const isCommentPost = method === "POST" && /^\/files\/[^/?#]+\/comments(\?|$)/.test(url.slice(REST_API_BASE.length));
+    if (method !== "GET" && !isCommentPost) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, `${method} ${url.slice(REST_API_BASE.length)} cannot be forwarded.`, "Only GET requests and POST …/comments are forwarded to the leader.");
     }
     if (!this.token()) return { noToken: true };
     const res = await this.fetch(url, {

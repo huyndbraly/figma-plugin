@@ -35,6 +35,8 @@ export interface DesignSystemKit {
     screenDepth?: number;
     includesScreens?: boolean;
     includesComponentUsage?: boolean;
+    /** A REST sub-read failed (scope, access): this kit is not the whole file. */
+    incomplete?: boolean;
   };
   notes?: string[];
 }

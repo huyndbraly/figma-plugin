@@ -260,7 +260,7 @@ export interface BridgeHandlers {
    * in its hello, or with set_rest_token. The bridge never stores or echoes
    * it; whoever handles this owns it (see rest-hub.ts).
    */
-  onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null }) => void;
+  onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null; savedAt?: number | null }) => void;
 }
 
 export interface BridgeOptions {
@@ -779,7 +779,8 @@ export class Bridge {
         const token = (msg as { token?: unknown }).token;
         if (token !== null && (typeof token !== "string" || token.length > 512)) break;
         const exp = (msg as { expiresAt?: unknown }).expiresAt;
-        this.handlers.onRestToken?.(token, conn.channel, { expiresAt: typeof exp === "number" ? exp : null });
+        const saved = (msg as { savedAt?: unknown }).savedAt;
+        this.handlers.onRestToken?.(token, conn.channel, { expiresAt: typeof exp === "number" ? exp : null, savedAt: typeof saved === "number" ? saved : null });
         break;
       }
       case "context": {
@@ -838,7 +839,6 @@ export class Bridge {
       if (hello.pageName && hello.pageName !== prevPage) {
         established.lastUserActivityAt = Date.now();
       }
-      this.takeHelloToken(hello, established.channel);
       this.broadcastChannels();
       return;
     }
@@ -893,13 +893,6 @@ export class Bridge {
         this.establish(client, hello, this.generateChannel(), newResumeToken());
       }
     });
-  }
-
-  /** A hello carrying a saved REST token hands it over (never a clear — see PluginHello.restToken). */
-  private takeHelloToken(hello: PluginHello, channel: string): void {
-    const t = hello.restToken;
-    const exp = hello.restTokenExpiresAt;
-    if (typeof t === "string" && t.length > 0 && t.length <= 512) this.handlers.onRestToken?.(t, channel, { expiresAt: typeof exp === "number" ? exp : null });
   }
 
   /** Resolve true when `ws` answers a protocol ping within the probe window. */
@@ -980,7 +973,6 @@ export class Bridge {
     // user so they can point specific agents at specific windows). When it
     // differs from the one the plugin asked for, the UI says so.
     conn.send({ type: "assigned", channel, resumeToken });
-    this.takeHelloToken(hello, channel);
     if (this.restStatusProvider) conn.send({ type: "rest_status", status: this.restStatusProvider() });
 
     for (const item of carried) conn.enqueue(item.request, item.pending);

@@ -148,14 +148,24 @@ const badge = () => String(els["token-badge"]?.textContent ?? "");
 const main = (m: Record<string, unknown>) => win.onmessage?.({ data: { pluginMessage: m } });
 
 describe("the REST Token field", () => {
-  it("a token saved on this machine rides in the hello", () => {
-    const ws = connected({ restToken: TOKEN });
-    expect(ws.sent[0]).toMatchObject({ type: "hello", restToken: TOKEN });
-  });
-
-  it("no saved token: the hello carries none (it must never clear the server's)", () => {
+  it("the hello never carries the token (it is sent with set_rest_token after `assigned`)", () => {
     const ws = connected();
     expect("restToken" in ws.sent[0]!).toBe(false);
+    expect(JSON.stringify(ws.sent[0])).not.toContain("figd_");
+  });
+
+  it("after `assigned`, it asks the main thread for what clientStorage holds NOW, and sends that", () => {
+    const ws = connected();
+    expect(toMain.some((m) => m.kind === "rest-token-request")).toBe(true);
+    expect(ws.sent.some((m) => m.type === "set_rest_token")).toBe(false); // nothing until the main thread answers
+    main({ kind: "rest-token", token: TOKEN, expiresAt: null, savedAt: 1234, reason: "sync" });
+    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: TOKEN, expiresAt: null, savedAt: 1234 });
+  });
+
+  it("nothing saved from this plugin (no token, no dated Clear): it says nothing", () => {
+    const ws = connected();
+    main({ kind: "rest-token", token: null, expiresAt: null, savedAt: null, reason: "sync" });
+    expect(ws.sent.some((m) => m.type === "set_rest_token")).toBe(false);
   });
 
   it("Save hands the token to the main thread, not to the socket", () => {
@@ -167,21 +177,44 @@ describe("the REST Token field", () => {
     expect(badge()).toBe("Checking…");
   });
 
-  it("once stored, it goes to the server with set_rest_token and the input is emptied", () => {
+  it("once stored, it goes to the server with its savedAt and the input is emptied", () => {
     const ws = connected();
     els["token-input"]!.value = TOKEN;
-    main({ kind: "rest-token", token: TOKEN, reason: "saved" });
-    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: TOKEN, expiresAt: null });
+    main({ kind: "rest-token", token: TOKEN, savedAt: 99, reason: "saved" });
+    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: TOKEN, expiresAt: null, savedAt: 99 });
     expect(els["token-input"]!.value).toBe("");
   });
 
-  it("Clear sends an explicit null", () => {
-    const ws = connected({ restToken: TOKEN });
+  it("Clear sends an explicit, dated null", () => {
+    const ws = connected();
     (els["token-clear"]!.onclick as () => void)();
     expect(toMain.at(-1)).toEqual({ kind: "save-rest-token", token: null });
-    main({ kind: "rest-token", token: null, reason: "cleared" });
-    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: null, expiresAt: null });
+    main({ kind: "rest-token", token: null, savedAt: 500, reason: "cleared" });
+    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: null, expiresAt: null, savedAt: 500 });
     expect(badge()).toBe("Not set");
+  });
+
+  it("a Clear made while disconnected reaches the server after the reconnect", () => {
+    const ws1 = connected();
+    ws1.serverClose();
+    main({ kind: "rest-token", token: null, savedAt: 700, reason: "cleared" }); // socket down: not sent
+    vi.advanceTimersByTime(600);
+    const ws2 = last();
+    ws2.open();
+    ws2.receive({ type: "assigned", channel: "chan-a", resumeToken: "tok-a" });
+    main({ kind: "rest-token", token: null, expiresAt: null, savedAt: 700, reason: "sync" });
+    expect(ws2.sent.at(-1)).toEqual({ type: "set_rest_token", token: null, expiresAt: null, savedAt: 700 });
+  });
+
+  it("a refused Save changes nothing: the badge keeps the server's verdict", () => {
+    const ws = connected();
+    ws.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h" } });
+    els["token-input"]!.value = "not a token";
+    (els["token-save"]!.onclick as () => void)();
+    main({ kind: "rest-token", token: null, reason: "rejected", error: "That does not look like a token" });
+    expect(badge()).toBe("Valid (@h)");
+    expect(els["token-input"]!.placeholder).toBe("That does not look like a token");
+    expect(els["token-input"]!.value).toBe("not a token"); // kept, so one wrong character can be fixed
   });
 
   it.each([
@@ -211,7 +244,7 @@ describe("REST activity", () => {
 });
 
 describe("token expiry (Figma cannot be asked, so the user says it at Save)", () => {
-  it("Save with '1 day' sends an expiry ~24h ahead; it rides to the server and in the next hello", () => {
+  it("Save with '1 day' sends an expiry ~24h ahead, and it rides to the server", () => {
     const ws = connected();
     els["token-input"]!.value = TOKEN;
     els["token-expiry"]!.value = "1";
@@ -220,8 +253,8 @@ describe("token expiry (Figma cannot be asked, so the user says it at Save)", ()
     const sent = toMain.at(-1) as { expiresAt: number };
     expect(sent.expiresAt - before).toBeGreaterThanOrEqual(86_400_000 - 5);
     expect(sent.expiresAt - before).toBeLessThan(86_400_000 + 1000);
-    main({ kind: "rest-token", token: TOKEN, expiresAt: sent.expiresAt, reason: "saved" });
-    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: TOKEN, expiresAt: sent.expiresAt });
+    main({ kind: "rest-token", token: TOKEN, expiresAt: sent.expiresAt, savedAt: 5, reason: "saved" });
+    expect(ws.sent.at(-1)).toEqual({ type: "set_rest_token", token: TOKEN, expiresAt: sent.expiresAt, savedAt: 5 });
   });
 
   it("the badge counts down, warns under a day, and says so once the date has passed", () => {
@@ -237,12 +270,6 @@ describe("token expiry (Figma cannot be asked, so the user says it at Save)", ()
     expect(badge()).toBe("Expired? (date passed)");
   });
 
-  it("a hello restores the saved expiry with the token", () => {
-    const exp = Date.now() + 7 * 86_400_000;
-    const ws = connected({ restToken: TOKEN, restTokenExpiresAt: exp });
-    expect(ws.sent[0]).toMatchObject({ type: "hello", restToken: TOKEN, restTokenExpiresAt: exp });
-  });
-
   it("a missing scope shows in the tooltip and turns the badge amber", () => {
     const ws = connected();
     ws.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h", missingScopes: ["file_comments:write"], scopes: ["file_content:read"] } });
@@ -251,10 +278,80 @@ describe("token expiry (Figma cannot be asked, so the user says it at Save)", ()
   });
 });
 
+describe("badge details from the review", () => {
+  it("a missing scope turns the badge amber even when an expiry is set", () => {
+    const ws = connected();
+    ws.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h", missingScopes: ["file_versions:read"], expiresAt: Date.now() + 10 * 86_400_000 } });
+    expect(els["token-badge"]!.className).toBe("token-badge warn");
+  });
+
+  it("the language comes from clientStorage via the main thread, and a click saves it there", () => {
+    connected();
+    main({ kind: "ui-lang", lang: "vi" });
+    const ws = last();
+    ws.receive({ type: "rest_status", status: { state: "not_set", source: null } });
+    expect(badge()).toBe("Chưa đặt");
+    expect(toMain.some((m) => m.kind === "save-ui-lang")).toBe(false); // restoring is not saving
+    (els["lang-en"]!.onclick as () => void)();
+    expect(toMain.at(-1)).toEqual({ kind: "save-ui-lang", lang: "en" });
+    expect(badge()).toBe("Not set");
+  });
+});
+
 describe("rate-limited badge", () => {
   it("says how long until REST works again", () => {
     const ws = connected();
     ws.receive({ type: "rest_status", status: { state: "rate_limited", source: "plugin", httpStatus: 429, retryAt: Date.now() + 4 * 86_400_000 + 60_000 } });
     expect(badge()).toBe("Rate-limited (429) · retry in 4d");
+  });
+});
+
+describe("a server that never answers the token (an older build)", () => {
+  it("after 12 s the badge says so instead of staying on Checking…", () => {
+    const ws = connected();
+    els["token-input"]!.value = TOKEN;
+    (els["token-save"]!.onclick as () => void)();
+    main({ kind: "rest-token", token: TOKEN, savedAt: 1, reason: "saved" });
+    expect(badge()).toBe("Checking…");
+    vi.advanceTimersByTime(11_999);
+    expect(badge()).toBe("Checking…");
+    vi.advanceTimersByTime(2);
+    expect(badge()).toBe("No answer from server");
+    expect(String(els["token-badge"]!.title)).toMatch(/restart the MCP server/);
+    // A late answer still wins.
+    ws.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h" } });
+    expect(badge()).toBe("Valid (@h)");
+  });
+
+  it("a server that answers in time never shows the warning", () => {
+    const ws = connected();
+    main({ kind: "rest-token", token: TOKEN, savedAt: 1, reason: "saved" });
+    ws.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h" } });
+    vi.advanceTimersByTime(20_000);
+    expect(badge()).toBe("Valid (@h)");
+  });
+});
+
+
+describe("review fixes (second pass)", () => {
+  it("a Save during the handshake of a NEW socket waits for that socket's `assigned`", () => {
+    const ws1 = connected();
+    ws1.serverClose();
+    vi.advanceTimersByTime(600);
+    const ws2 = last();
+    ws2.open(); // open, but not assigned yet — `channel` still holds the old value
+    main({ kind: "rest-token", token: TOKEN, savedAt: 9, reason: "saved" });
+    expect(ws2.sent.some((m) => m.type === "set_rest_token")).toBe(false);
+    ws2.receive({ type: "assigned", channel: "chan-a", resumeToken: "tok-a" });
+    main({ kind: "rest-token", token: TOKEN, savedAt: 9, reason: "sync" });
+    expect(ws2.sent.at(-1)).toMatchObject({ type: "set_rest_token", token: TOKEN });
+  });
+
+  it("a language the user clicked is not undone by the stored one arriving late", () => {
+    connected();
+    (els["lang-en"]!.onclick as () => void)();
+    main({ kind: "ui-lang", lang: "vi" });
+    last().receive({ type: "rest_status", status: { state: "not_set", source: null } });
+    expect(badge()).toBe("Not set");
   });
 });

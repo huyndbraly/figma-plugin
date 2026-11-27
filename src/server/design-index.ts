@@ -11,7 +11,7 @@
  * Metadata only — names, ids, keys, types, descriptions. No node trees, no
  * images, no token. The folder is gitignored; `FIGMA_CACHE=off` disables it.
  */
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileNameKey } from "../shared/figma-url.js";
 
@@ -44,12 +44,17 @@ const MAX_ITEMS_PER_FILE = 5000;
 /** figma_read ops answered from the index (server-side, no plugin round-trip for search). */
 export const LOCAL_INDEX_OPS = ["search_design_index", "index_design_file"] as const;
 
+/**
+ * Lowercase words, accents dropped ("Nút bấm" → nut bam, "Đơn" → don) —
+ * any script's letters kept: a CJK or Cyrillic name is words too, not "".
+ */
 function words(s: string): string[] {
   return s
+    .replace(/[đĐ]/g, "d")
     .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .split(/[^a-z0-9]+/)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean);
 }
 
@@ -57,7 +62,8 @@ function words(s: string): string[] {
 export function scoreName(name: string, query: string): number {
   const n = words(name).join(" ");
   const q = words(query).join(" ");
-  if (!q) return 1;
+  // An empty query lists everything; a query of only punctuation matches nothing.
+  if (!q) return query.trim() ? 0 : 1;
   if (n === q) return 100;
   const last = words(name.split("/").pop() ?? name).join(" ");
   if (last === q) return 90;
@@ -121,6 +127,37 @@ export function itemsFromResult(op: string, result: unknown): IndexedItem[] {
   return out;
 }
 
+/** How long a lock file may sit before it is taken for a crashed writer's. */
+const LOCK_STALE_MS = 10_000;
+
+/**
+ * Run `fn` holding an exclusive lock file (O_EXCL create). Waits up to ~5 s
+ * for another process; a lock older than LOCK_STALE_MS is a dead writer's and
+ * is broken. The index is a cache, so after the wait the write goes ahead.
+ */
+export async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+  let held = false;
+  for (let attempt = 0; attempt < 100 && !held; attempt++) {
+    try {
+      await writeFile(lockPath, String(process.pid), { flag: "wx" });
+      held = true;
+    } catch {
+      try {
+        const st = await stat(lockPath);
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) await unlink(lockPath).catch(() => undefined);
+      } catch {
+        /* gone between the two calls */
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    if (held) await unlink(lockPath).catch(() => undefined);
+  }
+}
+
 export class DesignIndex {
   readonly dir: string;
   private writing = Promise.resolve();
@@ -144,39 +181,69 @@ export class DesignIndex {
    * that kind's old items (a re-read of components replaces components and
    * leaves styles alone). Writes are serialised and atomic (tmp + rename).
    */
-  record(file: { fileKey: string | null; fileName: string; source: "plugin" | "rest" }, items: IndexedItem[]): Promise<IndexedFile | null> {
+  record(
+    file: { fileKey: string | null; fileName: string; source: "plugin" | "rest" },
+    items: IndexedItem[],
+    /**
+     * "replace": `items` is the file's WHOLE list of those kinds (an
+     * unfiltered read) and replaces it. "merge": a partial answer
+     * (find_component, a capped read) — adds and updates, never removes;
+     * replacing there shrank 300 indexed components to the 3 a search found.
+     */
+    mode: "replace" | "merge" = "replace",
+  ): Promise<IndexedFile | null> {
     if (!items.length) return Promise.resolve(null);
     const run = this.writing.then(async () => {
       await mkdir(this.filesDir(), { recursive: true });
       const id = safeFileId(file.fileKey, file.fileName);
       const path = join(this.filesDir(), `${id}.json`);
-      let prev: IndexedFile | null = null;
-      try {
-        prev = JSON.parse(await readFile(path, "utf8")) as IndexedFile;
-      } catch {
-        /* first time */
-      }
+      // Two files with one name ("Untitled") are two files: an entry stored
+      // by name is never folded into a keyed one — nothing here can prove
+      // they are the same file.
       const kinds = new Set(items.map((i) => (i.kind === "component_set" ? "component" : i.kind)));
-      const kept = (prev?.items ?? []).filter((i) => !kinds.has(i.kind === "component_set" ? "component" : i.kind));
-      const seen = new Set<string>();
-      const merged = [...kept, ...items].filter((i) => {
-        const k = `${i.kind}|${i.id ?? ""}|${i.name}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      const entry: IndexedFile = {
-        fileKey: file.fileKey ?? prev?.fileKey ?? null,
-        fileName: file.fileName || prev?.fileName || "",
-        updatedAt: new Date().toISOString(),
-        source: file.source,
-        items: merged.slice(0, MAX_ITEMS_PER_FILE),
+      // Identity: the node id when there is one (a rename keeps it, and must
+      // not leave the old name behind), else the name.
+      const identity = (i: IndexedItem) => (i.id ? `${i.kind === "component_set" ? "component" : i.kind}|#${i.id}` : `${i.kind}|${i.name}`);
+      const build = (prev: IndexedFile | null): IndexedFile => {
+        const previous = prev?.items ?? [];
+        const kept = mode === "merge" ? previous : previous.filter((i) => !kinds.has(i.kind === "component_set" ? "component" : i.kind));
+        // New items first: an update wins, and when the cap cuts, it cuts what is oldest.
+        const seen = new Set<string>();
+        const merged = [...items, ...kept].filter((i) => {
+          const k = identity(i);
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+        return {
+          fileKey: file.fileKey ?? prev?.fileKey ?? null,
+          fileName: file.fileName || prev?.fileName || "",
+          updatedAt: new Date().toISOString(),
+          source: file.source,
+          items: merged.slice(0, MAX_ITEMS_PER_FILE),
+        };
       };
-      const tmp = `${path}.${process.pid}.tmp`;
-      await writeFile(tmp, JSON.stringify(entry), "utf8");
-      await rename(tmp, path);
-      await this.ensureGitignore();
-      return entry;
+      // Leader and follower share this folder: the read-modify-write runs
+      // under a lock file, so neither overwrites what the other just wrote.
+      return withFileLock(`${path}.lock`, async () => {
+        let prev: IndexedFile | null = null;
+        try {
+          prev = JSON.parse(await readFile(path, "utf8")) as IndexedFile;
+        } catch {
+          prev = null;
+        }
+        const entry = build(prev);
+        const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+        try {
+          await writeFile(tmp, JSON.stringify(entry), "utf8");
+          await rename(tmp, path);
+        } catch (e) {
+          await unlink(tmp).catch(() => undefined);
+          throw e;
+        }
+        await this.ensureGitignore();
+        return entry;
+      });
     });
     this.writing = run.then(() => undefined, () => undefined);
     return run;

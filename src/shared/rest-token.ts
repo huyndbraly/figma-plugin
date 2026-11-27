@@ -7,8 +7,14 @@
 /** A PAT as pasted: trimmed, no inner whitespace, sane length; else null. */
 export function cleanRestToken(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
-  const t = raw.trim();
-  if (t.length < 8 || t.length > 512 || /\s/.test(t)) return null;
+  // Copy/paste brings zero-width spaces and BOMs along; at the ends they are
+  // noise, so drop them like whitespace.
+  const t = raw.replace(/^[\s\u200b-\u200d\u2060\ufeff]+|[\s\u200b-\u200d\u2060\ufeff]+$/g, "");
+  if (t.length < 8 || t.length > 512) return null;
+  // A token is printable ASCII. Anything else (a zero-width space inside, a
+  // curly quote) cannot even be put in an HTTP header — refuse it here, with
+  // a clear message, instead of failing later as a "network error".
+  if (!/^[\x21-\x7e]+$/.test(t)) return null;
   return t;
 }
 

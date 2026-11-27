@@ -17,7 +17,11 @@ import { parseStateText } from "../state/text.js";
 import { parseSitemapText } from "../sitemap/text.js";
 import { parseMermaid } from "../userflow/mermaid.js";
 import type { FigjamShape, FigjamColor } from "./style.js";
-export { FIGJAM_FILL, type FigjamShape, type FigjamColor } from "./style.js";
+import { buildUsecase, type UsecaseSpec } from "../usecase/index.js";
+import { buildJourney, type JourneySpec } from "../journey/index.js";
+import { buildPersona, type PersonaSpec } from "../persona/index.js";
+
+export { FIGJAM_FILL, FIGJAM_MARKER, type FigjamShape, type FigjamColor } from "./style.js";
 
 export interface FigjamNode {
   id: string;
@@ -43,10 +47,18 @@ export interface FigjamGraph {
   nodes: FigjamNode[];
   edges: FigjamEdge[];
   rankdir: "TB" | "LR";
+  /** Boards (persona, journey) come with every x/y set: a grid, not a graph to lay out. */
+  placed?: boolean;
 }
 
-/** Kinds that become a FigJam-native drawing when the window is FigJam. */
-export const FIGJAM_NATIVE_KINDS = ["userflow", "activity", "state", "sitemap"] as const;
+/**
+ * Kinds that become a FigJam-native drawing when the window is FigJam.
+ * Sequence and ERD are deliberately NOT here: a sequence needs lifelines in
+ * strict vertical order, which FigJam's self-routing connectors scramble, and
+ * an ERD needs crow's-foot ends, which FigJam connectors do not have. Both
+ * keep their Figma Design drawing, which renders fine on a FigJam board.
+ */
+export const FIGJAM_NATIVE_KINDS = ["userflow", "activity", "state", "sitemap", "usecase", "journey", "persona"] as const;
 export type FigjamNativeKind = (typeof FIGJAM_NATIVE_KINDS)[number];
 
 export function isFigjamNativeKind(k: unknown): k is FigjamNativeKind {
@@ -136,6 +148,70 @@ export function toFigjamGraph(kind: FigjamNativeKind, spec: Json): FigjamGraph {
       }),
     };
   }
+  if (kind === "usecase") {
+    const m = buildUsecase(spec as UsecaseSpec).model;
+    return {
+      title: m.title,
+      rankdir: "LR",
+      nodes: [
+        ...m.actors.map((a) => ({ id: a.id, label: `${a.kind === "system" ? "⚙ " : "🧑 "}${a.name ?? a.id}`, shape: "SQUARE" as FigjamShape, color: (a.kind === "system" ? "gray" : "orange") as FigjamColor })),
+        ...m.useCases.map((u) => ({ id: u.id, label: u.detail ? `${u.label ?? u.id}\n${u.detail}` : (u.label ?? u.id), shape: "ELLIPSE" as FigjamShape, color: "blue" as FigjamColor })),
+      ],
+      edges: m.links.map((l) => {
+        const k = l.kind ?? "association";
+        const label = k === "include" ? "«include»" : k === "extend" ? "«extend»" : k === "generalization" ? "generalizes" : (l.label ?? undefined);
+        return { from: l.from, to: l.to, ...(label ? { label } : {}), ...(k === "include" || k === "extend" ? { dashed: true } : {}) };
+      }),
+    };
+  }
+  if (kind === "persona") {
+    const m = buildPersona(spec as PersonaSpec).model;
+    const nodes: FigjamNode[] = [];
+    const COL = STICKY_SIDE + GRID_GAP;
+    m.personas.forEach((p, c) => {
+      const header = [`${p.primary ? "★ " : ""}${p.name ?? p.id}`, p.tag, p.quote ? `“${p.quote}”` : undefined].filter(Boolean).join("\n");
+      const rows: Array<[string, FigjamColor, string[] | undefined]> = [
+        ["Goals", "green", p.goals],
+        ["Pains", "red", p.pains],
+        ["Needs", "blue", p.needs],
+        ["Behaviours", "yellow", p.behaviors],
+        ["Facts", "gray", p.facts?.map((f) => `${f.label}: ${f.value}`)],
+      ];
+      nodes.push({ id: `${p.id}#head`, label: header, shape: "STICKY", color: "violet", x: c * COL, y: 0 });
+      let r = 1;
+      for (const [name, color, items] of rows) {
+        if (!items?.length) continue;
+        nodes.push({ id: `${p.id}#${name.toLowerCase()}`, label: `${name}\n${items.map((i) => `• ${i}`).join("\n")}`, shape: "STICKY", color, x: c * COL, y: r++ * COL });
+      }
+    });
+    return { title: m.title, rankdir: "LR", nodes, edges: [], placed: true };
+  }
+  if (kind === "journey") {
+    const m = buildJourney(spec as JourneySpec).model;
+    const nodes: FigjamNode[] = [];
+    const edges: FigjamEdge[] = [];
+    const COL = STICKY_SIDE + GRID_GAP;
+    m.phases.forEach((ph, c) => {
+      const x = c * COL;
+      nodes.push({ id: `${ph.id}#phase`, label: ph.label ?? ph.id, shape: "ROUNDED_RECTANGLE", color: "teal", x, y: 0, w: STICKY_SIDE, h: 80 });
+      if (c > 0) edges.push({ from: `${m.phases[c - 1]!.id}#phase`, to: `${ph.id}#phase` });
+      const feeling = typeof ph.feeling === "number" ? ph.feeling : undefined;
+      const rows: Array<[string, FigjamColor, string[] | undefined]> = [
+        ["Actions", "yellow", ph.actions],
+        ["Touchpoints", "blue", ph.touchpoints],
+        ["Thinks", "violet", ph.thoughts],
+        [feeling === undefined ? "Feels" : `Feels ${feeling > 0 ? "🙂" : feeling < 0 ? "🙁" : "😐"} ${feeling > 0 ? "+" : ""}${feeling}`, feeling !== undefined && feeling < 0 ? "red" : "green", ph.feelingNote ? [ph.feelingNote] : feeling !== undefined ? [] : undefined],
+        ["Pains", "red", ph.pains],
+        ["Ideas", "green", ph.ideas],
+      ];
+      let r = 0;
+      for (const [name, color, items] of rows) {
+        if (items === undefined || (!items.length && !name.startsWith("Feels "))) continue;
+        nodes.push({ id: `${ph.id}#${name.split(" ")[0]!.toLowerCase()}`, label: items.length ? `${name}\n${items.map((i) => `• ${i}`).join("\n")}` : name, shape: "STICKY", color, x, y: 110 + r++ * COL });
+      }
+    });
+    return { title: m.title, rankdir: "LR", nodes, edges, placed: true };
+  }
   // sitemap: containment tree, drawn top-down.
   const parsed = typeof spec.text === "string" ? parseSitemapText(spec.text) : null;
   const pages = parsed ? (parsed.pages as unknown as Json[]) : arr(spec.pages);
@@ -155,13 +231,23 @@ export function toFigjamGraph(kind: FigjamNativeKind, spec: Json): FigjamGraph {
   };
 }
 
+/** FigJam's sticky is a fixed square; boards are a grid of them. */
+export const STICKY_SIDE = 240;
+export const GRID_GAP = 40;
+const MAX_BOX_W = 320;
+const CHAR_W = 8;
+
 /** Box size from the label: FigJam shapes grow with their text, so size up front. */
 export function sizeFor(n: FigjamNode): { w: number; h: number } {
   const lines = n.label.split("\n");
   const longest = Math.max(1, ...lines.map((l) => l.length));
   if (n.shape === "ELLIPSE" && n.label.length <= 2) return { w: 48, h: 48 };
-  const w = Math.min(320, Math.max(140, longest * 8 + 40));
-  const h = Math.max(72, lines.length * 22 + 40);
+  const w = Math.min(MAX_BOX_W, Math.max(140, longest * CHAR_W + 40));
+  // A line longer than the box wraps: count the WRAPPED lines, or the box is
+  // too short and FigJam grows it over its neighbour.
+  const perLine = Math.max(1, Math.floor((w - 40) / CHAR_W));
+  const wrapped = lines.reduce((sum, l) => sum + Math.max(1, Math.ceil(l.length / perLine)), 0);
+  const h = Math.max(72, wrapped * 22 + 40);
   if (n.shape === "DIAMOND") return { w: Math.max(w, 160), h: Math.max(h, 120) };
   if (n.shape === "STICKY") return { w: 240, h: 240 };
   return { w, h };
@@ -174,12 +260,43 @@ export function sizeFor(n: FigjamNode): { w: number; h: number } {
  */
 export function layoutFigjam(graph: FigjamGraph, origin: { x?: number; y?: number } = {}): { graph: FigjamGraph; width: number; height: number; warnings: string[] } {
   const warnings: string[] = [];
+  // Ids are compared as strings everywhere downstream; a duplicate would draw
+  // two shapes on one spot and the plugin's id map would keep only one.
+  const seenIds = new Set<string>();
+  const nodes0: FigjamNode[] = [];
+  for (const raw of graph.nodes) {
+    const id = String(raw.id ?? "").trim();
+    if (!id) {
+      warnings.push(`A node with no id ("${raw.label.split("\n")[0]}") was not drawn.`);
+      continue;
+    }
+    if (seenIds.has(id)) {
+      warnings.push(`Node id "${id}" is used twice; only the first was drawn.`);
+      continue;
+    }
+    seenIds.add(id);
+    nodes0.push({ ...raw, id });
+  }
+  graph = { ...graph, nodes: nodes0, edges: graph.edges.map((e) => ({ ...e, from: String(e.from), to: String(e.to) })) };
   const ids = new Set(graph.nodes.map((n) => n.id));
   const edges = graph.edges.filter((e) => {
     const ok = ids.has(e.from) && ids.has(e.to);
     if (!ok) warnings.push(`Edge ${e.from} → ${e.to} names a node that does not exist; it was not drawn.`);
     return ok;
   });
+  if (graph.placed) {
+    // A board: positions are the grid the kind chose. Only sizes are filled in.
+    // Same margins dagre gets (marginx 40, marginy 80): clear of the section's title.
+    const ox0 = origin.x ?? 40;
+    const oy0 = origin.y ?? 80;
+    const nodes = graph.nodes.map((n) => {
+      const s = n.w && n.h ? { w: n.w, h: n.h } : sizeFor(n);
+      return { ...n, x: ox0 + (n.x ?? 0), y: oy0 + (n.y ?? 0), w: s.w, h: s.h };
+    });
+    const width = Math.max(0, ...nodes.map((n) => n.x! + n.w!)) + 40;
+    const height = Math.max(0, ...nodes.map((n) => n.y! + n.h!)) + 40;
+    return { graph: { ...graph, nodes, edges }, width, height, warnings };
+  }
   const g = new dagre.graphlib.Graph({ multigraph: true });
   g.setGraph({ rankdir: graph.rankdir, nodesep: 60, ranksep: 110, marginx: 40, marginy: 80 });
   g.setDefaultEdgeLabel(() => ({}));

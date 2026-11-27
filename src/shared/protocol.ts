@@ -10,7 +10,9 @@
 // v6: quality audits, component map, create_board (usecase/journey/persona).
 // v7: FigJam/Slides (create_figjam_diagram, get_slides, create_slide), the
 //     REST token messages (set_rest_token, rest_status, rest_event).
-export const PROTOCOL_VERSION = 7;
+// v8: the REST token is no longer read from the hello — only set_rest_token
+//     (with savedAt) after `assigned`; FigJam sections store their model.
+export const PROTOCOL_VERSION = 8;
 
 /** Default bridge port; server falls back to +1..+9 when busy. */
 export const DEFAULT_PORT = 38470;
@@ -234,24 +236,26 @@ export interface PluginHello {
    * only knew the channel name from GET /health).
    */
   resumeToken?: string | null;
-  /**
-   * The Figma REST personal access token saved in this plugin's
-   * clientStorage (REST Token field in the panel). Sent only when one is
-   * saved; the server keeps it in RAM and never echoes it back. Clearing it
-   * is an explicit SetRestToken { token: null }, never an absent field — a
-   * window that has not heard about a newer token must not wipe it.
-   */
-  restToken?: string | null;
-  /** When the saved token expires (epoch ms) — the user picks it at Save; Figma cannot be asked. */
-  restTokenExpiresAt?: number | null;
 }
 
-/** Plugin → server: the user saved (string) or cleared (null) the REST token. */
+/**
+ * Plugin → server: the REST token saved in this plugin's clientStorage
+ * (string) or its Clear (null). Sent on a connection that has received
+ * `assigned` (not in the hello), and again after every reconnect, so a Clear
+ * made while offline still arrives.
+ */
 export interface SetRestToken {
   type: "set_rest_token";
   token: string | null;
   /** Epoch ms the user said the token expires (1/7/30/90 days); null = not stated. */
   expiresAt?: number | null;
+  /**
+   * When this token (or this Clear) was saved, by the panel's clock. Every
+   * window shares one clientStorage but caches it; the server keeps the
+   * newest, so a window that missed a later Save/Clear cannot bring back
+   * what it cached.
+   */
+  savedAt?: number | null;
 }
 
 /** Token state as the plugin panel shows it. Never carries the token itself. */

@@ -232,6 +232,7 @@ Once the server is registered and the plugin is running, ask your agent to call 
 | Badge `Expired? (date passed)` while Figma still accepts it | The expiry you picked in **Exp** has passed by the clock | Replace the token now; Figma will start refusing it. |
 | Badge amber, tooltip `Missing scopes: …` / error `UNAUTHORIZED` naming a scope | The token was created without that scope | Create a token with the named scope ticked (the error also lists the scopes the current one has), Save it. |
 | `RATE_LIMITED` / badge `Rate-limited (429) · retry in …` | Figma's REST quota for this plan is used up | Open the file in Figma Desktop with the plugin — reads go through the plugin with no quota. REST works again at `restToken.retryAt`. |
+| `htmlToFigma`: "Playwright is installed but could not start Chromium" | The browser binary was never downloaded | `npx playwright install chromium` in the same folder Playwright is installed in. |
 | `get_comments` / `get_versions`: "Which file?" | No link given and the open window did not report its `fileKey` | Pass `{ url }`. Re-run the plugin once after updating — the manifest now enables `enablePrivatePluginApi`, which lets the plugin report its file key. |
 
 For the full error code table (what each `code` means and how to react), see [`TOOLS.md`](./TOOLS.md#error-codes).

@@ -82,15 +82,29 @@ export function threadComments(raw: unknown, opts: { nodeId?: string; nodeIds?: 
   return { threads, total, returned: threads.length };
 }
 
-export async function getComments(client: RestClient, fileKey: string, params: Json, signal?: AbortSignal): Promise<unknown> {
+/**
+ * Comment threads of a file. Filtered to one node ONLY when `nodeId` is
+ * passed explicitly: a copied link almost always carries a node-id (the page
+ * or whatever was selected), and filtering on it silently returned zero
+ * threads for "the comments of this file". The link's node comes back as
+ * `linkNodeId` so the caller can filter if that is what it meant.
+ */
+export async function getComments(client: RestClient, fileKey: string, params: Json, signal?: AbortSignal, linkNodeId?: string): Promise<unknown> {
   // Comments change while people talk — never the 60 s read cache.
   const raw = await client.get(`/files/${encodeURIComponent(fileKey)}/comments`, signal, { fresh: true });
+  const nodeId = typeof params.nodeId === "string" && params.nodeId ? params.nodeId : undefined;
   const t = threadComments(raw, {
-    ...(typeof params.nodeId === "string" ? { nodeId: params.nodeId } : {}),
+    ...(nodeId ? { nodeId } : {}),
     ...(params.unresolved === true ? { unresolved: true } : {}),
     ...(typeof params.limit === "number" ? { limit: params.limit } : {}),
   });
-  return { fileKey, ...t, source: "rest" };
+  return {
+    fileKey,
+    ...t,
+    ...(nodeId ? { nodeFilter: nodeId } : {}),
+    ...(linkNodeId && !nodeId ? { linkNodeId, hint: `All threads of the file. Pass nodeId: "${linkNodeId}" to keep only those pinned to the node in the link.` } : {}),
+    source: "rest",
+  };
 }
 
 export interface PostCommentInput {
@@ -127,7 +141,7 @@ export async function postComment(fetchImpl: RestFetch, fileKey: string, input: 
   if (res.status === 404) {
     throw new OpError(ErrorCode.NODE_NOT_FOUND, "Figma has no such file or comment (404).", "Check the link / fileKey, and that replyTo is the id of a comment in this file (figma_read get_comments).");
   }
-  if (!res.ok) throw restError(res.status, await res.text().catch(() => ""), "post comments (file_comments:write)");
+  if (!res.ok) throw restError(res.status, await res.text().catch(() => ""), "post comments (file_comments:write)", res.headers);
   return { ...compactComment((await res.json()) as Json), fileKey };
 }
 
@@ -216,6 +230,24 @@ export async function restDesignKit(client: RestClient, fileKey: string, params:
   const file = (await client.get(`/files/${key}?depth=2`, signal)) as Json;
   const pages = (((file.document as Json | undefined)?.children ?? []) as Json[]).filter((p) => p.type === "CANVAS");
   const notes: string[] = ["Built through the Figma REST API (file not open in Figma): no anatomy, instance usage or observed patterns — open the file with the plugin for those."];
+  /**
+   * A secondary read that may fail without sinking the whole design.md — but
+   * never silently: each failure is a note in the output, so a design.md with
+   * no components says WHY. A rate limit is not soft: the remaining reads
+   * would fail the same way, and the error says when to come back.
+   */
+  let incomplete = false;
+  const soft = async (path: string, what: string): Promise<Json> => {
+    try {
+      return (await client.get(path, signal)) as Json;
+    } catch (e) {
+      const err = e as { code?: string; message?: string };
+      if (err.code === ErrorCode.RATE_LIMITED) throw e;
+      incomplete = true;
+      notes.push(`${what} could not be read through REST, so this file is INCOMPLETE there: ${err.message ?? String(e)}`);
+      return {};
+    }
+  };
 
   const screens: DesignScreen[] = [];
   for (const p of pages) {
@@ -235,16 +267,19 @@ export async function restDesignKit(client: RestClient, fileKey: string, params:
   }
 
   // Styles: metadata lists them; their VALUES live on the style nodes.
-  const stylesMeta = ((((await client.get(`/files/${key}/styles`, signal).catch(() => ({}))) as Json).meta as Json | undefined)?.styles ?? []) as Json[];
+  const stylesMeta = (((await soft(`/files/${key}/styles`, "Published styles")).meta as Json | undefined)?.styles ?? []) as Json[];
   const fileStyles = (file.styles ?? {}) as Record<string, Json>;
   const styleList: Json[] = stylesMeta.length
     ? stylesMeta.map((s) => ({ id: s.node_id, name: s.name, styleType: s.style_type, description: s.description }))
     : Object.entries(fileStyles).map(([id, s]) => ({ id, name: s.name, styleType: s.styleType, description: s.description }));
   const valueById = new Map<string, Json>();
-  const ids = styleList.map((s) => String(s.id)).filter((id) => /^\d+:\d+/.test(id)).slice(0, 300);
+  const MAX_STYLE_VALUES = 300;
+  const allStyleIds = styleList.map((s) => String(s.id)).filter((id) => /^\d+:\d+/.test(id));
+  const ids = allStyleIds.slice(0, MAX_STYLE_VALUES);
+  if (allStyleIds.length > ids.length) notes.push(`Only the first ${MAX_STYLE_VALUES} of ${allStyleIds.length} styles have their values read (REST quota); the rest are listed by name only.`);
   for (let i = 0; i < ids.length; i += 100) {
     const slice = ids.slice(i, i + 100);
-    const res = (await client.get(`/files/${key}/nodes?ids=${encodeURIComponent(slice.join(","))}&depth=0`, signal).catch(() => ({}))) as Json;
+    const res = await soft(`/files/${key}/nodes?ids=${encodeURIComponent(slice.join(","))}&depth=0`, "Style values");
     for (const [id, n] of Object.entries((res.nodes ?? {}) as Record<string, Json | null>)) if (n?.document) valueById.set(id, n.document as Json);
   }
   const styles: NonNullable<DesignSystemKit["styles"]> = { paint: [], text: [], effect: [], grid: [] };
@@ -267,8 +302,8 @@ export async function restDesignKit(client: RestClient, fileKey: string, params:
 
   // Components (published metadata first; local ones off the file JSON).
   const components: DesignComponent[] = [];
-  const compMeta = ((((await client.get(`/files/${key}/components`, signal).catch(() => ({}))) as Json).meta as Json | undefined)?.components ?? []) as Json[];
-  const setMeta = ((((await client.get(`/files/${key}/component_sets`, signal).catch(() => ({}))) as Json).meta as Json | undefined)?.component_sets ?? []) as Json[];
+  const compMeta = (((await soft(`/files/${key}/components`, "Published components")).meta as Json | undefined)?.components ?? []) as Json[];
+  const setMeta = (((await soft(`/files/${key}/component_sets`, "Published component sets")).meta as Json | undefined)?.component_sets ?? []) as Json[];
   const seen = new Set<string>();
   for (const s of setMeta) {
     const id = String(s.node_id);
@@ -284,14 +319,19 @@ export async function restDesignKit(client: RestClient, fileKey: string, params:
     seen.add(id);
     components.push({ id, name: String(c.name), type: "COMPONENT", ...(c.key ? { key: String(c.key) } : {}), ...(c.description ? { description: String(c.description) } : {}), ...(frame.pageName ? { pageName: String(frame.pageName) } : {}) });
   }
-  if (!compMeta.length && !setMeta.length) {
-    for (const [id, c] of Object.entries((file.components ?? {}) as Record<string, Json>)) {
-      if (c.componentSetId) continue;
-      components.push({ id, name: String(c.name), type: "COMPONENT", ...(c.key ? { key: String(c.key) } : {}), ...(c.description ? { description: String(c.description) } : {}) });
-    }
-    for (const [id, s] of Object.entries((file.componentSets ?? {}) as Record<string, Json>)) {
-      components.push({ id, name: String(s.name), type: "COMPONENT_SET", ...(s.key ? { key: String(s.key) } : {}), ...(s.description ? { description: String(s.description) } : {}) });
-    }
+  // Unpublished (local) components are only in the file JSON. Always merge
+  // them: a file with SOME published components still has local ones.
+  // `remote: true` entries are components of OTHER files (libraries) that
+  // this file uses — not this file's own.
+  for (const [id, s] of Object.entries((file.componentSets ?? {}) as Record<string, Json>)) {
+    if (seen.has(id) || s.remote === true) continue;
+    seen.add(id);
+    components.push({ id, name: String(s.name), type: "COMPONENT_SET", ...(s.key ? { key: String(s.key) } : {}), ...(s.description ? { description: String(s.description) } : {}) });
+  }
+  for (const [id, c] of Object.entries((file.components ?? {}) as Record<string, Json>)) {
+    if (c.componentSetId || seen.has(id) || c.remote === true) continue;
+    seen.add(id);
+    components.push({ id, name: String(c.name), type: "COMPONENT", ...(c.key ? { key: String(c.key) } : {}), ...(c.description ? { description: String(c.description) } : {}) });
   }
 
   // A set's variants: from the published metadata, else the file JSON.
@@ -351,6 +391,7 @@ export async function restDesignKit(client: RestClient, fileKey: string, params:
       returnedScreens: Math.min(200, screens.length),
       includesScreens: true,
       includesComponentUsage: false,
+      ...(incomplete ? { incomplete: true } : {}),
     },
     notes,
   };

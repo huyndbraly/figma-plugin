@@ -406,8 +406,8 @@ If a specific library doesn't have the icon, `loadIcon` throws `NODE_NOT_FOUND` 
 Needs a token saved in the plugin panel (or `FIGMA_TOKEN`) — check `figma_status.restToken.state === "valid"` first; if not, ask the user to save one.
 
 ```js
-// Open threads on the frame a link points at:
-const { threads } = await figma.getComments({ url: "https://www.figma.com/design/KEY/App?node-id=12-34", unresolved: true });
+// Open threads pinned to one frame (a link's node-id alone is NOT a filter — pass nodeId):
+const { threads } = await figma.getComments({ url: "https://www.figma.com/design/KEY/App", nodeId: "12:34", unresolved: true });
 // Reply — only when the user asked you to: everyone on the file sees it.
 await figma.postComment({ url: "https://www.figma.com/design/KEY/App", replyTo: threads[0].id, message: "Fixed: spacing is now 16." });
 const { versions } = await figma.getVersions({ url: "https://www.figma.com/design/KEY/App", namedOnly: true, limit: 5 });
@@ -430,7 +430,7 @@ Each call spends REST quota (small on Starter plans — a `RATE_LIMITED` error s
 
 ## Diagrams in FigJam, slides in Figma Slides
 
-Run the plugin inside a FigJam board and call `figma_diagram` as usual — `userflow`, `activity`, `state` and `sitemap` come out as FigJam shapes and connectors in a section (`native: "figjam"` in the answer), still proof-read first.
+Run the plugin inside a FigJam board and call `figma_diagram` as usual — `userflow`, `activity`, `state`, `sitemap` and `usecase` come out as FigJam shapes and connectors, `persona` and `journey` as stickies, all in a section (`native: "figjam"` in the answer), still proof-read first. The section remembers its model: `figma_diagram { update: sectionId, patch: [...] }` redraws it in place. `sequence` and `erd` keep their Figma Design drawing.
 
 ```js
 // In a Figma Slides deck:
@@ -452,7 +452,7 @@ return await figma.exportCodeConnect({ dir: "/abs/path/app/src/figma", importFro
 
 ## Rebuild a running page in Figma
 
-Needs Playwright next to the MCP server (`npm i -D playwright && npx playwright install chromium`).
+Needs Playwright next to the MCP server (`npm i -D playwright && npx playwright install chromium`). Any http(s) URL works — localhost, LAN or public — and the page loads its CDN fonts, CSS and APIs as in a normal browser.
 
 ```js
 return await figma.htmlToFigma("http://localhost:3000/settings", { width: 390, selector: "main", name: "Settings (from code)", x: 2000, y: 0 });

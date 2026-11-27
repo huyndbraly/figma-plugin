@@ -286,7 +286,7 @@ function buildHints(d: Diagnostics, apiVersionMatch: boolean | null): string[] {
       `The Figma REST token${rt.source === "plugin" ? " saved in the plugin panel" : " (FIGMA_TOKEN)"} was rejected${rt.httpStatus ? ` (${rt.httpStatus})` : ""} — links to files that are not open, comments and versions will fail. Ask the user to paste a fresh personal access token into the plugin panel (REST Token → Save).`,
     );
   } else if (rt?.state === "rate_limited") {
-    hints.push("Figma is rate-limiting the REST token (429). REST reads retry with Retry-After; prefer the open file (plugin path) for repeated reads.");
+    hints.push(`Figma's REST quota for this token is used up (429)${rt.retryAt ? ` until ${new Date(rt.retryAt).toISOString()}` : ""}. Do NOT retry REST calls before then — Figma will answer 429 again and they fail with RATE_LIMITED. Read through the plugin instead: ask the user to open the file in Figma Desktop with the plugin running.`);
   }
   if (rt && rt.state !== "invalid" && rt.state !== "not_set") {
     for (const h of restTokenHints(rt, Date.now())) hints.push(h);
@@ -306,6 +306,9 @@ export const REST_FEATURE_SCOPES: Array<{ feature: string; scope: string }> = [
   { feature: "published components/styles of a closed file (generate_design_md, index_design_file)", scope: "library_content:read" },
 ];
 
+/** Pre-granular scope names that grant every *:read the features use. */
+export const LEGACY_READ_SCOPES = ["files:read", "file_read"];
+
 /** Expiry and scope hints for a token that works (state not invalid/not_set). */
 export function restTokenHints(rt: TokenStatus, now: number): string[] {
   const out: string[] = [];
@@ -321,7 +324,12 @@ export function restTokenHints(rt: TokenStatus, now: number): string[] {
     out.push(`The REST token was refused for missing scope(s) ${rt.missingScopes.join(", ")}. Features needing them fail until the user creates a token with them checked and saves it in the plugin panel.`);
   }
   if (rt.scopes?.length) {
-    const lacking = REST_FEATURE_SCOPES.filter((f) => !rt.scopes!.includes(f.scope) && !(rt.missingScopes ?? []).includes(f.scope));
+    // Older tokens carry broad scopes (files:read, file_read) that cover the
+    // granular read scopes; only a real 403 says one of those is missing.
+    const broadRead = rt.scopes.some((x) => LEGACY_READ_SCOPES.includes(x));
+    const lacking = REST_FEATURE_SCOPES.filter(
+      (f) => !rt.scopes!.includes(f.scope) && !(rt.missingScopes ?? []).includes(f.scope) && !(broadRead && f.scope.endsWith(":read")),
+    );
     if (lacking.length) out.push(`The REST token lacks ${lacking.map((f) => `${f.scope} (${f.feature})`).join("; ")}.`);
   }
   return out;
@@ -420,7 +428,7 @@ export async function restFor(ctx: ToolContext): Promise<{ client: RestClient; d
   } else {
     if (!(await restHub.available())) return null;
     // One cache per token: a new token may see files the old one could not.
-    const key = `hub|${restHub.generation()}`;
+    const key = `hub|${await restHub.cacheKey()}`;
     const cached = restClients.get(key);
     if (cached) client = cached;
     else {
@@ -477,7 +485,7 @@ async function readViaLink(
         "Save a personal access token in the plugin panel (REST Token), or set FIGMA_TOKEN on the MCP server.",
       );
     }
-    return { done: true, result: await restRead(op, params, link.fileKey, rest) };
+    return { done: true, result: await restReadIndexed(ctx, op, params, link.fileKey, rest) };
   }
   // A link without the name slug can still be matched by asking REST for the name.
   let name = link.slug;
@@ -509,7 +517,28 @@ async function readViaLink(
     );
   }
   // Ops REST cannot answer throw from restRead with a "needs the plugin" hint.
-  return { done: true, result: await restRead(op, params, link.fileKey, rest) };
+  return { done: true, result: await restReadIndexed(ctx, op, params, link.fileKey, rest) };
+}
+
+/**
+ * restRead, and — for generate_design_md, which reads the file's components
+ * and styles anyway — the design index learns them too, so a closed file read
+ * through REST is searchable afterwards like an open one.
+ */
+async function restReadIndexed(ctx: ToolContext, op: string, params: Record<string, unknown>, fileKey: string, rest: NonNullable<Awaited<ReturnType<typeof restFor>>>): Promise<unknown> {
+  if (op !== "generate_design_md" || !ctx.designIndex) return restRead(op, params, fileKey, rest);
+  const out = (await restRead(op, { ...params, includeJson: true }, fileKey, rest)) as Record<string, unknown> & { kit?: Record<string, unknown> };
+  try {
+    const kit = out.kit as { file?: { name?: string }; extraction?: { omittedComponents?: number; incomplete?: boolean } } | undefined;
+    // A kit with a sub-read that failed (missing scope, …) is not the whole list.
+    const partial = !!kit?.extraction?.omittedComponents || kit?.extraction?.incomplete === true;
+    if (kit) await ctx.designIndex.record({ fileKey, fileName: kit.file?.name ?? fileKey, source: "rest" }, itemsFromResult("get_design_system_kit", kit), partial ? "merge" : "replace");
+  } catch {
+    /* the cache is a convenience */
+  }
+  if (params.includeJson === true) return out;
+  const { kit: _kit, ...rest2 } = out;
+  return rest2;
 }
 
 function linkFor(fileKey: string, nodeId?: string): string {
@@ -532,11 +561,7 @@ async function fileKeyFor(ctx: ToolContext, params: Record<string, unknown>, rou
   if (typeof params.fileKey === "string" && params.fileKey.trim()) return { fileKey: params.fileKey.trim() };
   const listed = await ctx.runValidated("list_channels", {}).catch(() => []);
   const list = (Array.isArray(listed) ? listed : []) as Array<{ channel?: string; plugin?: { fileKey?: string | null; fileName?: string }; focused?: boolean }>;
-  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
-  const pick =
-    (r.channel && list.find((c) => c.channel === r.channel)) ||
-    (r.file && list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!))) ||
-    (list.length === 1 ? list[0] : list.find((c) => c.focused));
+  const pick = await pickWindow(ctx, list, route);
   const key = pick?.plugin?.fileKey;
   if (key) return { fileKey: key };
   throw new OpError(
@@ -556,8 +581,26 @@ async function handleRestOnlyRead(ctx: ToolContext, op: RestOnlyReadOp, params: 
       "Ask the user to paste a personal access token into the plugin panel (REST Token → Save), or set FIGMA_TOKEN on the MCP server.",
     );
   }
-  const p = { ...params, ...(nodeId && params.nodeId === undefined ? { nodeId } : {}) };
-  return op === "get_comments" ? getComments(rest.client, fileKey, p) : getVersions(rest.client, fileKey, p);
+  // The link's node-id is NOT a filter (see getComments): it is reported back.
+  return op === "get_comments" ? getComments(rest.client, fileKey, params, undefined, nodeId) : getVersions(rest.client, fileKey, params);
+}
+
+// ---- which window a call is about ----
+
+/**
+ * The window an op with this route would run on — in the bridge's own order:
+ * explicit channel, then file, then a single window, then the window this
+ * SESSION is bound to (Connect, or auto-sticky after its first routed call),
+ * and only then the focused one. Skipping the binding sent a bound session's
+ * comments, index entries and FigJam check to whichever file had focus.
+ */
+async function pickWindow<T extends { channel?: string; plugin?: { fileName?: string }; focused?: boolean }>(ctx: ToolContext, list: T[], route?: RouteArg): Promise<T | undefined> {
+  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
+  if (r.channel) return list.find((c) => c.channel === r.channel);
+  if (r.file) return list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!));
+  if (list.length <= 1) return list[0];
+  const bound = (await ctx.diagnostics().catch(() => undefined))?.boundChannel;
+  return (bound && list.find((c) => c.channel === bound)) || list.find((c) => c.focused);
 }
 
 // ---- local design-system index ----
@@ -569,11 +612,7 @@ const INDEXED_OPS = new Set(["get_components", "get_styles", "get_variables", "g
 async function routedWindow(ctx: ToolContext, route?: RouteArg): Promise<{ fileKey: string | null; fileName: string } | null> {
   const listed = await ctx.runValidated("list_channels", {}).catch(() => []);
   const list = (Array.isArray(listed) ? listed : []) as Array<{ channel?: string; plugin?: { fileName?: string; fileKey?: string | null }; focused?: boolean }>;
-  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
-  const pick =
-    (r.channel && list.find((c) => c.channel === r.channel)) ||
-    (r.file && list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!))) ||
-    (list.length === 1 ? list[0] : list.find((c) => c.focused));
+  const pick = await pickWindow(ctx, list, route);
   return pick?.plugin?.fileName ? { fileKey: pick.plugin.fileKey ?? null, fileName: pick.plugin.fileName } : null;
 }
 
@@ -584,7 +623,17 @@ async function recordIntoIndex(ctx: ToolContext, op: string, result: unknown, ro
     if (!items.length) return;
     const win = await routedWindow(ctx, route);
     if (!win) return;
-    await ctx.designIndex?.record({ ...win, source: "plugin" }, items);
+    // Full lists replace what was indexed; a search or a capped read only adds.
+    const r = (result ?? {}) as { extraction?: { omittedComponents?: number }; hasMore?: boolean; omittedCount?: number; count?: number; total?: number };
+    // Anything short of the whole list only adds: a search, a capped kit,
+    // `hasMore`, or get_components with maxComponents (omittedCount / count < total).
+    const partial =
+      op === "find_component" ||
+      !!r.extraction?.omittedComponents ||
+      r.hasMore === true ||
+      (typeof r.omittedCount === "number" && r.omittedCount > 0) ||
+      (typeof r.count === "number" && typeof r.total === "number" && r.count < r.total);
+    await ctx.designIndex?.record({ ...win, source: "plugin" }, items, partial ? "merge" : "replace");
   } catch {
     /* the cache is a convenience */
   }
@@ -715,15 +764,11 @@ export async function targetEditor(ctx: ToolContext, route?: RouteArg): Promise<
   const listed = await ctx.runValidated("list_channels", {}).catch(() => []);
   const list = (Array.isArray(listed) ? listed : []) as Array<{ channel?: string; plugin?: { fileName?: string; editorType?: string }; focused?: boolean }>;
   if (!list.length) return undefined;
-  const r = route && typeof route === "object" ? (route as { channel?: string; file?: string }) : typeof route === "string" ? { channel: route } : {};
-  const pick =
-    (r.channel && list.find((c) => c.channel === r.channel)) ||
-    (r.file && list.find((c) => fileNameKey(c.plugin?.fileName ?? "") === fileNameKey(r.file!))) ||
-    (list.length === 1 ? list[0] : list.find((c) => c.focused));
+  const pick = await pickWindow(ctx, list, route);
   return pick?.plugin?.editorType;
 }
 
-async function drawFigjamNative(ctx: ToolContext, type: FigjamNativeKind, spec: unknown, channel?: RouteArg): Promise<unknown> {
+async function drawFigjamNative(ctx: ToolContext, type: FigjamNativeKind, spec: unknown, channel?: RouteArg, intoSectionId?: string): Promise<unknown> {
   const options = readOptions(spec);
   const checked = (await runDiagramType(ctx, type, withOptions(spec, { dryRun: true }), channel)) as DiagramResult;
   if (options.dryRun === true) return { ...checked, native: "figjam" };
@@ -732,6 +777,9 @@ async function drawFigjamNative(ctx: ToolContext, type: FigjamNativeKind, spec: 
     return { ...checked, dryRun: undefined, checkedOnly: true, native: "figjam", hint: "Nothing was drawn: checkFirst was set and the model has findings. Fix them (or drop checkFirst to draw anyway) and call again." };
   }
   const model = (spec && typeof spec === "object" ? spec : {}) as Record<string, unknown>;
+  // What the section STORES: the model with draw-only options removed — the
+  // same rule as a Figma Design frame, so patches and cross-checks read it alike.
+  const { update: _u, patch: _p, ...stored } = isPlainObject(model.options) ? { ...model, options: mergeOptionLayers(withoutDrawOnlyOptions(model.options)) } : model;
   // Positions are relative to the section; the plugin places the section.
   const laid = layoutFigjam(toFigjamGraph(type, model));
   const drawn = resultOf(
@@ -744,15 +792,21 @@ async function drawFigjamNative(ctx: ToolContext, type: FigjamNativeKind, spec: 
         edges: laid.graph.edges,
         width: laid.width,
         height: laid.height,
-        ...(typeof model.x === "number" ? { x: model.x } : {}),
-        ...(typeof model.y === "number" ? { y: model.y } : {}),
+        source: stored,
+        ...(intoSectionId ? { intoSectionId } : {}),
+        ...(!intoSectionId && typeof model.x === "number" ? { x: model.x } : {}),
+        ...(!intoSectionId && typeof model.y === "number" ? { y: model.y } : {}),
       },
       undefined,
       channel,
     ),
   ) as Record<string, unknown>;
   const warnings = [...findings, ...laid.warnings];
-  return { native: "figjam", ...drawn, ...(checked.stats ? { stats: checked.stats } : {}), ...(warnings.length ? { warnings } : {}) };
+  // The plugin handed back the page's other diagrams: the same cross-check a
+  // Figma Design draw gets.
+  const { pageModel: onPage, ...clean } = drawn as Record<string, unknown> & { pageModel?: StoredDiagram[] };
+  const consistency = options.crossCheck === false ? [] : crossCheckAgainst(onPage);
+  return { native: "figjam", ...clean, ...(checked.stats ? { stats: checked.stats } : {}), ...(warnings.length ? { warnings } : {}), ...(consistency.length ? { consistency } : {}) };
 }
 
 /**
@@ -779,10 +833,30 @@ async function handleDiagramUpdate(
   let kind = type;
   let applied: string[] | undefined;
 
+  // Is the target a FigJam-native section? Then it is redrawn as one — a
+  // Figma Design drawing of the new model would land beside it.
+  let storedMark: { kind?: string; spec?: unknown; native?: string } | undefined;
   if (patch !== undefined) {
-    const stored = resultOf(
-      await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel),
-    ) as { kind?: string; spec?: unknown };
+    storedMark = resultOf(await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel)) as typeof storedMark;
+  } else if (isFigjamNativeKind(type)) {
+    // Only a kind that HAS a FigJam drawing can be a FigJam section: other
+    // kinds skip the round trip.
+    storedMark = (await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel)
+      .then(resultOf)
+      .catch((e: unknown) => {
+        // A Design frame drawn before models were stored is fine to redraw
+        // from a full spec. Anything else — a FigJam section with no model, a
+        // missing node, a transient failure — must not fall through to the
+        // Design drawing, which would draw frames on top of a FigJam section.
+        const err = e as { code?: string; message?: string };
+        if (err.code === ErrorCode.INVALID_PARAMS && !/FigJam/.test(String(err.message))) return undefined;
+        throw e;
+      })) as typeof storedMark;
+  }
+  const nativeFigjam = storedMark?.native === "figjam";
+
+  if (patch !== undefined) {
+    const stored = storedMark ?? {};
     const result = applyPatch(withoutStoredDrawOnlyOptions(stored.spec), patch);
     // Anything else in the call would be a second, contradictory source for
     // the same fields, and silently picking one of them is how a patch stops
@@ -808,6 +882,13 @@ async function handleDiagramUpdate(
     );
   }
 
+  if (nativeFigjam) {
+    if (!isFigjamNativeKind(kind)) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, `"${String(kind)}" has no FigJam-native drawing, and ${update} is a FigJam section.`, "Redraw it without `update` (a new diagram), or update it with its own kind.");
+    }
+    const drawn = (await drawFigjamNative(ctx, kind, next, channel, update)) as Record<string, unknown>;
+    return applied ? { ...drawn, patched: applied } : drawn;
+  }
   const drawn = (await drawWithChecks(ctx, next, channel, (s) =>
     runDiagramType(ctx, kind, s, channel, update),
   )) as Record<string, unknown>;
