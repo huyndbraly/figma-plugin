@@ -48,9 +48,11 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design rationale and the
 |---|---|---|---|
 | **Setup, Auth & Architecture** | | | |
 | Auth via Personal Access Token (PAT) / OAuth | ✅ (High) — PAT / OAuth | ✅ (High) — OAuth / Account | ✅ (Medium) — Local bridge + Figma Desktop session |
-| Headless / CI-CD (no Figma Desktop needed) | ✅ (High) | ❌ (Low — Desktop/client needed for live canvas) | ❌ (Figma Desktop plugin window must stay open) |
-| Multi-IDE / Multi-agent concurrency | ✅ (High) — Stateless HTTP | ❌ (Low — port/session conflicts) | ✅ (High) — Leader/follower `/rpc` forwarding |
-| Setup simplicity | ✅ (High) — Just an HTTP token | ✅ (High) — Hosted / 1-click plugin | ✅ (Medium) — Build server + import manifest |
+| Remote / Cloud access by Figma URL (no local plugin) | ✅ (High) | ✅ (High) — Remote MCP via URL | ❌ (Requires local build + open Figma Desktop plugin) |
+| Headless / CI-CD (no Figma Desktop needed) | ✅ (High) | ✅ (Medium — with Remote MCP reads) | ❌ (Figma Desktop plugin window must stay open) |
+| Multi-IDE / Multi-agent concurrency | ✅ (High) — Stateless HTTP | ✅ (Medium — Remote MCP) / ❌ (Low — Desktop local) | ✅ (High) — Leader/follower `/rpc` forwarding |
+| Enterprise SSO, seat permissions & audit logs | ✅ (High) | ✅ (High) — Official Figma Cloud permissions | ❌ (Local bridge, no cloud org governance) |
+| Setup simplicity | ✅ (High) — Just an HTTP token | ✅ (High) — Hosted / 1-click toggle in Figma | ✅ (Medium) — Clone, build server + import manifest |
 | Rate-limit resilience | ❌ (Low — strict REST API quotas) | ✅ (Medium) | ✅ (High — local WebSocket, no REST quota) |
 | **Agent Reading & Token Usage** | | | |
 | Read pages, layers, styles & metadata | ✅ (High) — Full file JSON | ✅ (High) | ✅ (High) |
@@ -72,7 +74,8 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design rationale and the
 | Create & bind Variables / Text & Effect Styles | ❌ | ✅ (Medium) | ✅ (High — `setupTokens`, `applyVariable`, import/export) |
 | Create Component Sets, Variants & Properties | ❌ | ✅ (Medium) | ✅ (High — grid layout + auto-bound properties) |
 | Instantiate by name (auto-resolve variant & `#id` keys) | ❌ | ❌ (Requires raw IDs/keys) | ✅ (High — `instantiate("Button", { variant, properties })`) |
-| Code ↔ Figma component mapping | ❌ | ✅ (High — native Code Connect) | ✅ (High — `export_component_map` + `render()`) |
+| Search org/team Design System libraries in the Cloud | ✅ (Medium) — Team/file endpoints | ✅ (High) — `search_design_system`, `get_libraries` | ❌ (Only inspects the currently open file) |
+| Code ↔ Figma component mapping | ❌ | ✅ (High) — Cloud-synced Dev Mode Code Connect | ✅ (Medium) — Local `export_component_map` + `render()` |
 | Design system compliance audit & auto-bind | ❌ | ❌ | ✅ (High — `audit_design_system` + one-call auto-bind) |
 | **Verification & Output Product Quality** | | | |
 | Screenshot / image export | ✅ (High — server-rendered PNG/SVG) | ✅ (High) | ✅ (High) |
@@ -88,14 +91,22 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design rationale and the
 | Semantic content linting & cross-diagram checks | ❌ | ❌ | ✅ (High — catches dead ends, missing PK/FK, etc.) |
 | Single-source business policies (`@policies`) | ❌ | ❌ | ✅ (High — prevents number/rule drift across diagrams) |
 | Smart connectors (arrows stay attached) | ❌ | ✅ (Medium — FigJam connectors) | ✅ (High — re-routes automatically on move) |
+| **AI Creative, Media & Multi-Surface Figma (Official / Paid)** | | | |
+| AI Image & Vector Illustration generation (`generate_image`, `generate_vector_illustration`) | ❌ | ✅ (High) | ❌ |
+| Motion / Animation context & keyframes (`get_motion_context`) | ❌ | ✅ (High) | ❌ |
+| Custom Shaders, Generative Plugins & Weave AI workflows | ❌ | ✅ (High) | ❌ |
+| Live Web / HTML → Editable Figma Design (`generate_figma_design`) | ❌ | ✅ (High) | ❌ (Must build frames via JS or `render()`) |
+| Video export (`export_video`) | ❌ | ✅ (High) | ❌ |
+| FigJam, Figma Slides, new file creation & Branching (`create_branch`) | ❌ (Read-only) | ✅ (High) — Native FigJam, Slides, Branching | ❌ (Focused on Figma Design canvas only) |
 | **Collaboration & Cloud Metadata** | | | |
-| Comments, version history & webhooks | ✅ (High) | ✅ (Medium — read comments) | ❌ (Focused on live canvas & design systems) |
+| Comments, version history & webhooks | ✅ (High) | ✅ (High) — Read/manage comments & cloud metadata | ❌ (Focused on live canvas & design systems) |
 
 ### Key Takeaways by Use Case
 
-- **Agent reading Figma to write code:** **Official Figma MCP** and **Figma Plugin MCP** both outperform the **REST API** by avoiding huge raw JSON payloads that burn LLM context tokens. **Figma Plugin MCP** additionally exports a deterministic `design-kit.md` snapshot and works with Variables on non-Enterprise plans.
-- **Agent designing UI & BA/UX diagrams in Figma:** **REST API** cannot write to the canvas at all. **Figma Plugin MCP** produces significantly higher-quality design outputs than typical MCPs because `layout_audit`, `a11y_audit`, `audit_design_system`, safe defaults, and model-backed diagrams catch clipping, contrast, and logic errors before a human even looks at a screenshot.
-- **Headless automation & cloud metadata (CI/CD, webhooks, comments):** **Figma REST API (PAT)** is the right tool when no Figma Desktop session is available.
+- **Cloud ecosystem, AI creative tools & multi-surface Figma:** **Official / Paid Figma MCP** is clearly stronger when you need zero-setup remote URL access, org-wide Design System library search (`search_design_system`), cloud-synced Dev Mode Code Connect, AI image/vector/shader/motion generation, live HTML-to-Figma capture, or FigJam, Slides, and Branching.
+- **Agent reading Figma to write code from an open file:** Both **Official Figma MCP** and **Figma Plugin MCP** outperform the **REST API** by avoiding huge raw JSON payloads that burn LLM context tokens. **Figma Plugin MCP** additionally exports a deterministic `design-kit.md` snapshot and reads Variables on non-Enterprise plans.
+- **Agent designing accurate UI & BA/UX diagrams on Figma Design:** **REST API** cannot write to the canvas at all. **Figma Plugin MCP** produces cleaner layout outputs than typical MCPs because `layout_audit`, `a11y_audit`, `audit_design_system`, safe defaults, and model-backed diagrams catch clipping, contrast, and logic errors before a human reviews a screenshot.
+- **Headless automation & cloud metadata (CI/CD, webhooks, version history):** **Figma REST API (PAT)** is the right tool when no Figma Desktop session is available.
 
 ## Quickstart
 
