@@ -728,6 +728,11 @@
     if (!ws || ws.readyState !== 1 || assignedSock !== ws) return;
     if (!restToken && !restSavedAt) return;
     ws.send(JSON.stringify({ type: "set_rest_token", token: restToken, expiresAt: restToken ? restExpiresAt : null, savedAt: restSavedAt }));
+    // A token that went "not checked" while offline is being checked again now.
+    if (restToken && restStatus && restStatus.settledOffline) {
+      restStatus = { state: "checking", source: "plugin" };
+      renderToken();
+    }
     // A server that never answers (an older build that does not know
     // set_rest_token) must not leave the badge on "Checking…" forever.
     clearTimeout(restAnswerTimer);
@@ -1052,6 +1057,9 @@
         if (msg.reason !== "sync") {
           el.tokenInput.value = "";
           restStatus = restToken ? { state: "checking", source: "plugin" } : { state: "not_set", source: null };
+          // Saved while offline: nobody can check it until the next `assigned`
+          // (which sends it) — "not checked", not "Checking…" forever.
+          if (!(ws && ws.readyState === 1 && assignedSock === ws)) settleCheckingOffline();
           renderToken();
         }
         sendRestToken();

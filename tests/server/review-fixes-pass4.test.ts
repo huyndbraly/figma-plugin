@@ -158,3 +158,43 @@ describe("fifth pass", () => {
   });
 });
 
+describe("sixth pass", () => {
+  const box = (x: number, y: number, w: number, h: number) => ({ x, y, w, h });
+  const k = (id: string, r: ReturnType<typeof box>): CapturedNode => ({ tag: "i", id, rect: r, style: {} });
+  it("Code Connect: a quote right after a JSX tag's `>` is text, not a string", () => {
+    const { connections } = parseCodeConnect(`
+      figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {
+        props: { a: figma.string("A") },
+        example: () => <p>'Tis</p> }), y = <p>{x}</p>, z = <p>Don't</p>
+      figma.connect(Other, "https://www.figma.com/design/K/x?node-id=2-2", {})`);
+    expect(connections.map((c) => c.component)).toEqual(["Btn", "Other"]);
+  });
+
+  it("Code Connect: a keyword inside JSX prose does not open a string; `=> '…'` still does", () => {
+    const { connections } = parseCodeConnect(`
+      figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {
+        props: { a: figma.string("A") },
+        example: () => <p>Best of '90s {x} don't</p> })
+      const f = () => '}'
+      figma.connect(Other, "https://www.figma.com/design/K/x?node-id=2-2", {})`);
+    expect(connections.map((c) => c.component)).toEqual(["Btn", "Other"]);
+  });
+
+  it("Code Connect: a string after `as` / `satisfies` is a string (its // is not a comment)", () => {
+    const { connections } = parseCodeConnect(`
+      figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {
+        props: { a: figma.string("A") },
+        example: () => <a href={u as 'https://x/y'} /> })
+      figma.connect(Other, "https://www.figma.com/design/K/x?node-id=2-2", {})`);
+    expect(connections.map((c) => c.component)).toEqual(["Btn", "Other"]);
+  });
+
+  it("htmlToFigma: a zero-height child in a wrapped reversed row stays on its line", () => {
+    const kids = [
+      k("a", box(100, 0, 100, 50)), k("spacer", box(50, 0, 0, 0)), k("b", box(0, 0, 50, 50)), // line 1
+      k("c", box(0, 60, 100, 40)), // line 2
+    ];
+    expect(reverseFlexOrder(kids, true, true).map((n) => n.id)).toEqual(["b", "spacer", "a", "c"]);
+  });
+});
+

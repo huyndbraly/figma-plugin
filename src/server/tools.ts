@@ -864,8 +864,9 @@ async function handleDiagramUpdate(
         if ((e as { code?: string }).code !== ErrorCode.INVALID_PARAMS) throw e;
         // A plugin built before FigJam sections answered with `native` says
         // so in words: still a FigJam section, never a Design frame to draw over.
-        // (Its exact sentence: a frame NAMED "…FigJam…" must not match.)
-        if (/" is a FigJam section drawn before the model was stored on it\./.test(String((e as Error).message ?? ""))) return { native: "figjam", spec: null };
+        // Matched on its sentence, ending the message or followed by more
+        // text — never on a mere mention of FigJam in a frame's NAME.
+        if (/" is a FigJam section drawn before the model was stored on it\.(\s|$)/.test(String((e as Error).message ?? ""))) return { native: "figjam", spec: null };
         return undefined;
       })) as typeof storedMark;
   }

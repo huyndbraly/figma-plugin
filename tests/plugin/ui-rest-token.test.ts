@@ -407,3 +407,21 @@ describe("review fixes (fifth pass)", () => {
   });
 });
 
+describe("review fixes (sixth pass)", () => {
+  it("a Save made while OFFLINE says 'not checked', then checks once the server assigns the window", () => {
+    const ws1 = connected();
+    ws1.serverClose();
+    main({ kind: "rest-token", token: TOKEN, savedAt: 5, reason: "saved" });
+    expect(badge()).toMatch(/not checked/i);
+    vi.advanceTimersByTime(600);
+    const ws2 = last();
+    ws2.open();
+    ws2.receive({ type: "assigned", channel: "chan-a", resumeToken: "tok-a" });
+    main({ kind: "rest-token", token: TOKEN, savedAt: 5, reason: "sync" });
+    expect(ws2.sent.at(-1)).toMatchObject({ type: "set_rest_token", token: TOKEN });
+    expect(badge()).toBe("Checking…");
+    ws2.receive({ type: "rest_status", status: { state: "valid", source: "plugin", handle: "h" } });
+    expect(badge()).toBe("Valid (@h)");
+  });
+});
+

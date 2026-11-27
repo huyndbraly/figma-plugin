@@ -350,7 +350,9 @@ export function reverseFlexOrder(kids: CapturedNode[], row: boolean, wraps: bool
   if (!wraps) return [...kids].sort(byMain);
   const lines: Array<{ start: number; end: number; items: CapturedNode[] }> = [];
   for (const k of [...kids].sort((a, b) => crossStart(a) - crossStart(b))) {
-    const line = lines.find((l) => crossStart(k) < l.end && crossEnd(k) > l.start);
+    // Inclusive for a zero-size box (an empty spacer) — it touches its line.
+    const zero = crossEnd(k) <= crossStart(k);
+    const line = lines.find((l) => (zero ? crossStart(k) >= l.start && crossStart(k) <= l.end : crossStart(k) < l.end && crossEnd(k) > l.start));
     if (line) {
       line.items.push(k);
       line.start = Math.min(line.start, crossStart(k));

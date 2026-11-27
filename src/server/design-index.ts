@@ -11,7 +11,7 @@
  * Metadata only — names, ids, keys, types, descriptions. No node trees, no
  * images, no token. The folder is gitignored; `FIGMA_CACHE=off` disables it.
  */
-import { link, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileNameKey } from "../shared/figma-url.js";
 
@@ -206,14 +206,30 @@ export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) =>
         hardLinks = false;
       }
     }
+    // No hard links here: an exclusive create. If the create worked but the
+    // write did not (ENOSPC, EIO), the file is OURS — remove it, or every
+    // other writer would wait on an empty lock nobody holds.
+    let created = false;
     try {
-      await writeFile(lockPath, pid, { flag: "wx" });
+      const h = await open(lockPath, "wx");
+      created = true;
+      try {
+        await h.writeFile(pid);
+      } finally {
+        await h.close();
+      }
       myIno = (await stat(lockPath)).ino;
       return true;
     } catch (e) {
+      if (created) {
+        await unlink(lockPath).catch(() => undefined);
+        return undefined;
+      }
       return (e as NodeJS.ErrnoException).code === "EEXIST" ? false : undefined;
     }
   };
+  /** Inode numbers mean something here (some FAT/SMB drivers report 0 or make them up). */
+  const inodesUsable = () => hardLinks && !!myIno;
   try {
     const deadline = Date.now() + LOCK_WAIT_MS;
     while (Date.now() < deadline) {
@@ -235,14 +251,30 @@ export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) =>
       }
       const ownerPid = lockOwner(owner);
       const age = Date.now() - seen.mtimeMs;
-      const breakable = (ownerPid !== null && !alive(ownerPid)) || (ownerPid === null && age > LOCK_NO_PID_MS) || age > LOCK_STALE_MS;
+      const breakable =
+        (ownerPid !== null && !alive(ownerPid)) ||
+        // Our OWN pid on a lock this process does not hold: a crashed
+        // predecessor that had the same pid (a container's pid 1).
+        (ownerPid === process.pid && !heldHere.has(lockPath)) ||
+        (ownerPid === null && age > LOCK_NO_PID_MS) ||
+        age > LOCK_STALE_MS;
       if (breakable) {
         const grave = `${lockPath}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}.stale`;
         const moved = await rename(lockPath, grave).then(() => true, () => false);
         if (moved) {
-          const ino = await stat(grave).then((g) => g.ino, () => seen.ino);
-          // Someone took the lock between our look and our rename: give it back.
-          if (ino !== seen.ino) await link(grave, lockPath).catch(() => undefined);
+          const [g, content] = await Promise.all([stat(grave).catch(() => null), readFile(grave, "utf8").catch(() => null)]);
+          // Someone took the lock between our look and our rename: its content
+          // (a live pid) differs — or, where inodes are stable, its inode does.
+          const taken = (content !== null && content !== owner) || (inodesUsable() && !!g && !!seen.ino && g.ino !== seen.ino);
+          let restored = false;
+          if (taken) {
+            restored = await link(grave, lockPath).then(() => true, () => false);
+            // No hard links (or link refused): move it back, if nobody else took the place.
+            if (!restored && !(await stat(lockPath).then(() => true, () => false))) {
+              restored = await rename(grave, lockPath).then(() => true, () => false);
+              if (restored) continue; // the grave IS the lock again
+            }
+          }
           await unlink(grave).catch(() => undefined);
           continue;
         }
@@ -252,15 +284,24 @@ export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) =>
   } finally {
     await unlink(mine).catch(() => undefined);
   }
+  if (held) heldHere.add(lockPath);
   try {
     return await fn(held);
   } finally {
     if (held) {
-      const ino = await stat(lockPath).then((st) => st.ino, () => undefined);
-      if (ino !== undefined && ino === myIno) await unlink(lockPath).catch(() => undefined);
+      heldHere.delete(lockPath);
+      // Still OURS: our pid inside, and — where inodes mean something — our
+      // inode (a freed inode is handed out again at once on ext4, so the
+      // content check is what tells a newcomer apart).
+      const [st, content] = await Promise.all([stat(lockPath).catch(() => null), readFile(lockPath, "utf8").catch(() => null)]);
+      const ours = st !== null && content !== null && lockOwner(content) === process.pid && (!inodesUsable() || !st.ino || st.ino === myIno);
+      if (ours) await unlink(lockPath).catch(() => undefined);
     }
   }
 }
+
+/** Lock paths this process holds right now (a lock with our pid that is NOT here is a dead predecessor's). */
+const heldHere = new Set<string>();
 
 export class DesignIndex {
   readonly dir: string;

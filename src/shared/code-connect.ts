@@ -231,7 +231,7 @@ function skipNonCode(src: string, i: number): number {
   return i;
 }
 
-const STRING_AFTER_WORD = new Set(["return", "case", "typeof", "in", "of", "else", "void", "yield", "await", "delete", "throw", "new", "instanceof", "do", "export", "default", "from", "import"]);
+const STRING_AFTER_WORD = new Set(["return", "case", "typeof", "in", "of", "else", "void", "yield", "await", "delete", "throw", "new", "instanceof", "do", "export", "default", "from", "import", "as", "satisfies", "extends", "keyof"]);
 
 /** Can a string literal start at `i` (judged by what comes before it)? */
 function stringCanStart(src: string, i: number): boolean {
@@ -242,9 +242,16 @@ function stringCanStart(src: string, i: number): boolean {
   if (/[\w$]/.test(p)) {
     let w = k;
     while (w >= 0 && /[\w$]/.test(src[w]!)) w--;
-    return STRING_AFTER_WORD.has(src.slice(w + 1, k + 1));
+    if (!STRING_AFTER_WORD.has(src.slice(w + 1, k + 1))) return false;
+    // A keyword in PROSE ("Best of '90s" in JSX text) follows another word or
+    // a tag's `>`; a real `return 'x'` / `case 'a'` follows code punctuation.
+    let q = w;
+    while (q >= 0 && /[ \t]/.test(src[q]!)) q--;
+    return q < 0 || !/[\w$>]/.test(src[q]!);
   }
-  return "([{,=:;?!&|+-*%<>~^".includes(p);
+  // `>` closes a JSX tag (`<p>'Tis`) — text follows; only `=>` starts an expression.
+  if (p === ">") return src[k - 1] === "=";
+  return "([{,=:;?!&|+-*%<~^".includes(p);
 }
 
 function skipTemplate(src: string, i: number): number {

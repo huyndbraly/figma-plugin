@@ -341,7 +341,7 @@ describe("redraw, fifth pass (review)", () => {
     expect(section.children).toContain(copy);
   });
 
-  it("a connector inside an INSTANCE is not touched or counted", async () => {
+  it("a connector inside an INSTANCE is not edited, but its dangling end is reported", async () => {
     const page: any = { type: "PAGE", children: [] as any[], findAllWithCriteria: ({ types }: { types: string[] }) => made.filter((n) => types.includes(n.type) && !n.removed) };
     const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
     const section = made.find((n) => n.id === first.sectionId);
@@ -354,8 +354,8 @@ describe("redraw, fifth pass (review)", () => {
     inner.connectorEnd = { endpointNodeId: first.nodeIds.cart, magnet: "AUTO" };
     const c2 = ctx({ ...DIAGRAM, intoSectionId: section.id });
     await createFigjamDiagram(c2);
-    expect(inner.connectorEnd.endpointNodeId).toBe(first.nodeIds.cart);
-    expect(c2.warnings.join("\n")).not.toMatch(/end\(s\) of connectors/);
+    expect(inner.connectorEnd.endpointNodeId).toBe(first.nodeIds.cart); // not edited…
+    expect(c2.warnings.join("\n")).toMatch(/1 end\(s\) of connectors.*inside an instance/); // …but reported
   });
 
   it("a FigJam section with an unreadable marker is listed as unreadable by get_page_model", async () => {

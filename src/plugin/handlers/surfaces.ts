@@ -172,21 +172,24 @@ export async function createFigjamDiagram(ctx: HandlerContext): Promise<unknown>
   // thrown: the new drawing is complete by now and must replace the old.
   let dangling = 0;
   for (const c of connectorsAround(section)) {
-    if (prevIds.has(c.id) || drawnIds.has(c.id) || insideInstance(c)) continue;
+    if (prevIds.has(c.id) || drawnIds.has(c.id)) continue;
+    // Inside an instance: not editable — but an end left on a removed shape
+    // is still reported.
+    const frozen = insideInstance(c);
     for (const end of ["connectorStart", "connectorEnd"] as const) {
       const e = c[end] as { endpointNodeId?: string; magnet?: "NONE" | "AUTO" | "TOP" | "LEFT" | "BOTTOM" | "RIGHT" | "CENTER" };
       if (!e || !e.endpointNodeId || !prevIds.has(e.endpointNodeId)) continue;
       const tag = tagOf.get(e.endpointNodeId);
       const to = tag ? idMap[tag] : undefined;
       try {
-        if (!to) throw new Error("no new shape");
+        if (!to || frozen) throw new Error("cannot move");
         c[end] = { endpointNodeId: to, magnet: e.magnet && e.magnet !== "NONE" ? e.magnet : "AUTO" };
       } catch {
         dangling++;
       }
     }
   }
-  if (dangling) ctx.warn(`${dangling} end(s) of connectors you drew pointed at shapes this redraw removed and could not be moved to a new shape (the shape is no longer in the model, or Figma refused the change) — check them.`);
+  if (dangling) ctx.warn(`${dangling} end(s) of connectors you drew pointed at shapes this redraw removed and could not be moved to a new shape (the shape is no longer in the model, the connector is inside an instance, or Figma refused the change) — check them.`);
   for (const n of previous) if (!n.removed) n.remove();
   section.setPluginData(
     FIGJAM_MARKER,
