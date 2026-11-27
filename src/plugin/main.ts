@@ -12,6 +12,7 @@ import { toBridgeError, err } from "./errors.js";
 import { HANDLERS, assertRegistryComplete, Handler } from "./handlers/registry.js";
 import { installDiagramLive } from "./diagram-live.js";
 import { readStoredToken, saveToken, clearToken } from "./rest-token-store.js";
+import { readStoredAiKeys, saveAiKey } from "./ai-key-store.js";
 
 declare const __VERSION__: string;
 declare const __BUILD__: string;
@@ -39,6 +40,10 @@ type UiToMain =
   // After each `assigned`: what clientStorage holds NOW (another window may
   // have saved or cleared since this one started).
   | { kind: "rest-token-request" }
+  // The AI Image Key field: save (key) or clear (null) one provider's key,
+  // or ask for what clientStorage holds (after `assigned`).
+  | { kind: "save-ai-key"; provider: string; key: string | null }
+  | { kind: "ai-keys-request" }
   // The panel's language, kept in clientStorage (the iframe's localStorage
   // does not persist in Figma).
   | { kind: "save-ui-lang"; lang: string }
@@ -59,6 +64,8 @@ type MainToUi =
   // the server with set_rest_token; it never shows the value.
   | { kind: "rest-token"; token: string | null; expiresAt?: number | null; savedAt?: number | null; reason: "saved" | "cleared" | "rejected" | "sync"; error?: string }
   | { kind: "ui-lang"; lang: string | null }
+  // The stored AI keys. The UI forwards them with set_ai_keys; it never shows them.
+  | { kind: "ai-keys"; keys: Record<string, string>; savedAt: number | null; reason: "saved" | "sync" | "rejected"; error?: string }
   | {
       kind: "local";
       id: string;
@@ -413,6 +420,17 @@ figma.ui.onmessage = async (msg: UiToMain) => {
         break;
       }
       post({ kind: "rest-token", token: res.stored.token, expiresAt: res.stored.expiresAt, savedAt: res.stored.savedAt, reason: "saved" });
+      break;
+    }
+    case "save-ai-key": {
+      const res = await saveAiKey(figma.clientStorage, msg.provider, typeof msg.key === "string" ? msg.key : null, Date.now());
+      if (!res.ok) post({ kind: "ai-keys", keys: {}, savedAt: null, reason: "rejected", error: res.error });
+      else post({ kind: "ai-keys", keys: res.stored.keys, savedAt: res.stored.savedAt, reason: "saved" });
+      break;
+    }
+    case "ai-keys-request": {
+      const stored = await readStoredAiKeys(figma.clientStorage);
+      post({ kind: "ai-keys", keys: stored.keys, savedAt: stored.savedAt, reason: "sync" });
       break;
     }
     case "rest-token-request": {

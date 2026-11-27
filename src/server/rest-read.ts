@@ -12,6 +12,7 @@
  * Supported: get_document_info, get_node, get_nodes, get_design_context,
  * generate_design_md (rest-features.ts), screenshot, export_node. Anything else needs the plugin and says so.
  */
+import { describeMotion } from "../shared/motion.js";
 import { ErrorCode, OpError } from "./errors.js";
 import { restGenerateDesignMd } from "./rest-features.js";
 import { restError, retryDelayMs } from "./rest-hub.js";
@@ -161,6 +162,11 @@ function serialize(node: Json, parentBox: Json | undefined, c: Ctx): Json {
   }
   if (c.detail === "compact") return out;
 
+  // Prototype motion of a closed file, the plugin's shape (full/design, as there).
+  if (Array.isArray(node.interactions) && node.interactions.length) {
+    const motion = describeMotion(node.interactions as unknown[], "ms");
+    if (motion.length) out.motion = motion;
+  }
   if (typeof node.cornerRadius === "number" && node.cornerRadius !== 0) out.cornerRadius = node.cornerRadius;
   else if (Array.isArray(node.rectangleCornerRadii)) out.cornerRadii = node.rectangleCornerRadii;
   const strokes = compactPaints(node.strokes);

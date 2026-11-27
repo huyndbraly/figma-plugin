@@ -56,3 +56,26 @@ describe("describeMotion", () => {
     expect(describeMotion(undefined)).toEqual([]);
   });
 });
+
+describe("motion from a closed file (REST interactions)", () => {
+  // @figma/rest-api-spec: transition duration is MILLISECONDS in REST
+  // (seconds in the Plugin API); trigger delay/timeout ms in both.
+  const interactions = [
+    {
+      trigger: { type: "ON_HOVER" },
+      actions: [{ type: "NODE", destinationId: "4:2", navigation: "CHANGE_TO", transition: { type: "SMART_ANIMATE", duration: 300, easing: { type: "CUSTOM_CUBIC_BEZIER", easingFunctionCubicBezier: { x1: 0.2, y1: 0, x2: 0, y2: 1 } } } }],
+    },
+    {
+      trigger: { type: "AFTER_TIMEOUT", timeout: 800 },
+      actions: [{ type: "NODE", destinationId: "4:3", navigation: "NAVIGATE", transition: { type: "MOVE_IN", direction: "LEFT", duration: 450, easing: { type: "GENTLE" } } }],
+    },
+  ];
+
+  it("describeMotion(…, \"ms\") gives the same seconds the plugin path gives", () => {
+    const m = describeMotion(interactions, "ms");
+    expect(m[0]!.actions[0]!.transition).toEqual({ type: "SMART_ANIMATE", duration: 0.3, easing: { type: "CUSTOM_CUBIC_BEZIER", bezier: [0.2, 0, 0, 1] }, css: "300ms cubic-bezier(0.2, 0, 0, 1)" });
+    expect(m[1]!.trigger).toEqual({ type: "AFTER_TIMEOUT", timeout: 0.8 });
+    expect(m[1]!.actions[0]!.transition).toMatchObject({ type: "MOVE_IN", direction: "LEFT", duration: 0.45, easing: { spring: { mass: 1, stiffness: 100, damping: 15 } } });
+    expect(m[1]!.actions[0]!.transition!.css).toBeUndefined(); // a spring has no CSS timing
+  });
+});

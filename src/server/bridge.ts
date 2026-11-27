@@ -52,6 +52,7 @@ import {
   type RestStatusWire,
   type RestStatusUpdate,
   type RestEventWire,
+  type AiStatusUpdate,
   type WireMessage,
 } from "../shared/protocol.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
@@ -261,6 +262,8 @@ export interface BridgeHandlers {
    * it; whoever handles this owns it (see rest-hub.ts).
    */
   onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null; savedAt?: number | null }) => void;
+  /** A plugin window sent its saved AI keys (see ai-keys.ts). Never stored or echoed here. */
+  onAiKeys?: (keys: Record<string, unknown>, savedAt: number | null) => void;
 }
 
 export interface BridgeOptions {
@@ -535,6 +538,11 @@ export class Bridge {
   }
 
   /** What a window joining now is told about the REST token (rest_status). */
+  private aiStatusProvider?: () => AiStatusUpdate["status"];
+  setAiStatusProvider(fn: () => AiStatusUpdate["status"]): void {
+    this.aiStatusProvider = fn;
+  }
+
   setRestStatusProvider(fn: () => RestStatusWire): void {
     this.restStatusProvider = fn;
   }
@@ -543,7 +551,7 @@ export class Bridge {
    * Push a server→plugin message to every established window (REST token
    * status, REST activity). Never used for requests — those are routed.
    */
-  broadcast(msg: RestStatusUpdate | RestEventWire): void {
+  broadcast(msg: RestStatusUpdate | RestEventWire | AiStatusUpdate): void {
     for (const conn of this.channels.values()) conn.send(msg);
   }
 
@@ -781,6 +789,16 @@ export class Bridge {
         const exp = (msg as { expiresAt?: unknown }).expiresAt;
         const saved = (msg as { savedAt?: unknown }).savedAt;
         this.handlers.onRestToken?.(token, conn.channel, { expiresAt: typeof exp === "number" ? exp : null, savedAt: typeof saved === "number" ? saved : null });
+        break;
+      }
+      case "set_ai_keys": {
+        if (!conn) break;
+        const keys = (msg as { keys?: unknown }).keys;
+        if (!keys || typeof keys !== "object" || Array.isArray(keys)) break;
+        const saved = (msg as { savedAt?: unknown }).savedAt;
+        this.handlers.onAiKeys?.(keys as Record<string, unknown>, typeof saved === "number" ? saved : null);
+        // Always answer the sender, changed or not: its badge is waiting.
+        if (this.aiStatusProvider) conn.send({ type: "ai_status", status: this.aiStatusProvider() });
         break;
       }
       case "context": {

@@ -1,47 +1,88 @@
 /**
- * Bring-your-own-key generation: an image (OpenAI Images) or an SVG (Anthropic
- * Messages) from a prompt, placed on the canvas by figma_write.
+ * Bring-your-own-key generation: an image (OpenAI Images, Google Gemini or
+ * Black Forest Labs Flux) or an SVG (Anthropic Messages) from a prompt,
+ * placed on the canvas by figma_write.
  *
- * Keys come from the environment — OPENAI_API_KEY / ANTHROPIC_API_KEY, or the
- * FIGMA_MCP_-prefixed variants — or from an optional JSON file named by
- * FIGMA_MCP_BYOK_CONFIG ({ openaiApiKey, anthropicApiKey, imageModel,
- * svgModel }). Like the Figma token, a key is only ever a request header: it
- * is not logged, not echoed, and every error says which variable to set,
- * never what it was set to.
+ * Keys come, per provider, from the plugin panel's "AI Image Key" field
+ * (held in RAM — ai-keys.ts), else the environment (OPENAI_API_KEY,
+ * GEMINI_API_KEY / GOOGLE_API_KEY, BFL_API_KEY, ANTHROPIC_API_KEY, or the
+ * FIGMA_MCP_-prefixed variants), else an optional JSON file named by
+ * FIGMA_MCP_BYOK_CONFIG. Like the Figma token, a key is only ever a request
+ * header: it is not logged, not echoed (provider error text is scrubbed of
+ * it), and every error says where to set it, never what it was set to.
  */
 import { readFileSync } from "node:fs";
 import { ErrorCode, OpError } from "./errors.js";
 import { withTimeout } from "./rest-hub.js";
+import { aiKeys, type AiKeyStore } from "./ai-keys.js";
+import { sniffImage } from "./image-file.js";
+import { AI_PROVIDER_LABELS, IMAGE_PROVIDERS, isImageProvider, type ImageProvider } from "../shared/ai-key.js";
 
 export type AiFetch = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface ByokConfig {
   openaiApiKey?: string;
+  geminiApiKey?: string;
+  fluxApiKey?: string;
   anthropicApiKey?: string;
+  /** Which image provider to use when the call names none (and it has a key). */
+  imageProvider?: ImageProvider;
+  /** OpenAI image model (FIGMA_MCP_IMAGE_MODEL). */
   imageModel?: string;
+  geminiModel?: string;
+  fluxModel?: string;
   svgModel?: string;
 }
 
 export const DEFAULT_IMAGE_MODEL = "gpt-image-1";
+export const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-image";
+export const DEFAULT_FLUX_MODEL = "flux-pro-1.1";
 export const DEFAULT_SVG_MODEL = "claude-sonnet-5-5";
 
-export function loadByokConfig(env: NodeJS.ProcessEnv = process.env): ByokConfig {
-  let file: ByokConfig = {};
-  const path = env.FIGMA_MCP_BYOK_CONFIG;
-  if (path) {
-    try {
-      file = JSON.parse(readFileSync(path, "utf8")) as ByokConfig;
-    } catch {
-      throw new OpError(ErrorCode.INVALID_PARAMS, "FIGMA_MCP_BYOK_CONFIG points at a file that is not readable JSON.", "It should hold { openaiApiKey?, anthropicApiKey?, imageModel?, svgModel? }.");
-    }
-  }
-  const pick = (...v: Array<string | undefined>) => v.find((x) => typeof x === "string" && x.trim())?.trim();
+const pick = (...v: Array<unknown>): string | undefined => {
+  const hit = v.find((x) => typeof x === "string" && x.trim());
+  return typeof hit === "string" ? hit.trim() : undefined;
+};
+
+/** The environment's (and config file's) keys alone — what figma_status shows as source "env". */
+export function envAiKeys(env: NodeJS.ProcessEnv = process.env, file: ByokConfig = {}): { openai?: string; gemini?: string; flux?: string; anthropic?: string } {
   return {
-    ...(pick(env.FIGMA_MCP_OPENAI_API_KEY, env.OPENAI_API_KEY, file.openaiApiKey) ? { openaiApiKey: pick(env.FIGMA_MCP_OPENAI_API_KEY, env.OPENAI_API_KEY, file.openaiApiKey) } : {}),
-    ...(pick(env.FIGMA_MCP_ANTHROPIC_API_KEY, env.ANTHROPIC_API_KEY, file.anthropicApiKey) ? { anthropicApiKey: pick(env.FIGMA_MCP_ANTHROPIC_API_KEY, env.ANTHROPIC_API_KEY, file.anthropicApiKey) } : {}),
-    imageModel: pick(env.FIGMA_MCP_IMAGE_MODEL, file.imageModel) ?? DEFAULT_IMAGE_MODEL,
-    svgModel: pick(env.FIGMA_MCP_SVG_MODEL, file.svgModel) ?? DEFAULT_SVG_MODEL,
+    openai: pick(env.FIGMA_MCP_OPENAI_API_KEY, env.OPENAI_API_KEY, file.openaiApiKey),
+    gemini: pick(env.FIGMA_MCP_GEMINI_API_KEY, env.GEMINI_API_KEY, env.GOOGLE_API_KEY, file.geminiApiKey),
+    flux: pick(env.FIGMA_MCP_FLUX_API_KEY, env.BFL_API_KEY, file.fluxApiKey),
+    anthropic: pick(env.FIGMA_MCP_ANTHROPIC_API_KEY, env.ANTHROPIC_API_KEY, file.anthropicApiKey),
   };
+}
+
+export function readByokFile(env: NodeJS.ProcessEnv = process.env): ByokConfig {
+  const path = env.FIGMA_MCP_BYOK_CONFIG;
+  if (!path) return {};
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as ByokConfig;
+  } catch {
+    throw new OpError(ErrorCode.INVALID_PARAMS, "FIGMA_MCP_BYOK_CONFIG points at a file that is not readable JSON.", "It should hold { openaiApiKey?, geminiApiKey?, fluxApiKey?, anthropicApiKey?, imageProvider?, imageModel?, geminiModel?, fluxModel?, svgModel? }.");
+  }
+}
+
+/** Panel keys first (the user typed them for this), then env, then the config file. */
+export function loadByokConfig(env: NodeJS.ProcessEnv = process.env, panel: AiKeyStore = aiKeys): ByokConfig {
+  const file = readByokFile(env);
+  const fromEnv = envAiKeys(env, file);
+  const key = (p: "openai" | "gemini" | "flux" | "anthropic") => panel.get(p) ?? fromEnv[p];
+  const provider = pick(env.FIGMA_MCP_IMAGE_PROVIDER, file.imageProvider);
+  const out: ByokConfig = {
+    imageModel: pick(env.FIGMA_MCP_IMAGE_MODEL, file.imageModel) ?? DEFAULT_IMAGE_MODEL,
+    geminiModel: pick(env.FIGMA_MCP_GEMINI_MODEL, file.geminiModel) ?? DEFAULT_GEMINI_MODEL,
+    fluxModel: pick(env.FIGMA_MCP_FLUX_MODEL, file.fluxModel) ?? DEFAULT_FLUX_MODEL,
+    svgModel: pick(env.FIGMA_MCP_SVG_MODEL, file.svgModel) ?? DEFAULT_SVG_MODEL,
+    ...(isImageProvider(provider) ? { imageProvider: provider } : {}),
+  };
+  const o = key("openai"), g = key("gemini"), f = key("flux"), a = key("anthropic");
+  if (o) out.openaiApiKey = o;
+  if (g) out.geminiApiKey = g;
+  if (f) out.fluxApiKey = f;
+  if (a) out.anthropicApiKey = a;
+  return out;
 }
 
 function prompted(prompt: unknown): string {
@@ -53,27 +94,170 @@ function prompted(prompt: unknown): string {
 
 const SIZES = ["1024x1024", "1536x1024", "1024x1536", "auto"];
 
-/** → base64 PNG bytes. */
-export async function generateImage(prompt: unknown, opts: { size?: string; quality?: string } = {}, cfg: ByokConfig = loadByokConfig(), fetchImpl: AiFetch = (u, i) => fetch(u, i), signal?: AbortSignal): Promise<{ base64: string; model: string; size: string }> {
-  const text = prompted(prompt);
-  if (!cfg.openaiApiKey) {
-    throw new OpError(ErrorCode.UNAUTHORIZED, "No image-generation key is configured.", "Set OPENAI_API_KEY (or FIGMA_MCP_OPENAI_API_KEY) in the MCP server's environment, or put openaiApiKey in the JSON file FIGMA_MCP_BYOK_CONFIG names, then restart the server.");
+const KEY_HINT = "Ask the user to paste a key into the plugin panel's AI Image Key field (pick the provider), or to set OPENAI_API_KEY / GEMINI_API_KEY / BFL_API_KEY in the MCP server's environment. Never ask for a key in chat.";
+
+function keyOf(cfg: ByokConfig, p: ImageProvider): string | undefined {
+  return p === "openai" ? cfg.openaiApiKey : p === "gemini" ? cfg.geminiApiKey : cfg.fluxApiKey;
+}
+
+/** The provider a call uses: the one asked for, else the preferred one, else the first with a key. */
+export function chooseImageProvider(cfg: ByokConfig, asked?: unknown): ImageProvider {
+  if (asked !== undefined) {
+    if (!isImageProvider(asked)) throw new OpError(ErrorCode.INVALID_PARAMS, `Unknown image provider ${JSON.stringify(asked)}.`, `Use one of: ${IMAGE_PROVIDERS.join(", ")}.`);
+    if (!keyOf(cfg, asked)) throw new OpError(ErrorCode.UNAUTHORIZED, `No ${AI_PROVIDER_LABELS[asked]} key is configured.`, KEY_HINT);
+    return asked;
   }
+  if (cfg.imageProvider && keyOf(cfg, cfg.imageProvider)) return cfg.imageProvider;
+  const any = IMAGE_PROVIDERS.find((p) => keyOf(cfg, p));
+  if (!any) throw new OpError(ErrorCode.UNAUTHORIZED, "No image-generation key is configured (OpenAI, Gemini or Flux).", KEY_HINT);
+  return any;
+}
+
+/** Provider error text with the key scrubbed out, short. */
+function scrub(text: string, key: string): string {
+  return (key ? text.split(key).join("…") : text).replace(/\s+/g, " ").slice(0, 200);
+}
+
+function refused(provider: ImageProvider, status: number): OpError {
+  return new OpError(ErrorCode.UNAUTHORIZED, `${AI_PROVIDER_LABELS[provider]} refused the key (${status}).`, `Check the ${AI_PROVIDER_LABELS[provider]} key is valid and has image access; replace it in the plugin panel's AI Image Key field.`);
+}
+
+function rateLimited(provider: ImageProvider): OpError {
+  return new OpError(ErrorCode.RATE_LIMITED, `${AI_PROVIDER_LABELS[provider]} is rate-limiting this key (429).`, "Wait and retry, use another provider ({ provider }), or a key with a higher limit.");
+}
+
+/** The aspect ratio Gemini takes for one of the OpenAI-style sizes. */
+function aspectOf(size: string): string {
+  return size === "1536x1024" ? "3:2" : size === "1024x1536" ? "2:3" : "1:1";
+}
+
+function dims(size: string): { w: number; h: number } {
+  const m = /^(\d+)x(\d+)$/.exec(size);
+  return m ? { w: Number(m[1]), h: Number(m[2]) } : { w: 1024, h: 1024 };
+}
+
+export interface GenerateImageOptions {
+  size?: string;
+  quality?: string;
+  provider?: unknown;
+  /** Test seam: Flux's polling delay. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** → base64 image bytes (PNG or JPEG) from the chosen provider. */
+export async function generateImage(prompt: unknown, opts: GenerateImageOptions = {}, cfg: ByokConfig = loadByokConfig(), fetchImpl: AiFetch = (u, i) => fetch(u, i), signal?: AbortSignal): Promise<{ base64: string; model: string; size: string; provider: ImageProvider }> {
+  const text = prompted(prompt);
+  const provider = chooseImageProvider(cfg, opts.provider);
   const size = opts.size && SIZES.includes(opts.size) ? opts.size : "1024x1024";
+  const key = keyOf(cfg, provider)!;
+  let out: { base64: string; model: string };
+  if (provider === "openai") out = await openaiImage(text, size, opts.quality, key, cfg, fetchImpl, signal);
+  else if (provider === "gemini") out = await geminiImage(text, size, key, cfg, fetchImpl, signal);
+  else out = await fluxImage(text, size, key, cfg, fetchImpl, signal, opts.sleep);
+  const kind = sniffImage(Buffer.from(out.base64.slice(0, 64), "base64"));
+  if (kind !== "png" && kind !== "jpeg") {
+    throw new OpError(ErrorCode.INTERNAL, `${AI_PROVIDER_LABELS[provider]} returned an image Figma cannot decode (${kind ?? "unknown format"}).`, "Retry, or use another provider ({ provider }).");
+  }
+  return { ...out, size, provider };
+}
+
+async function openaiImage(text: string, size: string, quality: string | undefined, key: string, cfg: ByokConfig, fetchImpl: AiFetch, signal?: AbortSignal): Promise<{ base64: string; model: string }> {
   const model = cfg.imageModel ?? DEFAULT_IMAGE_MODEL;
   const res = await fetchImpl("https://api.openai.com/v1/images/generations", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${cfg.openaiApiKey}` },
-    body: JSON.stringify({ model, prompt: text, size, n: 1, ...(opts.quality ? { quality: opts.quality } : {}) }),
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify({ model, prompt: text, size, n: 1, ...(quality ? { quality } : {}) }),
     signal: byokSignal(signal),
   });
-  if (res.status === 401 || res.status === 403) throw new OpError(ErrorCode.UNAUTHORIZED, `The image provider refused the key (${res.status}).`, "Check OPENAI_API_KEY is valid and has image access.");
-  if (res.status === 429) throw new OpError(ErrorCode.INTERNAL, "The image provider is rate-limiting this key (429).", "Wait and retry, or use a key with a higher limit.");
-  if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `Image generation failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+  if (res.status === 401 || res.status === 403) throw refused("openai", res.status);
+  if (res.status === 429) throw rateLimited("openai");
+  if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `Image generation failed: HTTP ${res.status} ${scrub(await res.text(), key)}`, "Check FIGMA_MCP_IMAGE_MODEL names a model the key can use.");
   const body = (await res.json()) as { data?: Array<{ b64_json?: string }> };
   const b64 = body.data?.[0]?.b64_json;
   if (!b64) throw new OpError(ErrorCode.INTERNAL, "The image provider returned no image data.", "Retry; if it persists, try another model with FIGMA_MCP_IMAGE_MODEL.");
-  return { base64: b64, model, size };
+  return { base64: b64, model };
+}
+
+async function geminiImage(text: string, size: string, key: string, cfg: ByokConfig, fetchImpl: AiFetch, signal?: AbortSignal): Promise<{ base64: string; model: string }> {
+  const model = cfg.geminiModel ?? DEFAULT_GEMINI_MODEL;
+  const res = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text }] }],
+      generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: aspectOf(size) } },
+    }),
+    signal: byokSignal(signal),
+  });
+  if (res.status === 401 || res.status === 403) throw refused("gemini", res.status);
+  if (res.status === 429) throw rateLimited("gemini");
+  if (!res.ok) {
+    const body = await res.text();
+    // Google answers a bad key with 400 API_KEY_INVALID, not 401.
+    if (/API_KEY_INVALID|API key not valid/i.test(body)) throw refused("gemini", res.status);
+    throw new OpError(ErrorCode.INTERNAL, `Image generation failed: HTTP ${res.status} ${scrub(body, key)}`, "Check FIGMA_MCP_GEMINI_MODEL names an image model the key can use.");
+  }
+  type Part = { inlineData?: { data?: string }; inline_data?: { data?: string }; text?: string };
+  const body = (await res.json()) as { candidates?: Array<{ content?: { parts?: Part[] }; finishReason?: string }>; promptFeedback?: { blockReason?: string } };
+  const parts = body.candidates?.[0]?.content?.parts ?? [];
+  const b64 = parts.map((p) => p.inlineData?.data ?? p.inline_data?.data).find((d) => typeof d === "string" && d);
+  if (!b64) {
+    const why = body.promptFeedback?.blockReason ?? body.candidates?.[0]?.finishReason;
+    throw new OpError(ErrorCode.INTERNAL, `Gemini returned no image${why ? ` (${why})` : ""}.`, "Rephrase the prompt (Gemini may have declined it), or use another provider.");
+  }
+  return { base64: b64, model };
+}
+
+const FLUX_DEADLINE_MS = 110_000;
+
+/** Only Black Forest Labs' own hosts get the key. */
+function isBflHost(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && (u.hostname === "bfl.ai" || u.hostname.endsWith(".bfl.ai") || u.hostname.endsWith(".bfl.ml"));
+  } catch {
+    return false;
+  }
+}
+
+async function fluxImage(text: string, size: string, key: string, cfg: ByokConfig, fetchImpl: AiFetch, signal?: AbortSignal, sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<{ base64: string; model: string }> {
+  const model = cfg.fluxModel ?? DEFAULT_FLUX_MODEL;
+  const { w, h } = dims(size === "auto" ? "1024x1024" : size);
+  const res = await fetchImpl(`https://api.bfl.ai/v1/${encodeURIComponent(model)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", "x-key": key },
+    body: JSON.stringify({ prompt: text, width: w, height: h, output_format: "png" }),
+    signal: byokSignal(signal),
+  });
+  if (res.status === 401 || res.status === 403) throw refused("flux", res.status);
+  if (res.status === 429) throw rateLimited("flux");
+  if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `Image generation failed: HTTP ${res.status} ${scrub(await res.text(), key)}`, "Check FIGMA_MCP_FLUX_MODEL names a model the key can use (e.g. flux-pro-1.1, flux-dev).");
+  const job = (await res.json()) as { id?: string; polling_url?: string };
+  if (!job.id && !job.polling_url) throw new OpError(ErrorCode.INTERNAL, "Flux returned no job id.", "Retry.");
+  const pollUrl = job.polling_url ?? `https://api.bfl.ai/v1/get_result?id=${encodeURIComponent(job.id!)}`;
+  if (!isBflHost(pollUrl)) throw new OpError(ErrorCode.INTERNAL, "Flux sent a polling URL outside bfl.ai; it was not followed.", "Retry; report it if it persists.");
+  const deadline = Date.now() + FLUX_DEADLINE_MS;
+  for (;;) {
+    if (signal?.aborted) throw new OpError(ErrorCode.INTERNAL, "generateImage was cancelled.", "Call again if it is still needed.");
+    const poll = await fetchImpl(pollUrl, { method: "GET", headers: { accept: "application/json", "x-key": key }, signal: byokSignal(signal) });
+    if (poll.status === 401 || poll.status === 403) throw refused("flux", poll.status);
+    if (poll.status === 429) throw rateLimited("flux");
+    if (!poll.ok) throw new OpError(ErrorCode.INTERNAL, `Flux polling failed: HTTP ${poll.status}`, "Retry.");
+    const st = (await poll.json()) as { status?: string; result?: { sample?: string } };
+    if (st.status === "Ready") {
+      const sample = st.result?.sample;
+      if (typeof sample !== "string" || !/^https:\/\//i.test(sample)) throw new OpError(ErrorCode.INTERNAL, "Flux finished without an image URL.", "Retry.");
+      // The signed delivery URL needs no key — and never gets one.
+      const img = await fetchImpl(sample, { method: "GET", signal: byokSignal(signal) });
+      if (!img.ok) throw new OpError(ErrorCode.INTERNAL, `Downloading the Flux image failed: HTTP ${img.status}`, "Retry (the link expires after a few minutes).");
+      return { base64: Buffer.from(await img.arrayBuffer()).toString("base64"), model };
+    }
+    if (st.status && st.status !== "Pending" && st.status !== "Queued" && st.status !== "Processing") {
+      throw new OpError(ErrorCode.INTERNAL, `Flux did not make the image: ${st.status}.`, /moderat/i.test(st.status) ? "The prompt or result was moderated; rephrase it." : "Retry, or use another provider.");
+    }
+    if (Date.now() > deadline) throw new OpError(ErrorCode.INTERNAL, "Flux did not finish within 110 s.", "Retry, or use a faster model (FIGMA_MCP_FLUX_MODEL=flux-dev).");
+    await sleep(1000);
+  }
 }
 
 /** Elements an illustration needs. Everything else is dropped. */
@@ -217,12 +401,14 @@ function byokSignal(signal?: AbortSignal): AbortSignal | undefined {
   return withTimeout(signal, BYOK_TIMEOUT_MS);
 }
 
+const scrubText = (text: string, key: string | undefined): string => (key ? text.split(key).join("…") : text).replace(/\s+/g, " ").slice(0, 200);
+
 const finiteOr = (v: unknown, d: number): number => (typeof v === "number" && Number.isFinite(v) ? v : d);
 
 export async function generateSvg(prompt: unknown, opts: { width?: number; height?: number; style?: string } = {}, cfg: ByokConfig = loadByokConfig(), fetchImpl: AiFetch = (u, i) => fetch(u, i), signal?: AbortSignal): Promise<{ svg: string; model: string }> {
   const text = prompted(prompt);
   if (!cfg.anthropicApiKey) {
-    throw new OpError(ErrorCode.UNAUTHORIZED, "No SVG-generation key is configured.", "Set ANTHROPIC_API_KEY (or FIGMA_MCP_ANTHROPIC_API_KEY) in the MCP server's environment, or put anthropicApiKey in the JSON file FIGMA_MCP_BYOK_CONFIG names, then restart the server.");
+    throw new OpError(ErrorCode.UNAUTHORIZED, "No SVG-generation key is configured.", "Ask the user to paste an Anthropic key into the plugin panel's AI Image Key field (provider Anthropic), or set ANTHROPIC_API_KEY in the MCP server's environment. Never ask for a key in chat.");
   }
   const w = Math.max(16, Math.min(2048, Math.round(finiteOr(opts.width, 512))));
   const h = Math.max(16, Math.min(2048, Math.round(finiteOr(opts.height, 512))));
@@ -234,9 +420,9 @@ export async function generateSvg(prompt: unknown, opts: { width?: number; heigh
     body: JSON.stringify({ model, max_tokens: 8000, messages: [{ role: "user", content: instruction }] }),
     signal: byokSignal(signal),
   });
-  if (res.status === 401 || res.status === 403) throw new OpError(ErrorCode.UNAUTHORIZED, `The SVG provider refused the key (${res.status}).`, "Check ANTHROPIC_API_KEY is valid.");
-  if (res.status === 429) throw new OpError(ErrorCode.INTERNAL, "The SVG provider is rate-limiting this key (429).", "Wait and retry.");
-  if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `SVG generation failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`, "Check FIGMA_MCP_SVG_MODEL names a model your key can use.");
+  if (res.status === 401 || res.status === 403) throw new OpError(ErrorCode.UNAUTHORIZED, `The SVG provider refused the key (${res.status}).`, "Check the Anthropic key is valid; replace it in the plugin panel's AI Image Key field.");
+  if (res.status === 429) throw new OpError(ErrorCode.RATE_LIMITED, "The SVG provider is rate-limiting this key (429).", "Wait and retry.");
+  if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `SVG generation failed: HTTP ${res.status} ${scrubText(await res.text(), cfg.anthropicApiKey)}`, "Check FIGMA_MCP_SVG_MODEL names a model your key can use.");
   const body = (await res.json()) as { content?: Array<{ type?: string; text?: string }>; stop_reason?: string };
   const out = (body.content ?? []).filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
   if (body.stop_reason === "max_tokens" && !/<\/svg>/i.test(out)) {

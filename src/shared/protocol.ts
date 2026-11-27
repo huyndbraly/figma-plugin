@@ -12,7 +12,9 @@
 //     REST token messages (set_rest_token, rest_status, rest_event).
 // v8: the REST token is no longer read from the hello — only set_rest_token
 //     (with savedAt) after `assigned`; FigJam sections store their model.
-export const PROTOCOL_VERSION = 8;
+// v9: AI keys from the panel (set_ai_keys, ai_status); load_image takes
+//     replaceId / besideId (removeBackground) and keeps clear of the canvas.
+export const PROTOCOL_VERSION = 9;
 
 /** Default bridge port; server falls back to +1..+9 when busy. */
 export const DEFAULT_PORT = 38470;
@@ -276,6 +278,23 @@ export interface RestStatusWire {
   tokenGen?: number;
 }
 
+/**
+ * Plugin → server: the AI keys saved in this plugin's clientStorage (the
+ * "AI Image Key" field), one entry per provider, null = none. Sent after
+ * `assigned` and after every Save/Clear; the server keeps the newest savedAt.
+ */
+export interface SetAiKeys {
+  type: "set_ai_keys";
+  keys: Partial<Record<"openai" | "gemini" | "flux" | "anthropic", string | null>>;
+  savedAt?: number | null;
+}
+
+/** Server → plugin: which providers have a key (masked) — never a key. */
+export interface AiStatusUpdate {
+  type: "ai_status";
+  status: { providers: Array<{ provider: string; source: "plugin" | "env"; masked: string }> };
+}
+
 /** Server → plugin: the REST token's state changed (or a window just joined). */
 export interface RestStatusUpdate {
   type: "rest_status";
@@ -365,6 +384,8 @@ export type WireMessage =
   | PluginContext
   | SetRestToken
   | RestStatusUpdate
+  | SetAiKeys
+  | AiStatusUpdate
   | RestEventWire
   | Heartbeat;
 
