@@ -38,9 +38,10 @@ beforeAll(async () => {
   await import("../../src/plugin/main.js");
 });
 
+// main.ts's handler is async and awaits clientStorage: awaiting it is the
+// condition (no guessed sleep).
 const send = async (m: unknown) => {
   await onmessage?.(m);
-  await new Promise((r) => setTimeout(r, 5));
 };
 const lastOf = (kind: string) => [...posted].reverse().find((m) => m.kind === kind);
 

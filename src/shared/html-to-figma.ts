@@ -283,7 +283,11 @@ function convert(n: CapturedNode, parentRect: CapturedNode["rect"] | null, paren
     // *-reverse lays the DOM order out backwards; auto-layout follows child
     // order — so reorder by POSITION (left→right / top→bottom), which also
     // keeps the measured gap below positive.
-    if (/reverse/.test(st.flexDirection ?? "")) kids = [...kids].sort((a, b) => (row ? a.rect.x - b.rect.x : a.rect.y - b.rect.y));
+    // Two keys, so a wrapped reversed row sorts line by line instead of
+    // interleaving its lines (rows: top, then left; columns: left, then top).
+    if (/reverse/.test(st.flexDirection ?? "")) {
+      kids = [...kids].sort((a, b) => (row ? a.rect.y - b.rect.y || a.rect.x - b.rect.x : a.rect.x - b.rect.x || a.rect.y - b.rect.y));
+    }
     spec.layoutMode = row ? "HORIZONTAL" : "VERTICAL";
     const gap = px(row ? st.columnGap ?? st.gap : st.rowGap ?? st.gap);
     spec.itemSpacing = gap > 0 ? r1(gap) : gapBetween(kids, row ? "x" : "y");

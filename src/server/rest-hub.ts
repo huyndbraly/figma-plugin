@@ -61,6 +61,11 @@ export interface TokenStatus {
   scopes?: string[];
   /** Scopes a real request was refused for ("This endpoint requires …"). */
   missingScopes?: string[];
+  /**
+   * Changes when (and only when) the token in use changes — a follower keys
+   * its read cache on the leader's, which a 4-character mask cannot do.
+   */
+  tokenGen?: number;
   /** Rate-limited: when Figma said to try again (epoch ms, from Retry-After). */
   retryAt?: number;
   /** Rate-limited: Figma's plan tier / limit type headers ("starter", "low"). */
@@ -248,13 +253,19 @@ export function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal 
   const any = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
   if (typeof any === "function") return any(list);
   const ctl = new AbortController();
+  // Each listener is removed once the combined signal aborts, from ANY
+  // source: a long-lived caller signal must not collect one listener per request.
+  const unhook: Array<() => void> = [];
   for (const sig of list) {
     if (sig.aborted) {
       ctl.abort(sig.reason);
       break;
     }
-    sig.addEventListener("abort", () => ctl.abort(sig.reason), { once: true });
+    const on = () => ctl.abort(sig.reason);
+    sig.addEventListener("abort", on, { once: true });
+    unhook.push(() => sig.removeEventListener("abort", on));
   }
+  ctl.signal.addEventListener("abort", () => unhook.forEach((f) => f()), { once: true });
   return ctl.signal;
 }
 
@@ -487,8 +498,17 @@ export class RestHub {
   getStatus(): TokenStatus {
     // A rate limit whose Retry-After has passed is not a rate limit any more:
     // nothing else would clear it, since agents are told to avoid REST meanwhile.
-    if (this.status.state === "rate_limited" && this.status.retryAt && this.now() >= this.status.retryAt) this.expireRateLimit();
+    this.refreshRateLimit();
     return { ...this.status };
+  }
+
+  /** Expire a rate limit whose time has come. Returns true when it did (and so emitted). */
+  private refreshRateLimit(): boolean {
+    if (this.status.state === "rate_limited" && this.status.retryAt && this.now() >= this.status.retryAt) {
+      this.expireRateLimit();
+      return true;
+    }
+    return false;
   }
 
   /** rate_limited → unverified, told to every listener (the panels' badges). */
@@ -507,15 +527,19 @@ export class RestHub {
     const ms = Math.min(2_147_483_000, Math.max(0, retryAt - this.now()));
     this.agingTimer = setTimeout(() => {
       this.agingTimer = undefined;
-      if (this.status.state === "rate_limited" && this.status.retryAt === retryAt) this.expireRateLimit();
+      if (this.status.state !== "rate_limited" || this.status.retryAt !== retryAt) return;
+      // A Retry-After longer than a timer can wait (~24.8 days) is reached in steps.
+      if (this.now() < retryAt) this.scheduleAging(retryAt);
+      else this.expireRateLimit();
     }, ms);
     this.agingTimer.unref?.();
   }
 
   /** Say the current state again — every set_rest_token gets an answer, even "nothing changed". */
   private rebroadcast(): TokenStatus {
-    this.setStatus(this.getStatus());
-    return this.getStatus();
+    // One emit: if expiring a rate limit already told everyone, that was it.
+    if (!this.refreshRateLimit()) this.setStatus(this.status);
+    return { ...this.status };
   }
 
   /**
@@ -559,11 +583,14 @@ export class RestHub {
    * under the old one.
    */
   async cacheKey(): Promise<string> {
-    if (this.token() || !this.remote()) return `local|${this.gen}`;
-    // The token (masked), not checkedAt: that changes on every re-check and
-    // would throw the 60 s cache away for nothing.
+    // The same condition fetch() uses to forward: without a plugin token, a
+    // follower's requests run on the LEADER's token even when it has its own
+    // FIGMA_TOKEN — so that is the token the cache must follow.
+    if (this.pluginToken || !this.remote()) return `local|${this.gen}`;
+    // The leader's token GENERATION (changes only with the token; not on
+    // re-checks, and unlike a 4-character mask it cannot collide).
     const leader = await this.leaderStatus();
-    return `leader|${leader?.masked ?? "?"}`;
+    return `leader|${leader?.tokenGen ?? leader?.masked ?? "?"}|${this.gen}`;
   }
 
   onStatus(fn: (s: TokenStatus) => void): () => void {
@@ -577,7 +604,7 @@ export class RestHub {
   }
 
   private setStatus(s: TokenStatus): void {
-    this.status = s;
+    this.status = { ...s, tokenGen: this.gen };
     for (const fn of this.statusListeners) {
       try {
         fn({ ...s });
@@ -892,6 +919,15 @@ export class RestHub {
       bodyBase64: buf.toString("base64"),
     };
   }
+}
+
+/**
+ * The token status a FOLLOWER reports: the leader's when the leader has a
+ * token (that is the one its requests use), else its own (FIGMA_TOKEN).
+ * Extracted from index.ts so the merge is tested as the server runs it.
+ */
+export function mergeFollowerRestStatus(leader: TokenStatus | undefined, own: TokenStatus): TokenStatus {
+  return leader && leader.state !== "not_set" ? leader : own;
 }
 
 /** The one hub of this process. */

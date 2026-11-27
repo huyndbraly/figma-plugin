@@ -128,31 +128,59 @@ export function itemsFromResult(op: string, result: unknown): IndexedItem[] {
 }
 
 /** How long a lock file may sit before it is taken for a crashed writer's. */
-const LOCK_STALE_MS = 10_000;
+const LOCK_STALE_MS = 3_000;
+/** How long to wait for another process's lock (longer than LOCK_STALE_MS, so a dead writer's lock is always broken in time). */
+const LOCK_WAIT_MS = 5_000;
+
+/** Is the process that wrote this lock still running? */
+function alive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 
 /**
- * Run `fn` holding an exclusive lock file (O_EXCL create). Waits up to ~5 s
- * for another process; a lock older than LOCK_STALE_MS is a dead writer's and
- * is broken. The index is a cache, so after the wait the write goes ahead.
+ * Run `fn` holding an exclusive lock file (O_EXCL create).
+ *
+ * - Only EEXIST means "someone else holds it" and is waited on; any other
+ *   error (a read-only or locked cache folder) skips the lock at once instead
+ *   of stalling every write for the whole wait.
+ * - A lock whose writer is dead, or that is older than LOCK_STALE_MS, is
+ *   broken ATOMICALLY: renamed to a unique name first, so two waiters cannot
+ *   both break it and both go on to "hold" it.
+ * - The index is a cache: after LOCK_WAIT_MS the write goes ahead unlocked,
+ *   and `fn` is told so.
  */
-export async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) => Promise<T>): Promise<T> {
   let held = false;
-  for (let attempt = 0; attempt < 100 && !held; attempt++) {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  while (!held && Date.now() < deadline) {
     try {
       await writeFile(lockPath, String(process.pid), { flag: "wx" });
       held = true;
-    } catch {
-      try {
-        const st = await stat(lockPath);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) await unlink(lockPath).catch(() => undefined);
-      } catch {
-        /* gone between the two calls */
-      }
-      await new Promise((r) => setTimeout(r, 50));
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") break;
     }
+    try {
+      const [st, owner] = await Promise.all([stat(lockPath), readFile(lockPath, "utf8")]);
+      if (!alive(Number(owner)) || Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        const grave = `${lockPath}.${process.pid}.${Date.now()}.stale`;
+        // Whoever wins the rename broke it; the loser's rename fails (ENOENT).
+        await rename(lockPath, grave).then(() => unlink(grave).catch(() => undefined), () => undefined);
+        continue;
+      }
+    } catch {
+      continue; // released between the calls: try again at once
+    }
+    await new Promise((r) => setTimeout(r, 25));
   }
   try {
-    return await fn();
+    return await fn(held);
   } finally {
     if (held) await unlink(lockPath).catch(() => undefined);
   }

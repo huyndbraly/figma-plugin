@@ -1372,7 +1372,9 @@ function buildFigmaProxy(
       ...(typeof o.timeoutMs === "number" ? { timeoutMs: o.timeoutMs } : {}),
     }, deps.playwrightLoader);
     const built = domToFigma(tree, {
-      name: typeof o.name === "string" ? o.name : String(url),
+      // The default layer name is the URL WITHOUT user:password — the frame
+      // is saved in a file other people open.
+      name: typeof o.name === "string" ? o.name : urlForName(url),
       ...(typeof o.maxNodes === "number" ? { maxNodes: o.maxNodes } : {}),
       ...(typeof o.fallbackFont === "string" ? { fallbackFont: o.fallbackFont } : {}),
     });
@@ -1434,7 +1436,7 @@ function buildFigmaProxy(
     const idByName: Record<string, string> = {};
     // A set wins over a same-named variant: Code Connect points at the set.
     for (const c of comps) if (!idByName[c.name] || c.type === "COMPONENT_SET") idByName[c.name] = c.id;
-    const { files, missing, invalid } = mapToCodeConnect(map, idByName, {
+    const { files, missing, invalid, collisions } = mapToCodeConnect(map, idByName, {
       fileKey,
       ...(typeof o.importFrom === "string" ? { importFrom: o.importFrom } : {}),
       ...(isObj(o.importPaths) ? { importPaths: o.importPaths as Record<string, string> } : {}),
@@ -1464,7 +1466,11 @@ function buildFigmaProxy(
       const w = `exportCodeConnect: ${invalid.length} map key(s) are not code identifiers and were skipped: ${invalid.slice(0, 5).map((x) => JSON.stringify(x)).join(", ")}.`;
       if (!warnings.includes(w)) warnings.push(w);
     }
-    return { written, skipped, missing, invalid, fileKey };
+    if (collisions.length) {
+      const w = `exportCodeConnect: ${collisions.length} name(s) would overwrite another's file on a case-insensitive disk and were skipped: ${collisions.slice(0, 5).join(", ")}.`;
+      if (!warnings.includes(w)) warnings.push(w);
+    }
+    return { written, skipped, missing, invalid, ...(collisions.length ? { collisions } : {}), fileKey };
   };
   proxy["readCodeConnect"] = async (opts?: Record<string, unknown>) => {
     const o = isObj(opts) ? opts : {};
@@ -2402,4 +2408,14 @@ async function findCodeConnectFiles(dir: string): Promise<string[]> {
   };
   await walk(dir, 0);
   return out;
+}
+
+/** A URL for a layer name: no credentials, no query or fragment (tokens hide there too). */
+export function urlForName(raw: unknown): string {
+  try {
+    const u = new URL(String(raw));
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return "captured page";
+  }
 }

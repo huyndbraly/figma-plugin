@@ -273,6 +273,7 @@ export interface RestStatusWire {
   retryAt?: number;
   planTier?: string;
   rateLimitType?: string;
+  tokenGen?: number;
 }
 
 /** Server → plugin: the REST token's state changed (or a window just joined). */

@@ -70,21 +70,18 @@ function propExpr(p: PropMapping): string {
 }
 
 /** A code component name that can be an import binding, a JSX tag AND a file name. */
-const RESERVED = new Set(
-  ("break case catch class const continue debugger default delete do else enum export extends false finally for function if " +
-    "import in instanceof new null return super switch this throw true try typeof var void while with yield let static " +
-    "implements interface package private protected public await").split(" "),
-);
 /** Windows refuses these as file names, whatever the extension. */
 const WINDOWS_DEVICES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 /**
  * A code component name that works as an import binding, a JSX COMPONENT tag
- * (an uppercase first letter — `<button>` is the HTML element) and a file
+ * (not a lowercase first letter — `<button>` is the HTML element) and a file
  * name on every OS.
  */
 export function isComponentIdent(name: string): boolean {
-  return /^[A-Z][\w$]*$/.test(name) && name.length <= 100 && !RESERVED.has(name) && !WINDOWS_DEVICES.test(name);
+  // An uppercase letter, `_` or `$` first: JSX treats a lowercase tag as an
+  // HTML element. (No reserved word starts that way, so none can slip in.)
+  return /^[A-Z_$][\w$]*$/.test(name) && name.length <= 100 && !WINDOWS_DEVICES.test(name);
 }
 
 /** Text safe inside a `//` line comment: one line, no comment terminators. */
@@ -129,26 +126,38 @@ export function codeConnectSource(component: string, mapping: ComponentMapping, 
  * Every mapped component that has a node id → a file. Components with no
  * node id (not found in the file) are returned in `missing`, not guessed.
  */
-export function mapToCodeConnect(map: ComponentMap, nodeIdByFigmaName: Record<string, string>, opts: CodeConnectOptions): { files: CodeConnectFile[]; missing: string[]; invalid: string[] } {
+export function mapToCodeConnect(
+  map: ComponentMap,
+  nodeIdByFigmaName: Record<string, string>,
+  opts: CodeConnectOptions,
+): { files: CodeConnectFile[]; missing: string[]; invalid: string[]; collisions: string[] } {
   const files: CodeConnectFile[] = [];
   const missing: string[] = [];
+  /** Not a usable component name. */
   const invalid: string[] = [];
-  // macOS and Windows file systems ignore case: Button and BUTTON are one file.
-  const fileNames = new Set<string>();
+  /** A valid name whose FILE would be another's on a case-insensitive disk (Button / BUTTON). */
+  const collisions: string[] = [];
+  const fileNames = new Map<string, string>();
   for (const [component, mapping] of Object.entries(map.components)) {
-    if (!isComponentIdent(component) || fileNames.has(component.toLowerCase())) {
+    if (!isComponentIdent(component)) {
       invalid.push(component);
       continue;
     }
-    fileNames.add(component.toLowerCase());
     const nodeId = nodeIdByFigmaName[mapping.figma];
     if (!nodeId) {
       missing.push(component);
       continue;
     }
+    // Only names that actually produce a file can collide.
+    const taken = fileNames.get(component.toLowerCase());
+    if (taken) {
+      collisions.push(`${component} (same file as ${taken} on macOS/Windows)`);
+      continue;
+    }
+    fileNames.set(component.toLowerCase(), component);
     files.push({ component, fileName: `${component}.figma.tsx`, source: codeConnectSource(component, mapping, { component, nodeId }, opts) });
   }
-  return { files, missing, invalid };
+  return { files, missing, invalid, collisions };
 }
 
 // ---------------------------------------------------------------------------
@@ -200,24 +209,78 @@ function commentEnd(src: string, i: number): number {
 }
 
 /**
+ * If a comment, a string or a template literal starts at `i`, the index just
+ * past it; else `i`. A template is walked to its closing backtick through
+ * every `${ … }` (with their own strings, comments and braces), so a `//` in
+ * `https://x/${id}` is never taken for a comment and its braces never count.
+ */
+function skipNonCode(src: string, i: number): number {
+  const ce = commentEnd(src, i);
+  if (ce > i) return ce;
+  const c = src[i];
+  if (c === "`") return skipTemplate(src, i);
+  if (c === '"' || c === "'") {
+    const str = readString(src, i);
+    if (str) return str.end;
+    // Unterminated on its line: skip to the line end, so the rest is not misread.
+    const nl = src.indexOf("\n", i);
+    return nl < 0 ? src.length : nl;
+  }
+  return i;
+}
+
+function skipTemplate(src: string, i: number): number {
+  for (let k = i + 1; k < src.length; k++) {
+    const c = src[k];
+    if (c === "\\") {
+      k++;
+      continue;
+    }
+    if (c === "`") return k + 1;
+    if (c === "$" && src[k + 1] === "{") k = skipBlock(src, k + 1) - 1;
+  }
+  return src.length;
+}
+
+/** From the `{` at `open`, the index just past its partner `}` — code-aware. */
+function skipBlock(src: string, open: number): number {
+  let depth = 0;
+  for (let k = open; k < src.length; k++) {
+    const past = skipNonCode(src, k);
+    if (past > k) {
+      k = past - 1;
+      continue;
+    }
+    if (src[k] === "{") depth++;
+    else if (src[k] === "}" && --depth === 0) return k + 1;
+  }
+  return src.length;
+}
+
+/** The first match of `re` that starts in CODE (not in a comment, string or template). */
+function searchCode(src: string, re: RegExp): number {
+  for (let i = 0; i < src.length; i++) {
+    const past = skipNonCode(src, i);
+    if (past > i) {
+      i = past - 1;
+      continue;
+    }
+    if (re.test(src.slice(i, i + 80))) return i;
+  }
+  return -1;
+}
+
+/**
  * Offsets of `figma.connect(` that are CODE — not inside a comment or a
  * string (a commented-out connection must not come back to life).
  */
 function connectCalls(src: string): number[] {
   const out: number[] = [];
   for (let i = 0; i < src.length; i++) {
-    const skip = commentEnd(src, i);
-    if (skip > i) {
-      i = skip - 1;
+    const past = skipNonCode(src, i);
+    if (past > i) {
+      i = past - 1;
       continue;
-    }
-    const c = src[i];
-    if (c === '"' || c === "'" || c === "`") {
-      const str = readString(src, i);
-      if (str) {
-        i = str.end - 1;
-        continue;
-      }
     }
     if (src.startsWith("figma.connect(", i) && !/[\w$.]/.test(src[i - 1] ?? "")) out.push(i);
   }
@@ -245,17 +308,10 @@ function braced(src: string, open: number): string {
   let depth = 0;
   for (let i = open; i < src.length; i++) {
     const c = src[i];
-    const skip = commentEnd(src, i);
-    if (skip > i) {
-      i = skip - 1;
+    const past = skipNonCode(src, i);
+    if (past > i) {
+      i = past - 1;
       continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      const str = readString(src, i);
-      if (str) {
-        i = str.end - 1;
-        continue;
-      }
     }
     if (c === "{") depth++;
     else if (c === "}") {
@@ -312,17 +368,10 @@ function parseProps(body: string, component: string, skipped: string[]): ParsedC
     let end = i;
     for (; end < body.length; end++) {
       const c = body[end]!;
-      const skip = commentEnd(body, end);
-      if (skip > end) {
-        end = skip - 1;
+      const past = skipNonCode(body, end);
+      if (past > end) {
+        end = past - 1;
         continue;
-      }
-      if (c === '"' || c === "'" || c === "`") {
-        const str = readString(body, end);
-        if (str) {
-          end = str.end - 1;
-          continue;
-        }
       }
       if (c === "(" || c === "{" || c === "[") depth++;
       else if (c === ")" || c === "}" || c === "]") depth--;
@@ -418,7 +467,8 @@ export function parseCodeConnect(source: string): { connections: ParsedCodeConne
     const link = parseConnectUrl(urlLit.value);
     const conn: ParsedCodeConnect = { component, url: urlLit.value, ...(link ? { fileKey: link.fileKey, nodeId: link.nodeId } : {}), props: {} };
     const span = source.slice(urlLit.end, spanEnd);
-    const propsAt = span.search(/\bprops\s*:/);
+    // `props:` in CODE: a commented-out `// props: {…}` above the real one must not win.
+    const propsAt = searchCode(span, /^props\s*:/);
     if (propsAt >= 0) {
       const open = span.indexOf("{", propsAt);
       if (open >= 0) conn.props = parseProps(braced(span, open), component, skipped);

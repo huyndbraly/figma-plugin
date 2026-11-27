@@ -96,8 +96,10 @@ const SVG_ATTRS = new Set([
 function decodeEntities(v: string): string {
   return v.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);?/gi, (_m, e: string) => {
     const k = e.toLowerCase();
-    if (k.startsWith("#x")) return String.fromCodePoint(parseInt(k.slice(2), 16) || 0xfffd);
-    if (k.startsWith("#")) return String.fromCodePoint(parseInt(k.slice(1), 10) || 0xfffd);
+    // Out of Unicode's range (`&#x110000;`) is a replacement character, never a RangeError.
+    const cp = (n: number) => (Number.isInteger(n) && n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : "\ufffd");
+    if (k.startsWith("#x")) return cp(parseInt(k.slice(2), 16));
+    if (k.startsWith("#")) return cp(parseInt(k.slice(1), 10));
     return ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" } as Record<string, string>)[k] ?? "";
   });
 }
@@ -147,8 +149,9 @@ export function sanitizeSvg(raw: string): string {
           for (let k = open.length - 1; k > at; k--) out += `</${open[k]}>`;
           open.length = at;
           out += `</${closeName}>`;
+          // Depth moves only on a close that matched an open we kept.
+          if (n === "svg" && --svgDepth === 0) closed = true;
         }
-        if (n === "svg" && --svgDepth === 0) closed = true;
       }
       continue;
     }
@@ -178,11 +181,12 @@ export function sanitizeSvg(raw: string): string {
       if (!selfClose) {
         open.push(openName);
         if (n === "svg") svgDepth++;
-      }
+      } else if (n === "svg" && svgDepth === 0) closed = true; // `<svg/>` is the whole document
       continue;
     }
     if (dropDepth || whole.startsWith("<")) continue; // comments, CDATA, doctype, PIs, stray "<"
-    out += whole.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    // Text: a bare `&` (AT&T) or an HTML-only entity (&nbsp;) is not XML.
+    out += whole.replace(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);)/gi, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
   // A reply cut off mid-element (or an unclosed dropped element that ate the
   // rest): close what is open so the result is still one well-formed <svg>.

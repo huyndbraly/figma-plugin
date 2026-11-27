@@ -153,22 +153,72 @@ export async function createFigjamDiagram(ctx: HandlerContext): Promise<unknown>
     }
     throw e;
   }
+  // The user's own connectors that ended on a shape about to go: move their
+  // end to the new shape with the same diagram id, so they stay attached.
+  const prevIds = new Set(previous.map((n) => n.id));
+  const newIdFor = (oldId: string): string | undefined => {
+    const old = previous.find((n) => n.id === oldId);
+    let tag = "";
+    try {
+      tag = old ? old.getPluginData("figjam-id") : "";
+    } catch {
+      tag = "";
+    }
+    return tag ? idMap[tag] : undefined;
+  };
+  for (const c of section.children) {
+    if (c.type !== "CONNECTOR" || prevIds.has(c.id) || drawnNow.includes(c)) continue;
+    for (const end of ["connectorStart", "connectorEnd"] as const) {
+      const e = c[end] as { endpointNodeId?: string; magnet?: "NONE" | "AUTO" | "TOP" | "LEFT" | "BOTTOM" | "RIGHT" | "CENTER" };
+      if (e.endpointNodeId && prevIds.has(e.endpointNodeId)) {
+        const to = newIdFor(e.endpointNodeId);
+        if (to) c[end] = { endpointNodeId: to, magnet: e.magnet ?? "AUTO" };
+      }
+    }
+  }
   for (const n of previous) if (!n.removed) n.remove();
   section.setPluginData(
     FIGJAM_MARKER,
-    JSON.stringify({ kind: p.kind ?? null, title: p.title ?? null, ...(p.source !== undefined ? { source: p.source } : {}), native: "figjam" }),
+    // `drawn`: the node ids THIS drawing made — the next redraw removes those
+    // and nothing else (a copy the user pasted carries the figjam-id tag too).
+    JSON.stringify({ kind: p.kind ?? null, title: p.title ?? null, ...(p.source !== undefined ? { source: p.source } : {}), native: "figjam", drawn: drawnNow.map((n) => n.id) }),
   );
   // The other diagrams on the page, for the server's cross-check — the same
   // hand-back a Figma Design draw gives, so FigJam diagrams are compared too.
-  return { sectionId: section.id, nodeIds: idMap, shapes: nodes.length, connectors, ...(created ? {} : { redrawn: true }), pageModel: pageModel(section) };
+  // The diagram IS drawn by now: a page walk that fails must not turn that
+  // into an error (an agent would draw it again).
+  let onPage: Array<Record<string, unknown>> | undefined;
+  try {
+    onPage = pageModel(section);
+  } catch {
+    ctx.warn("The other diagrams on the page could not be read, so this one was not cross-checked.");
+  }
+  return { sectionId: section.id, nodeIds: idMap, shapes: nodes.length, connectors, ...(created ? {} : { redrawn: true }), ...(onPage ? { pageModel: onPage } : {}) };
 }
 
 /**
- * What a previous drawing of this section made: nodes tagged `figjam-id`,
- * plus — for sections drawn before connectors were tagged — connectors
- * whose two ends are such nodes.
+ * What a previous drawing of this section made. Exactly the ids the marker
+ * lists, when it lists them; for a section drawn before that (no `drawn`
+ * list), nodes tagged `figjam-id` plus connectors whose two ends are such
+ * nodes.
  */
 function toolDrawn(section: SectionNode): SceneNode[] {
+  let listed: string[] | undefined;
+  try {
+    const raw = section.getPluginData(FIGJAM_MARKER);
+    const drawn = raw ? (JSON.parse(raw) as { drawn?: unknown }).drawn : undefined;
+    if (Array.isArray(drawn)) listed = drawn.map(String);
+  } catch {
+    listed = undefined;
+  }
+  if (listed) {
+    const ids = new Set(listed);
+    return section.children.filter((c) => ids.has(c.id));
+  }
+  return toolDrawnByTag(section);
+}
+
+function toolDrawnByTag(section: SectionNode): SceneNode[] {
   const tagged = new Set<string>();
   const out: SceneNode[] = [];
   for (const c of section.children) {

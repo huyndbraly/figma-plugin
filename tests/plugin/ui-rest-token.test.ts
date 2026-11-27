@@ -352,6 +352,25 @@ describe("review fixes (second pass)", () => {
     (els["lang-en"]!.onclick as () => void)();
     main({ kind: "ui-lang", lang: "vi" });
     last().receive({ type: "rest_status", status: { state: "not_set", source: null } });
+    // "Not set" vs "Chưa đặt": the strings differ, so this fails if vi won.
     expect(badge()).toBe("Not set");
+    expect(badge()).not.toBe("Chưa đặt");
+  });
+
+  it("`assigned` itself asks the main thread for the token (no manual step needed)", () => {
+    mainHello();
+    const ws = last();
+    ws.open();
+    const before = toMain.filter((m) => m.kind === "rest-token-request").length;
+    ws.receive({ type: "assigned", channel: "chan-a", resumeToken: "tok-a" });
+    expect(toMain.filter((m) => m.kind === "rest-token-request").length).toBe(before + 1);
+  });
+
+  it("a socket that closes cancels the 12 s no-answer diagnosis", () => {
+    const ws = connected();
+    main({ kind: "rest-token", token: TOKEN, savedAt: 1, reason: "saved" });
+    ws.serverClose();
+    vi.advanceTimersByTime(13_000);
+    expect(badge()).not.toBe("No answer from server");
   });
 });

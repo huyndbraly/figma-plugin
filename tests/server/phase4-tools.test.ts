@@ -412,3 +412,49 @@ describe("review fixes (second pass): index from capped and incomplete reads", (
     expect((await idx.files())[0]!.items).toHaveLength(3);
   });
 });
+
+
+describe("third pass: lock file and index_design_file", () => {
+  it("a lock that cannot be created for another reason (EACCES/EROFS) does not stall the write", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const started = Date.now();
+    const out = await withFileLock(join(dir, "no-such-dir", "x.lock"), async (locked) => locked);
+    expect(out).toBe(false); // ran, unlocked
+    expect(Date.now() - started).toBeLessThan(1000); // not the 5 s contention wait
+  });
+
+  it("a lock left by a DEAD process is broken at once", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf } = await import("node:fs/promises");
+    const lock = join(dir, "y.lock");
+    await wf(lock, "999999"); // a pid that is not running
+    const started = Date.now();
+    expect(await withFileLock(lock, async (locked) => locked)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("index_design_file with a failed REST sub-read only ADDS", async () => {
+    const idx = new DesignIndex(dir);
+    await idx.record({ fileKey: "Z", fileName: "Remote", source: "plugin" }, [{ kind: "style", name: "KeepMe" }]);
+    const ctx: ToolContext = {
+      runValidated: async () => [],
+      runWrite: async () => ({}),
+      sessions: new SessionRegistry(),
+      diagnostics: async () => ({}) as never,
+      designIndex: idx,
+      rest: {
+        token: "figd_test_token_000",
+        fetch: async (url) => {
+          const p = new URL(url).pathname;
+          if (p === "/v1/files/Z") return new Response(JSON.stringify({ name: "Remote", document: { children: [] }, components: { "3:3": { name: "Chip" } } }), { status: 200 });
+          if (p.endsWith("/styles")) return new Response(JSON.stringify({ message: "Invalid scope: []. This endpoint requires the library_content:read scope." }), { status: 403 });
+          return new Response(JSON.stringify({ meta: {} }), { status: 200 });
+        },
+      },
+    };
+    const out = (await handleRead(ctx, "index_design_file", { fileKey: "Z" })) as any;
+    expect(out.incomplete).toBe(true);
+    const names = (await idx.files())[0]!.items.map((i) => i.name).sort();
+    expect(names).toEqual(["Chip", "KeepMe"]);
+  });
+});

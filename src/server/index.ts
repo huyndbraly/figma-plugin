@@ -46,7 +46,7 @@ import { READ_OPERATIONS, DEFAULT_PORT, PORT_RANGE } from "../shared/protocol.js
 import { parseRouteArg, type RouteArg } from "./route.js";
 import { REST_ONLY_READ_OPS } from "./rest-features.js";
 import { DesignIndex, LOCAL_INDEX_OPS } from "./design-index.js";
-import { restHub, type ForwardedRequest, type ForwardedResponse, type TokenStatus } from "./rest-hub.js";
+import { restHub, mergeFollowerRestStatus, type ForwardedRequest, type ForwardedResponse, type TokenStatus } from "./rest-hub.js";
 
 // ---- JSON tool schemas (match ARCHITECTURE.md) ----
 
@@ -625,7 +625,7 @@ export async function createServer(): Promise<ServerHandle> {
       // The leader's token wins; with none there, this process's own
       // FIGMA_TOKEN is what its requests fall back to.
       const ownRest = restHub.getStatus();
-      const restToken = state.restToken && state.restToken.state !== "not_set" ? state.restToken : ownRest;
+      const restToken = mergeFollowerRestStatus(state.restToken, ownRest);
       return {
         ...base,
         statusSource: "leader",

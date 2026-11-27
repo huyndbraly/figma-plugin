@@ -22,18 +22,27 @@ export async function getDiagramSpec(ctx: HandlerContext): Promise<unknown> {
     );
   }
   const mark = readDiagramSource(node);
+  // A FigJam-native section answers in STRUCTURE, never by an error message:
+  // the server branches on `native`, and a message (which carries the node's
+  // name) is no thing to branch on. One drawn by the first FigJam build has
+  // no model — `spec: null` — and can still be redrawn in place from a full spec.
+  if (mark.native === "figjam") {
+    return {
+      nodeId: node.id,
+      ...(mark.kind ? { kind: mark.kind } : {}),
+      ...(mark.title ? { title: mark.title } : {}),
+      native: "figjam",
+      spec: mark.source ?? null,
+      ...(mark.source === undefined
+        ? { hint: "This FigJam section was drawn before its model was stored. Send the full spec with `type` and `update: <this id>` to redraw it in place; it can be patched from then on." }
+        : {}),
+    };
+  }
   if (!mark.kind) {
     throw err(
       ErrorCode.INVALID_PARAMS,
       `"${node.name}" is not a frame drawn by a diagram tool.`,
       "Only frames drawn by figma_diagram carry their model. Pass the frameId it returned.",
-    );
-  }
-  if (mark.source === undefined && mark.native === "figjam") {
-    throw err(
-      ErrorCode.INVALID_PARAMS,
-      `"${node.name}" is a FigJam section drawn before the model was stored on it.`,
-      "Redraw it once with figma_diagram and the full spec (no update) — the new section carries its model, and can be patched from then on.",
     );
   }
   if (mark.source === undefined) {

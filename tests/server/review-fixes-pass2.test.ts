@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
-import { RestHub, anySignal, type TokenStatus } from "../../src/server/rest-hub.js";
+import { RestHub, anySignal, mergeFollowerRestStatus, type TokenStatus } from "../../src/server/rest-hub.js";
 import { Bridge } from "../../src/server/bridge.js";
 import { handleStatus, type Diagnostics, type ToolContext } from "../../src/server/tools.js";
 import { SessionRegistry } from "../../src/server/session.js";
@@ -18,8 +18,9 @@ import { executeWrite } from "../../src/server/executor.js";
 const A = "figd_aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B = "figd_bbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const json = (b: unknown, s = 200, h: Record<string, string> = {}) => new Response(JSON.stringify(b), { status: s, headers: h });
+/** Wait for a condition, not for a guessed number of milliseconds. */
 const settle = async (h: RestHub) => {
-  for (let i = 0; i < 40 && h.getStatus().state === "checking"; i++) await new Promise((r) => setTimeout(r, 5));
+  await vi.waitFor(() => expect(h.getStatus().state).not.toBe("checking"));
   return h.getStatus();
 };
 
@@ -56,8 +57,7 @@ describe("token lifecycle, second pass", () => {
     h.onStatus((s) => seen.push(s.state));
     await h.fetch("https://api.figma.com/v1/files/K", {});
     now += 60;
-    await new Promise((r) => setTimeout(r, 120));
-    expect(seen).toEqual(["rate_limited", "unverified"]);
+    await vi.waitFor(() => expect(seen).toEqual(["rate_limited", "unverified"]));
   });
 
   it("a 429 without Retry-After still ages out (default wait)", async () => {
@@ -137,9 +137,9 @@ describe("figma_status from the REAL bridge + hub never carries the token", () =
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
     await new Promise<void>((r) => ws.once("open", () => r()));
     ws.send(JSON.stringify({ type: "hello", protocolVersion: 8, pluginVersion: "1", fileKey: "K", fileName: "F", pageName: "P", editorType: "figma", restToken: A }));
-    await new Promise((r) => setTimeout(r, 40));
+    await vi.waitFor(() => expect(b.channelSummaries()).toHaveLength(1));
     ws.send(JSON.stringify({ type: "set_rest_token", token: A, savedAt: 1 }));
-    await new Promise((r) => setTimeout(r, 60));
+    await vi.waitFor(() => expect(hub.getStatus().masked).toBe("figd_…aaaa"));
     await settle(hub);
     const d: Diagnostics = {
       mode: "leader", port, bridgeAuth: "ok", statusSource: "local", pluginConnected: b.pluginConnected,
@@ -200,12 +200,38 @@ describe("Code Connect, second pass", () => {
     expect(out.conflicts[0]).toMatch(/Btn: connected to "Button" and to "OtherButton"/);
   });
 
-  it("names: uppercase component tags only, no reserved words or device names, no case-folded duplicates", () => {
-    for (const bad of ["button", "class", "Default".toLowerCase(), "CON", "Nul"]) expect(isComponentIdent(bad), bad).toBe(false);
-    expect(isComponentIdent("Button")).toBe(true);
-    const { files, invalid } = mapToCodeConnect({ components: { Button: { figma: "B" }, BUTTON: { figma: "B" } } }, { B: "1:1" }, { fileKey: "K" });
-    expect(files.map((f) => f.fileName)).toEqual(["Button.figma.tsx"]);
-    expect(invalid).toEqual(["BUTTON"]);
+  it("names: not lowercase (HTML tags), no reserved words or device names; _ and $ starts are fine", () => {
+    for (const bad of ["button", "class", "default", "CON", "Nul", "my-button"]) expect(isComponentIdent(bad), bad).toBe(false);
+    for (const ok of ["Button", "_Private", "$Icon"]) expect(isComponentIdent(ok), ok).toBe(true);
+  });
+
+  it("a case-insensitive file clash is a COLLISION (its own list), and only between names that produce a file", () => {
+    const one = mapToCodeConnect({ components: { Button: { figma: "B" }, BUTTON: { figma: "B" } } }, { B: "1:1" }, { fileKey: "K" });
+    expect(one.files.map((f) => f.fileName)).toEqual(["Button.figma.tsx"]);
+    expect(one.invalid).toEqual([]);
+    expect(one.collisions[0]).toMatch(/^BUTTON \(same file as Button/);
+    // Button has no Figma node → no file → BUTTON collides with nothing.
+    const two = mapToCodeConnect({ components: { Button: { figma: "Missing" }, BUTTON: { figma: "B" } } }, { B: "1:1" }, { fileKey: "K" });
+    expect(two.files.map((f) => f.fileName)).toEqual(["BUTTON.figma.tsx"]);
+    expect(two.missing).toEqual(["Button"]);
+    expect(two.collisions).toEqual([]);
+  });
+
+  it("a // inside a template's ${…} is not a comment; props after it are still read", () => {
+    const { connections } = parseCodeConnect(
+      'figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {\n' +
+        "  example: (p) => <Btn href={`https://x/${p.id + '//'}`}>{p.label}</Btn>,\n" +
+        '  props: { label: figma.string("Label") },\n' +
+        "})\nconst t = `${'figma.connect(Ghost, \"u\")'}`;\n",
+    );
+    expect(connections.map((c) => [c.component, Object.keys(c.props)])).toEqual([["Btn", ["label"]]]);
+  });
+
+  it("a commented-out props: block above the real one is not read", () => {
+    const { connections } = parseCodeConnect(
+      'figma.connect(Btn, "https://www.figma.com/design/K/x?node-id=1-1", {\n  // props: { old: figma.string("Old") },\n  props: { label: figma.string("Label") },\n})',
+    );
+    expect(Object.keys(connections[0]!.props)).toEqual(["label"]);
   });
 });
 
@@ -283,5 +309,90 @@ describe("extractInPage turns modern colours into rgb in the page (review)", () 
     } finally {
       Object.assign(g, saved);
     }
+  });
+});
+
+describe("sanitizeSvg, third pass", () => {
+  it("an entity beyond Unicode is a replacement character, not a RangeError", () => {
+    expect(() => sanitizeSvg('<svg><rect id="&#x110000;&#99999999;"/></svg>')).not.toThrow();
+  });
+  it("a self-closing root ends the document", () => {
+    expect(sanitizeSvg("<svg/>junk<g></g><svg></svg>")).toBe("<svg/>");
+  });
+  it("a bare & in text becomes &amp; (valid XML); real entities stay", () => {
+    expect(sanitizeSvg("<svg><text>AT&T &amp; &nbsp;</text></svg>")).toBe("<svg><text>AT&amp;T &amp; &amp;nbsp;</text></svg>");
+  });
+  it("an unknown closing tag is dropped without unbalancing the document", () => {
+    expect(sanitizeSvg("<svg><g></svg_x></g><rect/></svg>")).toBe("<svg><g></g><rect/></svg>");
+  });
+});
+
+
+describe("third pass: rest-hub", () => {
+  it("the follower status merge index.ts runs: the leader's when it has a token, else this process's own", () => {
+    const own: TokenStatus = { state: "valid", source: "env", masked: "figd_…envv" };
+    expect(mergeFollowerRestStatus({ state: "valid", source: "plugin", masked: "figd_…lead" }, own).masked).toBe("figd_…lead");
+    expect(mergeFollowerRestStatus({ state: "not_set", source: null }, own)).toBe(own);
+    expect(mergeFollowerRestStatus(undefined, own)).toBe(own);
+  });
+
+  it("a follower WITH its own FIGMA_TOKEN keys its cache on the leader's token (that is what its requests use)", async () => {
+    let leaderGen = 1;
+    const f = new RestHub({ env: () => B, fetch: async () => json({}) });
+    f.setRemote(() => async () => ({ noToken: true }), async () => ({ state: "valid", source: "plugin", masked: "figd_…same", tokenGen: leaderGen }));
+    const k1 = await f.cacheKey();
+    leaderGen = 2;
+    await new Promise((r) => setTimeout(r, 0));
+    (f as unknown as { remoteStatusCache?: unknown }).remoteStatusCache = undefined; // skip the 5 s status cache
+    expect(await f.cacheKey()).not.toBe(k1); // same mask, different token: different key
+  });
+
+  it("a Retry-After longer than a timer can wait is reached in steps, never early", async () => {
+    let now = 0;
+    const h = new RestHub({ env: () => undefined, now: () => now, fetch: async (u) => (u.endsWith("/me") ? json({ handle: "h" }) : u.includes("/teams/") ? json({}, 404) : json({}, 429, { "retry-after": "3000000" })) });
+    h.setPluginToken(A);
+    await settle(h);
+    await h.fetch("https://api.figma.com/v1/files/K", {});
+    // Fire the timer by hand at a time BEFORE retryAt: the limit must hold.
+    const timer = (h as unknown as { agingTimer?: { _onTimeout?: () => void } }).agingTimer;
+    expect(typeof timer?._onTimeout).toBe("function"); // Node timer internals: fail loudly if they change
+    now = 2_147_483_000;
+    timer!._onTimeout!();
+    expect(h.getStatus().state).toBe("rate_limited");
+  });
+
+  it("anySignal's Node 18 path removes its listeners once the combined signal aborts", () => {
+    const real = (AbortSignal as unknown as { any?: unknown }).any;
+    (AbortSignal as unknown as { any?: unknown }).any = undefined;
+    try {
+      const longLived = new AbortController();
+      let added = 0;
+      let removed = 0;
+      const sig = longLived.signal;
+      const add = sig.addEventListener.bind(sig);
+      const rem = sig.removeEventListener.bind(sig);
+      sig.addEventListener = ((...a: Parameters<typeof add>) => (added++, add(...a))) as typeof add;
+      sig.removeEventListener = ((...a: Parameters<typeof rem>) => (removed++, rem(...a))) as typeof rem;
+      const other = new AbortController();
+      anySignal([sig, other.signal]);
+      other.abort();
+      expect(added).toBe(1);
+      expect(removed).toBe(1);
+    } finally {
+      (AbortSignal as unknown as { any?: unknown }).any = real;
+    }
+  });
+
+  it("a re-save while an expired rate limit is pending emits ONCE", async () => {
+    let now = 0;
+    const h = new RestHub({ env: () => undefined, now: () => now, fetch: async (u) => (u.endsWith("/me") ? json({ handle: "h" }) : u.includes("/teams/") ? json({}, 404) : json({}, 429, { "retry-after": "10" })) });
+    h.setPluginToken(A);
+    await settle(h);
+    await h.fetch("https://api.figma.com/v1/files/K", {});
+    now = 11_000;
+    const seen: string[] = [];
+    h.onStatus((s) => seen.push(s.state));
+    h.setPluginToken(A); // same token
+    expect(seen).toEqual(["unverified"]); // the expiry IS the answer — not a second copy of it
   });
 });

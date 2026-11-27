@@ -670,12 +670,14 @@ async function handleIndexOp(ctx: ToolContext, op: "search_design_index" | "inde
       throw new OpError(ErrorCode.UNAUTHORIZED, "Indexing a file that is not open reads the REST API, and no token is set.", "Save a personal access token in the plugin panel (REST Token), or open the file with the plugin running and call without url.");
     }
     const r = await restComponentsAndStyles(rest.client, fileKey);
+    // A kit with a sub-read that failed is not the whole list: add, never replace.
+    const mode = r.incomplete ? "merge" : "replace";
     const items: IndexedItem[] = [
       ...r.components.map((c) => ({ kind: (c.type === "COMPONENT_SET" ? "component_set" : "component") as IndexedItem["kind"], name: c.name, id: c.id, ...(c.key ? { key: c.key } : {}), type: c.type, ...(c.description ? { description: c.description } : {}) })),
       ...r.styles.map((st) => ({ kind: "style" as const, name: st.name, type: st.type.toUpperCase(), ...(st.description ? { description: st.description } : {}) })),
     ];
-    const entry = await index.record({ fileKey, fileName: r.fileName, source: "rest" }, items);
-    return { fileKey, fileName: r.fileName, indexed: entry?.items.length ?? 0, source: "rest", cacheDir: index.dir };
+    const entry = await index.record({ fileKey, fileName: r.fileName, source: "rest" }, items, mode);
+    return { fileKey, fileName: r.fileName, indexed: entry?.items.length ?? 0, source: "rest", cacheDir: index.dir, ...(r.incomplete ? { incomplete: true, notes: r.notes } : {}) };
   }
   const kit = resultOf(await ctx.runValidated("get_design_system_kit", { includeScreens: false, includeComponentUsage: false, includeInstances: false }, undefined, route));
   const win = await routedWindow(ctx, route);
@@ -838,18 +840,23 @@ async function handleDiagramUpdate(
   let storedMark: { kind?: string; spec?: unknown; native?: string } | undefined;
   if (patch !== undefined) {
     storedMark = resultOf(await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel)) as typeof storedMark;
+    if (storedMark?.native === "figjam" && (storedMark.spec === null || storedMark.spec === undefined)) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `${update} is a FigJam section drawn before its model was stored, so there is nothing to patch.`,
+        "Send the full spec with `type` and `update` (no patch) to redraw it in place — it can be patched from then on.",
+      );
+    }
   } else if (isFigjamNativeKind(type)) {
     // Only a kind that HAS a FigJam drawing can be a FigJam section: other
-    // kinds skip the round trip.
+    // kinds skip the round trip. A FigJam section always ANSWERS (with
+    // `native`), so an INVALID_PARAMS here is a Design frame without a stored
+    // model — fine to redraw from this full spec. Anything else (a missing
+    // node, a timeout) must not fall through to a Design drawing.
     storedMark = (await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel)
       .then(resultOf)
       .catch((e: unknown) => {
-        // A Design frame drawn before models were stored is fine to redraw
-        // from a full spec. Anything else — a FigJam section with no model, a
-        // missing node, a transient failure — must not fall through to the
-        // Design drawing, which would draw frames on top of a FigJam section.
-        const err = e as { code?: string; message?: string };
-        if (err.code === ErrorCode.INVALID_PARAMS && !/FigJam/.test(String(err.message))) return undefined;
+        if ((e as { code?: string }).code === ErrorCode.INVALID_PARAMS) return undefined;
         throw e;
       })) as typeof storedMark;
   }

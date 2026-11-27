@@ -223,3 +223,24 @@ describe("htmlToFigma conversion gaps", () => {
     expect(fontStyle("200")).toBe("Extra Light");
   });
 });
+
+
+describe("htmlToFigma third pass", () => {
+  it("the default layer name drops credentials, query and fragment", async () => {
+    const { urlForName } = await import("../../src/server/executor.js");
+    expect(urlForName("https://admin:s3cret@staging.example.com/app?token=abc#x")).toBe("https://staging.example.com/app");
+  });
+
+  it("a WRAPPED row-reverse sorts line by line (top, then left)", () => {
+    const box = (x: number, y: number, w: number, h: number) => ({ x, y, w, h });
+    const { spec } = domToFigma({
+      tag: "div", rect: box(0, 0, 200, 100), style: { display: "flex", flexDirection: "row-reverse", flexWrap: "wrap" },
+      children: [
+        { tag: "i", id: "a", rect: box(100, 0, 100, 50), style: {} },
+        { tag: "i", id: "b", rect: box(0, 0, 100, 50), style: {} },
+        { tag: "i", id: "c", rect: box(100, 50, 100, 50), style: {} },
+      ],
+    });
+    expect((spec.children as Array<{ name: string }>).map((c) => c.name)).toEqual(["i#b", "i#a", "i#c"]);
+  });
+});

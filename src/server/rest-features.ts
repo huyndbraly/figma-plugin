@@ -408,11 +408,11 @@ export async function restGenerateDesignMd(client: RestClient, fileKey: string, 
 }
 
 /** Components / styles of a closed file, in the shape the design index stores. */
-export async function restComponentsAndStyles(client: RestClient, fileKey: string, signal?: AbortSignal): Promise<{ fileName: string; components: DesignComponent[]; styles: Array<{ name: string; type: string; description?: string }> }> {
+export async function restComponentsAndStyles(client: RestClient, fileKey: string, signal?: AbortSignal): Promise<{ fileName: string; components: DesignComponent[]; styles: Array<{ name: string; type: string; description?: string }>; incomplete: boolean; notes: string[] }> {
   const kit = await restDesignKit(client, fileKey, {}, signal);
   const styles: Array<{ name: string; type: string; description?: string }> = [];
   for (const [type, list] of Object.entries(kit.styles ?? {})) {
     for (const s of (list ?? []) as Json[]) styles.push({ name: String(s.name), type, ...(s.description ? { description: String(s.description) } : {}) });
   }
-  return { fileName: kit.file?.name ?? fileKey, components: kit.components ?? [], styles };
+  return { fileName: kit.file?.name ?? fileKey, components: kit.components ?? [], styles, incomplete: kit.extraction?.incomplete === true, notes: (kit.notes ?? []).slice(1) };
 }

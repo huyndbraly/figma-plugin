@@ -157,3 +157,54 @@ describe("FigJam update, second pass (review)", () => {
     expect(out.consistency).toEqual(expected);
   });
 });
+
+
+describe("legacy FigJam sections, third pass (review)", () => {
+  function legacyCtx() {
+    const calls: Array<[string, any]> = [];
+    const ctx = {
+      runValidated: vi.fn(async (op: string, params: any) => {
+        calls.push([op, params]);
+        if (op === "list_channels") return [{ channel: "c1", plugin: { fileName: "Board", editorType: "figjam" } }];
+        // What the plugin now answers for a section with no stored model: STRUCTURE, not an error.
+        if (op === "get_diagram_spec") return { nodeId: "7:7", native: "figjam", spec: null, hint: "…" };
+        if (op === "create_figjam_diagram") return { sectionId: params.intoSectionId ?? "new", redrawn: !!params.intoSectionId };
+        return {};
+      }),
+    } as unknown as ToolContext;
+    return { ctx, calls };
+  }
+
+  it("a full-spec update redraws INTO the legacy section — no duplicate section", async () => {
+    const { ctx, calls } = legacyCtx();
+    const out = (await handleDiagram(ctx, "userflow", { ...FLOW, update: "7:7" })) as any;
+    const sent = calls.find((c) => c[0] === "create_figjam_diagram")![1];
+    expect(sent.intoSectionId).toBe("7:7");
+    expect(out.sectionId).toBe("7:7");
+    expect(calls.map((c) => c[0])).not.toContain("create_userflow");
+  });
+
+  it("a PATCH on it says there is no model to patch, and how to redraw", async () => {
+    const { ctx } = legacyCtx();
+    await expect(handleDiagram(ctx, undefined, { update: "7:7", patch: [{ collection: "nodes", id: "a", set: { label: "x" } }] })).rejects.toMatchObject({
+      code: "INVALID_PARAMS",
+      hint: expect.stringMatching(/full spec with `type` and `update`/),
+    });
+  });
+
+  it("a Design frame NAMED like FigJam is still redrawn as a Design frame (no message sniffing)", async () => {
+    const calls: string[] = [];
+    const ctx = {
+      runValidated: vi.fn(async (op: string, params: any) => {
+        calls.push(op);
+        if (op === "list_channels") return [{ channel: "c1", plugin: { fileName: "Board", editorType: "figma" } }];
+        if (op === "get_diagram_spec") throw Object.assign(new Error('"FigJam flow v1" was drawn before the model was stored on the frame.'), { code: "INVALID_PARAMS" });
+        if (op === "layout_audit") return { nodeCount: 1, summary: { issues: [], styleHints: [] } };
+        validateOperation(op, params);
+        return { frameId: "9:9" };
+      }),
+    } as unknown as ToolContext;
+    await handleDiagram(ctx, "userflow", { ...FLOW, update: "9:9" });
+    expect(calls).toContain("create_userflow");
+  });
+});

@@ -1191,6 +1191,10 @@
     sock.onclose = function (event) {
       if (sock !== ws) return; // a socket we already replaced or dropped
       if (assignedSock === sock) assignedSock = null;
+      // A server that went away is not "an older build": drop the 12 s
+      // no-answer diagnosis; the token is sent again after the next `assigned`.
+      clearTimeout(restAnswerTimer);
+      restAnswerTimer = null;
       clearTimeout(connectTimer);
       stopHeartbeat();
       if (connectedPort != null) {
@@ -1229,6 +1233,8 @@
     ws = null;
     connectedPort = null;
     if (assignedSock === old) assignedSock = null;
+    clearTimeout(restAnswerTimer);
+    restAnswerTimer = null;
     if (!old) return;
     old.onopen = old.onmessage = old.onerror = old.onclose = null;
     try { old.close(); } catch (e) { /* already closing */ }

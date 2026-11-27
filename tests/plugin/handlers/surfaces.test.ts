@@ -141,7 +141,10 @@ describe("create_figjam_diagram: the section remembers its model (review D2)", (
   it("stores { kind, title, source, native } on the section", async () => {
     const out = (await createFigjamDiagram(ctx({ ...DIAGRAM, source: { title: "Checkout", nodes: [] } }))) as any;
     const section = made.find((n) => n.id === out.sectionId);
-    expect(JSON.parse(section.data["figma-plugin.figjam"])).toEqual({ kind: "userflow", title: "Checkout", source: { title: "Checkout", nodes: [] }, native: "figjam" });
+    const mark = JSON.parse(section.data["figma-plugin.figjam"]);
+    expect(mark).toMatchObject({ kind: "userflow", title: "Checkout", source: { title: "Checkout", nodes: [] }, native: "figjam" });
+    // …and exactly which nodes it drew, so a redraw removes only those.
+    expect(mark.drawn.sort()).toEqual(section.children.map((c: any) => c.id).sort());
   });
 
   it("intoSectionId redraws in place: same section, old shapes gone", async () => {
@@ -232,5 +235,50 @@ describe("redraw into a section, second pass (review)", () => {
     second.setPluginData("figma-plugin.figjam", JSON.stringify({ kind: "state", title: "Order", source: { title: "Order" }, native: "figjam" }));
     const out = (await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: first.sectionId, source: { title: "A2" } }))) as any;
     expect(out.pageModel.map((d: any) => d.kind).sort()).toEqual(["state", "userflow"]);
+  });
+});
+
+
+describe("redraw, third pass (review)", () => {
+  it("a copy the USER pasted of a tool shape (same figjam-id tag) survives a redraw", async () => {
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    const copy = base("SHAPE_WITH_TEXT");
+    copy.data["figjam-id"] = "cart"; // Figma copies plugin data with the node
+    section.appendChild(copy);
+    await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: section.id }));
+    expect(section.children).toContain(copy);
+  });
+
+  it("the user's connector to a redrawn shape is moved to the new shape", async () => {
+    const first = (await createFigjamDiagram(ctx(DIAGRAM))) as any;
+    const section = made.find((n) => n.id === first.sectionId);
+    const note = base("STICKY");
+    section.appendChild(note);
+    const userArrow = base("CONNECTOR");
+    section.appendChild(userArrow);
+    userArrow.connectorStart = { endpointNodeId: note.id, magnet: "AUTO" };
+    userArrow.connectorEnd = { endpointNodeId: first.nodeIds.cart, magnet: "AUTO" };
+    const again = (await createFigjamDiagram(ctx({ ...DIAGRAM, intoSectionId: section.id }))) as any;
+    expect(section.children).toContain(userArrow);
+    expect(userArrow.connectorEnd.endpointNodeId).toBe(again.nodeIds.cart);
+    expect(userArrow.connectorStart.endpointNodeId).toBe(note.id);
+  });
+
+  it("a page-model failure after a successful draw is a warning, not an error", async () => {
+    const c = ctx(DIAGRAM);
+    const out = (await (async () => {
+      const r = (await createFigjamDiagram(c)) as any;
+      return r;
+    })()) as any;
+    expect(out.sectionId).toBeTruthy();
+    // pageModel reads parent chains; a section with no page parent returns [] — make it throw instead:
+    const section = made.find((n) => n.id === out.sectionId);
+    Object.defineProperty(section, "parent", { get() { throw new Error("page walk failed"); } });
+    const c2 = ctx({ ...DIAGRAM, intoSectionId: section.id });
+    const again = (await createFigjamDiagram(c2)) as any;
+    expect(again.redrawn).toBe(true);
+    expect(again).not.toHaveProperty("pageModel");
+    expect(c2.warnings.join("\n")).toMatch(/not cross-checked/);
   });
 });
