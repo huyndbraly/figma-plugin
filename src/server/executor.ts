@@ -58,6 +58,8 @@ import { getComments, getVersions, postComment } from "./rest-features.js";
 import { capturePage, type PlaywrightLoader } from "./html-capture.js";
 import { domToFigma } from "../shared/html-to-figma.js";
 import { generateImage, generateSvg, loadByokConfig, type AiFetch, type ByokConfig } from "./byok.js";
+import { readImageFile } from "./image-file.js";
+import { loadBackgroundRemover, removeBackgroundPng, type BackgroundRemover } from "./bg-removal.js";
 import { mapToCodeConnect, parseCodeConnect, codeConnectToMap, type ParsedCodeConnect } from "../shared/code-connect.js";
 import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import { join, resolve, relative, isAbsolute } from "node:path";
@@ -114,6 +116,8 @@ export interface ExecutorDeps {
   byok?: ByokConfig;
   /** Injectable for tests — the personal access token for the REST fallback (default: FIGMA_TOKEN). */
   figmaToken?: string;
+  /** Injectable for tests — removeBackground's remover (default: @imgly/background-removal-node, if installed). */
+  bgRemover?: BackgroundRemover;
 }
 
 export interface WriteResult {
@@ -1151,8 +1155,44 @@ function buildFigmaProxy(
   // raw base64. Previously only base64 worked and a URL crashed the plugin with
   // a cryptic atob() error; now the server resolves the URL to base64 before
   // forwarding, matching the documented loadImage(url|base64) contract.
+  // Also loadImage({ filePath }) / loadImage({ imageUrl }): the SERVER reads
+  // the file or fetches the URL, so the agent never handles base64.
   proxy["loadImage"] = async (source: unknown, opts?: Record<string, unknown>) =>
-    call("load_image", { base64: await resolveImageSource(source, deps), ...(isObj(opts) ? opts : {}) });
+    call("load_image", await loadImageParams(source, opts, deps));
+
+  // removeBackground: the plugin renders the node, this process cuts the
+  // subject out locally (optional @imgly/background-removal-node), the plugin
+  // places the transparent PNG beside the original (or into it). One call;
+  // the bytes never reach the agent.
+  proxy["removeBackground"] = async (target?: unknown, opts?: Record<string, unknown>) => {
+    const o = { ...(isObj(target) ? target : {}), ...(isObj(opts) ? opts : {}) };
+    let nodeId = typeof target === "string" && target ? target : typeof o.nodeId === "string" ? o.nodeId : typeof o.id === "string" ? o.id : "";
+    const mode = o.mode === undefined || o.mode === "beside" ? "beside" : o.mode === "replace" ? "replace" : null;
+    if (!mode) throw new OpError(ErrorCode.INVALID_PARAMS, `removeBackground mode must be "beside" or "replace".`, '"beside" (default) keeps the original; "replace" swaps the image fill of an image layer.');
+    const model = o.model === "small" ? "small" : "medium";
+    const scale = typeof o.scale === "number" && Number.isFinite(o.scale) ? Math.max(0.5, Math.min(4, o.scale)) : 1;
+    // Load the remover FIRST: a missing package must not cost a render.
+    const remover = deps.bgRemover ?? (await loadBackgroundRemover());
+    if (!nodeId) {
+      const r = (await call("get_selection", { detail: "sparse" })) as { selection?: Array<{ id: string; name: string }> };
+      const sel = r.selection ?? [];
+      if (sel.length === 0) throw new OpError(ErrorCode.INVALID_PARAMS, "Nothing is selected in Figma and no nodeId was given.", "Ask the user to select the image layer, or pass removeBackground(nodeId).");
+      if (sel.length > 1) {
+        throw new OpError(ErrorCode.INVALID_PARAMS, `${sel.length} layers are selected; removeBackground works on one.`, `Pass one id: ${sel.slice(0, 5).map((n) => `${n.id} (${n.name})`).join(", ")}.`);
+      }
+      nodeId = sel[0]!.id;
+    }
+    const started = Date.now();
+    const rendered = (await call("export_node", { nodeId, format: "PNG", scale })) as { base64?: string };
+    if (typeof rendered?.base64 !== "string" || !rendered.base64) throw new OpError(ErrorCode.INTERNAL, "The plugin returned no render of the node.", "Check the node is visible and has a size.");
+    const cut = await removeBackgroundPng(new Uint8Array(Buffer.from(rendered.base64, "base64")), remover, { model, ...(deps.signal ? { signal: deps.signal } : {}) });
+    const placed = (await call("load_image", {
+      base64: Buffer.from(cut).toString("base64"),
+      ...(typeof o.name === "string" ? { name: o.name } : {}),
+      ...(mode === "replace" ? { replaceId: nodeId } : { besideId: nodeId }),
+    })) as Record<string, unknown>;
+    return { ...(isObj(placed) ? placed : {}), mode, sourceId: nodeId, model, ms: Date.now() - started };
+  };
 
   // exportAssets: render many nodes and write them into the codebase. The
   // plugin renders (exportAsync — local, no rate limit); the SERVER writes the
@@ -1398,10 +1438,11 @@ function buildFigmaProxy(
     const img = await generateImage(prompt, {
       ...(typeof o.size === "string" ? { size: o.size } : {}),
       ...(typeof o.quality === "string" ? { quality: o.quality } : {}),
+      ...(o.provider !== undefined ? { provider: o.provider } : {}),
     }, deps.byok ?? loadByokConfig(), deps.aiFetch, deps.signal);
-    const { size: _s, quality: _q, ...place } = o;
+    const { size: _s, quality: _q, provider: _p, ...place } = o;
     const placed = (await call("load_image", { base64: img.base64, name: typeof o.name === "string" ? o.name : String(prompt).slice(0, 60), ...place })) as Record<string, unknown>;
-    return { ...(isObj(placed) ? placed : {}), model: img.model, size: img.size };
+    return { ...(isObj(placed) ? placed : {}), provider: img.provider, model: img.model, size: img.size };
   };
   proxy["generateSvg"] = async (prompt: unknown, opts?: Record<string, unknown>) => {
     const o = isObj(opts) ? opts : {};
@@ -1825,16 +1866,51 @@ async function resolveImageSource(source: unknown, deps: ExecutorDeps): Promise<
   if (typeof source !== "string" || source.length === 0) {
     throw new OpError(
       ErrorCode.INVALID_PARAMS,
-      "loadImage requires a URL, a data: URI, or a base64 string.",
-      "Pass an https URL (public hosts only), a data:image/...;base64,... URI, or raw base64 bytes.",
+      "loadImage requires an image source.",
+      "Pass { filePath } (a PNG/JPEG/GIF on this machine) or { imageUrl } (public https) — the server reads it, so you never handle base64.",
     );
   }
   if (/^https?:\/\//i.test(source)) return fetchImageAsBase64(source, deps);
+  if (/^file:\/\//i.test(source)) return (await readImageFile(source)).base64;
   if (source.startsWith("data:")) {
     const comma = source.indexOf(",");
     return comma >= 0 ? source.slice(comma + 1) : source;
   }
   return source;
+}
+
+/**
+ * figma.loadImage's arguments → load_image params with `base64` filled in.
+ * Forms: loadImage(urlOrBase64, opts), loadImage({ filePath, ...opts}),
+ * loadImage({ imageUrl, ...opts }), loadImage({ base64 | source | url }).
+ * Exactly one source; the source keys never reach the plugin.
+ */
+async function loadImageParams(source: unknown, opts: Record<string, unknown> | undefined, deps: ExecutorDeps): Promise<Record<string, unknown>> {
+  const bag = { ...(isObj(source) ? source : {}), ...(isObj(opts) ? opts : {}) };
+  const { filePath, imageUrl, url, base64, source: src, ...rest } = bag;
+  const given = [
+    typeof source === "string" ? "a positional source" : null,
+    filePath !== undefined ? "filePath" : null,
+    imageUrl !== undefined ? "imageUrl" : null,
+    url !== undefined ? "url" : null,
+    base64 !== undefined ? "base64" : null,
+    src !== undefined ? "source" : null,
+  ].filter(Boolean) as string[];
+  if (given.length > 1) {
+    throw new OpError(ErrorCode.INVALID_PARAMS, `loadImage got more than one image source (${given.join(", ")}).`, "Pass exactly one of filePath, imageUrl, or a URL / base64 string.");
+  }
+  if (filePath !== undefined) {
+    const file = await readImageFile(filePath);
+    const base = file.path.split(/[\\/]/).pop()!.replace(/\.[a-z0-9]+$/i, "");
+    return { name: base || "image", ...rest, base64: file.base64 };
+  }
+  if (imageUrl !== undefined) {
+    if (typeof imageUrl !== "string" || !/^https?:\/\//i.test(imageUrl)) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, "imageUrl must be an http(s) URL.", "Public https hosts only; for a file on this machine use filePath.");
+    }
+    return { ...rest, base64: await fetchImageAsBase64(imageUrl, deps) };
+  }
+  return { ...rest, base64: await resolveImageSource(typeof source === "string" ? source : (base64 ?? src ?? url), deps) };
 }
 
 /**
@@ -1874,10 +1950,11 @@ async function resolveBatchItemParams(
 ): Promise<Record<string, unknown>> {
   if (op === "load_image") {
     const { source, url, base64, ...rest } = params;
+    if (typeof rest.filePath === "string" || typeof rest.imageUrl === "string") return loadImageParams(params, undefined, deps);
     const src = base64 ?? source ?? url;
     if (typeof src !== "string") return params;
-    // Raw base64 needs nothing; a URL or data: URI goes through loadImage's path.
-    if (src === base64 && !/^https?:\/\//i.test(src) && !src.startsWith("data:")) return params;
+    // Raw base64 needs nothing; a URL, file:// or data: URI goes through loadImage's path.
+    if (src === base64 && !/^(https?|file):\/\//i.test(src) && !src.startsWith("data:")) return params;
     return { ...rest, base64: await resolveImageSource(src, deps) };
   }
   if (op === "load_icon" && (typeof params.svg !== "string" || params.svg.length === 0)) {

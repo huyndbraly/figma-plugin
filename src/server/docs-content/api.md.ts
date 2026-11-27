@@ -163,7 +163,27 @@ separators; a near miss throws with the closest names — never a guess.
 - \`searchIcons(query)\` → candidate canonical names (no fetch).
 - \`loadIcon(name, {library, size, color, parentId, x, y, inset, align,
   insertAt})\` — SVG fetched server-side, drawn by the plugin.
-- \`loadImage(urlOrBase64)\`.
+- \`loadImage({ filePath } | { imageUrl } | urlOrBase64, { parentId, x, y, w, h,
+  name, scaleMode })\` — prefer \`filePath\` (absolute or \`~/…\`, PNG/JPEG/GIF on
+  this machine) or \`imageUrl\` (public https): the SERVER reads the bytes, so
+  never put base64 in your code. Dropped on a page it keeps clear of frames.
+- \`removeBackground(nodeId?, { mode?: "beside"|"replace", model?: "small"|"medium",
+  scale?, name? })\` — cuts the subject out of an image layer locally (no key,
+  no upload); no nodeId = the one selected layer. "beside" (default) adds a
+  transparent PNG right of the original; "replace" swaps an image layer's fill.
+  UNSUPPORTED_OPERATION = the optional package is not installed: tell the user
+  the hint's one-time install line, do not retry.
+
+## SVG → editable vectors
+- Draw icons/illustrations yourself: \`create({ type: "ICON", svg, name, size?,
+  parentId?, x?, y?, color? })\` → \`figma.createNodeFromSvg\`, editable vector
+  layers. \`size\` scales to that width (aspect kept). With no parentId it lands
+  on the page clear of existing frames.
+- Write SVG Figma imports cleanly: a \`viewBox\`, explicit width/height, inline
+  \`fill\`/\`stroke\` attributes (no \`<style>\`/classes), \`<path>\`/basic shapes, no
+  \`<image>\`, \`<foreignObject>\`, filters or external fonts. One idea per layer:
+  group parts with \`<g>\` (each becomes a Figma group).
+- Library icons: \`loadIcon(name)\` is cheaper than writing the path.
 - \`exportAssets(ids | "selection" | {childrenOf}, {dir, formats?, scales?,
   scaleNaming?: "ios"|"android"|"web", overwrite?})\` — render many nodes and
   WRITE them into the codebase (\`dir\` absolute); returns paths only, so use it
@@ -329,9 +349,11 @@ If it is not valid, ask the USER to paste a PAT into the plugin panel
 - \`htmlToFigma(url, { width?, selector?, parentId?, maxNodes? })\` — needs
   Playwright installed next to the server; flex → auto-layout. Any http(s)
   URL (localhost, LAN, public); CDN fonts/CSS load as in a browser.
-- \`generateImage(prompt, { size?, parentId, x, y, w, h })\` (OPENAI_API_KEY),
-  \`generateSvg(prompt, { width?, height?, style?, parentId })\`
-  (ANTHROPIC_API_KEY). Keys are the server's env; never ask for one in chat.
+- \`generateImage(prompt, { provider?: "openai"|"gemini"|"flux", size?, parentId,
+  x, y, w, h })\`, \`generateSvg(prompt, { width?, height?, style?, parentId })\`
+  (Anthropic). Keys: the plugin panel's AI Image Key field, else the server's
+  env (figma_status \`aiKeys\` lists which providers have one). Never ask for a
+  key in chat.
 
 ## Deleting components and styles
 - \`delete(componentId, {force?})\` removes a COMPONENT / COMPONENT_SET. With

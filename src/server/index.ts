@@ -46,6 +46,9 @@ import { READ_OPERATIONS, DEFAULT_PORT, PORT_RANGE } from "../shared/protocol.js
 import { parseRouteArg, type RouteArg } from "./route.js";
 import { REST_ONLY_READ_OPS } from "./rest-features.js";
 import { DesignIndex, LOCAL_INDEX_OPS } from "./design-index.js";
+import { aiKeys } from "./ai-keys.js";
+import { envAiKeys, readByokFile } from "./byok.js";
+import type { AiStatusWire } from "../shared/ai-key.js";
 import { restHub, mergeFollowerRestStatus, type ForwardedRequest, type ForwardedResponse, type TokenStatus } from "./rest-hub.js";
 
 // ---- JSON tool schemas (match ARCHITECTURE.md) ----
@@ -346,6 +349,17 @@ export interface ServerHandle {
   close: () => Promise<void>;
 }
 
+/** Which AI providers have a key — panel first, then env / FIGMA_MCP_BYOK_CONFIG. Masked only. */
+function aiStatus(): AiStatusWire {
+  let file = {};
+  try {
+    file = readByokFile();
+  } catch {
+    /* a broken config file is reported by the generation call itself */
+  }
+  return aiKeys.status(envAiKeys(process.env, file));
+}
+
 export async function createServer(): Promise<ServerHandle> {
   const sessions = new SessionRegistry();
 
@@ -425,9 +439,15 @@ export async function createServer(): Promise<ServerHandle> {
     onRestToken: (token, _channel, meta) => {
       restHub.setPluginToken(token, meta ?? {});
     },
+    // The panel's AI Image Key field: RAM only, used by generateImage /
+    // generateSvg (figma_write runs on the leader, so only its copy matters).
+    onAiKeys: (keys, savedAt) => {
+      aiKeys.set(keys, savedAt);
+    },
     // Runs for the initial bridge AND any takeover replacement.
     onBridgeCreated: (bridge) => {
       bridge.setRestStatusProvider(() => restHub.getStatus());
+      bridge.setAiStatusProvider(aiStatus);
       // Feed agent-session summaries to the bridge so plugin UIs can render
       // the "which agent drives this window?" picker. Sessions idle for over
       // an hour are hidden: a dead MCP process leaves no disconnect signal,
@@ -554,7 +574,7 @@ export async function createServer(): Promise<ServerHandle> {
   type LeaderPluginState = Pick<
     Diagnostics,
     "pluginConnected" | "plugin" | "channels" | "lastHeartbeatMs" | "queueLength" | "pendingCount"
-  > & { sessions?: Diagnostics["sessions"]; restToken?: TokenStatus };
+  > & { sessions?: Diagnostics["sessions"]; restToken?: TokenStatus; aiKeys?: AiStatusWire };
 
   function leaderPluginState(bridge: Bridge): LeaderPluginState {
     return {
@@ -582,6 +602,7 @@ export async function createServer(): Promise<ServerHandle> {
       pendingCount: bridge.pendingCount,
       sessions: sessions.summaries(),
       restToken: restHub.getStatus(),
+      aiKeys: aiStatus(),
     };
   }
 
@@ -682,6 +703,7 @@ export async function createServer(): Promise<ServerHandle> {
   );
   const offRestStatus = restHub.onStatus((status) => liveBridge()?.broadcast({ type: "rest_status", status }));
   const offRestEvent = restHub.onEvent((e) => liveBridge()?.broadcast(e));
+  const offAiKeys = aiKeys.onChange(() => liveBridge()?.broadcast({ type: "ai_status", status: aiStatus() }));
 
   const ctx: ToolContext = { runValidated, runWrite, sessions, diagnostics, designIndex: DesignIndex.fromEnv() };
 
@@ -739,6 +761,7 @@ export async function createServer(): Promise<ServerHandle> {
     close: async () => {
       offRestStatus();
       offRestEvent();
+      offAiKeys();
       await ready.catch(() => undefined);
       await coordinator.close();
     },

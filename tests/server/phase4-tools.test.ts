@@ -183,6 +183,8 @@ describe("htmlToFigma", () => {
 // ---------------------------------------------------------------------------
 describe("BYOK generation", () => {
   const KEY = "sk-test-SECRET-key-123456";
+  /** A PNG signature: generateImage checks the bytes are an image Figma decodes. */
+  const PNG_B64 = "iVBORw0KGgoAAAANSUhEUg==";
 
   it("env beats the config file, and the FIGMA_MCP_ prefix beats the generic name", async () => {
     const cfgPath = join(dir, "byok.json");
@@ -200,9 +202,9 @@ describe("BYOK generation", () => {
     const seen: any[] = [];
     const out = await generateImage("a cat", { size: "1536x1024" }, { openaiApiKey: KEY, imageModel: "gpt-image-1" }, async (url, init) => {
       seen.push({ url, headers: init.headers, body: JSON.parse(String(init.body)) });
-      return new Response(JSON.stringify({ data: [{ b64_json: "AAAA" }] }), { status: 200 });
+      return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }), { status: 200 });
     });
-    expect(out).toEqual({ base64: "AAAA", model: "gpt-image-1", size: "1536x1024" });
+    expect(out).toEqual({ base64: PNG_B64, model: "gpt-image-1", size: "1536x1024", provider: "openai" });
     expect(seen[0].url).toBe("https://api.openai.com/v1/images/generations");
     expect(seen[0].headers.authorization).toBe(`Bearer ${KEY}`);
     expect(JSON.stringify(seen[0].body)).not.toContain(KEY);
@@ -248,11 +250,11 @@ describe("BYOK generation", () => {
         },
         byok: { openaiApiKey: KEY, anthropicApiKey: KEY },
         aiFetch: async (url) =>
-          new Response(JSON.stringify(url.includes("openai") ? { data: [{ b64_json: "QUJD" }] } : { content: [{ type: "text", text: "<svg><rect/></svg>" }] }), { status: 200 }),
+          new Response(JSON.stringify(url.includes("openai") ? { data: [{ b64_json: PNG_B64 }] } : { content: [{ type: "text", text: "<svg><rect/></svg>" }] }), { status: 200 }),
       },
     );
     expect(res.ok, JSON.stringify(res.error)).toBe(true);
-    expect(calls[0]).toEqual(["load_image", { base64: "QUJD", name: "hero", parentId: "1:1", w: 300 }]);
+    expect(calls[0]).toEqual(["load_image", { base64: PNG_B64, name: "hero", parentId: "1:1", w: 300 }]);
     expect(calls[1]![1]).toMatchObject({ type: "ICON", svg: "<svg><rect/></svg>", parentId: "1:1", x: 10 });
     expect(JSON.stringify(res)).not.toContain(KEY);
   });

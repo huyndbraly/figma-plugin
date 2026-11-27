@@ -200,3 +200,21 @@ describe("figma.exportAssets with a link", () => {
     expect(r.calls).not.toContain("export_node");
   });
 });
+
+describe("motion of a closed file (REST interactions, transition duration in ms)", () => {
+  const interactions = [
+    {
+      trigger: { type: "ON_HOVER" },
+      actions: [{ type: "NODE", destinationId: "4:2", navigation: "CHANGE_TO", transition: { type: "SMART_ANIMATE", duration: 300, easing: { type: "EASE_OUT" } } }],
+    },
+  ];
+
+  it("the REST compactor adds motion at full/design detail only", async () => {
+    const { compactTree } = await import("../../src/server/rest-read.js");
+    const node = { id: "1:1", name: "Card", type: "FRAME", absoluteBoundingBox: { x: 0, y: 0, width: 10, height: 10 }, interactions };
+    expect(compactTree(node, "compact", 0, 10).tree.motion).toBeUndefined();
+    const full = compactTree(node, "full", 0, 10).tree.motion as Array<{ actions: Array<{ transition: { duration: number } }> }>;
+    expect(full[0]!.actions[0]!.transition.duration).toBe(0.3);
+    expect(compactTree({ ...node, interactions: [] }, "design", 0, 10).tree.motion).toBeUndefined();
+  });
+});

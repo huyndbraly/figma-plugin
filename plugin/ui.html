@@ -287,6 +287,26 @@
     </div>
   </div>
 
+  <!-- Optional BYOK keys for generateImage / generateSvg. Same rules as the
+       PAT: clientStorage on this machine, RAM on the server, never shown. -->
+  <div class="token-row" id="ai-row">
+    <div class="token-head">
+      <span class="token-label" id="ai-label" title="Optional. Your own AI key, used only when an agent calls generateImage (OpenAI / Gemini / Flux) or generateSvg (Anthropic). Stored on this machine (figma.clientStorage); the MCP server keeps it in memory.">AI Image Key (optional)</span>
+      <span class="token-badge" id="ai-badge">Not set</span>
+    </div>
+    <div class="token-editor">
+      <select id="ai-provider" class="token-expiry" title="Which provider this key is for.">
+        <option value="openai">OpenAI</option>
+        <option value="gemini">Gemini</option>
+        <option value="flux">Flux</option>
+        <option value="anthropic">Anthropic (SVG)</option>
+      </select>
+      <input id="ai-input" type="password" placeholder="API key" autocomplete="off" spellcheck="false" maxlength="512" title="Paste the provider's API key. Stored locally in figma.clientStorage, never in the Figma file.">
+      <button class="mini primary" id="ai-save" title="Save this provider's key locally and hand it to the MCP server.">Save</button>
+      <button class="mini" id="ai-clear" title="Remove this provider's key from this machine and server memory.">Clear</button>
+    </div>
+  </div>
+
   <div class="section-label" id="sessions-label" title="Each row is one Claude Code / Codex instance. Connect routes its commands to this window."><span id="sessions-label-text">AI sessions</span> (<span id="agent-count">0</span>)</div>
   <div class="agents" id="agents">
     <div class="agents-empty" id="agents-empty">No AI sessions yet.</div>
@@ -401,6 +421,9 @@
   var restStatus = null;           // latest rest_status from the server
   var pendingStatus = null;        // the badge before a Save, restored if the Save is refused
   var restAnswerTimer = null;      // armed when the token is sent; any rest_status disarms it
+  var aiKeys = {};                 // AI keys from clientStorage (main thread); sent to the server, never shown
+  var aiSavedAt = null;            // when they were last saved; the server keeps the newest
+  var aiStatus = null;             // latest ai_status from the server (masked previews only)
   var assignedSock = null;         // the socket that received `assigned` — only it may carry the token
   var langChosen = false;          // the user clicked a language; a late stored value must not undo it
   var REST_ANSWER_MS = 12000;
@@ -434,6 +457,12 @@
     tokenSave: document.getElementById("token-save"),
     tokenClear: document.getElementById("token-clear"),
     tokenExpiry: document.getElementById("token-expiry"),
+    aiLabel: document.getElementById("ai-label"),
+    aiBadge: document.getElementById("ai-badge"),
+    aiProvider: document.getElementById("ai-provider"),
+    aiInput: document.getElementById("ai-input"),
+    aiSave: document.getElementById("ai-save"),
+    aiClear: document.getElementById("ai-clear"),
     langEn: document.getElementById("lang-en"),
     langVi: document.getElementById("lang-vi"),
     statusRow: document.getElementById("status-row"),
@@ -484,6 +513,14 @@
       tokenSaveTitle: "Save token locally and verify it with the MCP server (/v1/me).",
       tokenClear: "Clear",
       tokenClearTitle: "Remove the saved REST token from this machine and server memory.",
+      aiLabel: "AI Image Key (optional)",
+      aiTitle: "Optional. Your own AI key, used only when an agent calls generateImage (OpenAI / Gemini / Flux) or generateSvg (Anthropic). Stored on this machine (figma.clientStorage); the MCP server keeps it in memory.",
+      aiNotSet: "Not set",
+      aiPasteFirst: "paste a key first",
+      aiRejected: "Not a key — nothing was changed",
+      aiSaveTitle: "Save this provider's key locally and hand it to the MCP server.",
+      aiClearTitle: "Remove this provider's key from this machine and server memory.",
+      aiFromEnv: " (server env)",
       sessionsLabel: "AI sessions",
       sessionsTitle: "Each row is one Claude Code / Codex instance. Connect routes its commands to this window.",
       noSessions: "No AI sessions yet.",
@@ -561,6 +598,14 @@
       tokenSaveTitle: "Lưu token cục bộ và xác thực với MCP server (/v1/me).",
       tokenClear: "Xóa",
       tokenClearTitle: "Xóa REST token đã lưu khỏi máy này và RAM của server.",
+      aiLabel: "AI Image Key (tùy chọn)",
+      aiTitle: "Tùy chọn. API key AI của bạn, chỉ dùng khi agent gọi generateImage (OpenAI / Gemini / Flux) hoặc generateSvg (Anthropic). Lưu trên máy này (figma.clientStorage); MCP server giữ trong RAM.",
+      aiNotSet: "Chưa đặt",
+      aiPasteFirst: "hãy dán key trước",
+      aiRejected: "Không phải key — không có gì thay đổi",
+      aiSaveTitle: "Lưu key của provider này trên máy và gửi cho MCP server.",
+      aiClearTitle: "Xóa key của provider này khỏi máy và RAM của server.",
+      aiFromEnv: " (env của server)",
       sessionsLabel: "Phiên AI",
       sessionsTitle: "Mỗi dòng là một phiên Claude Code / Codex. Bấm Kết nối để điều hướng lệnh về cửa sổ này.",
       noSessions: "Chưa có phiên AI nào.",
@@ -645,6 +690,9 @@
     if (el.optExp90) el.optExp90.textContent = t("exp90");
     if (el.tokenSave) { el.tokenSave.textContent = t("tokenSave"); el.tokenSave.title = t("tokenSaveTitle"); }
     if (el.tokenClear) { el.tokenClear.textContent = t("tokenClear"); el.tokenClear.title = t("tokenClearTitle"); }
+    if (el.aiLabel) { el.aiLabel.textContent = t("aiLabel"); el.aiLabel.title = t("aiTitle"); }
+    if (el.aiSave) { el.aiSave.textContent = t("tokenSave"); el.aiSave.title = t("aiSaveTitle"); }
+    if (el.aiClear) { el.aiClear.textContent = t("tokenClear"); el.aiClear.title = t("aiClearTitle"); }
     if (el.sessionsLabel) el.sessionsLabel.title = t("sessionsTitle");
     if (el.sessionsLabelText) el.sessionsLabelText.textContent = t("sessionsLabel");
     if (el.statWritesCard) el.statWritesCard.title = t("writesTitle");
@@ -663,6 +711,7 @@
 
     if (lastStateKind) setState(lastStateKind, lastStateRawText);
     renderToken();
+    renderAi();
     renderMeta();
     if (channelsUpdate) renderAgents();
     else if (el.agentsEmpty) el.agentsEmpty.textContent = t("noSessions");
@@ -764,6 +813,33 @@
       restStatus = next;
       renderToken();
     }
+  }
+
+  // ---- AI keys ----
+  var AI_NAMES = { openai: "OpenAI", gemini: "Gemini", flux: "Flux", anthropic: "Anthropic" };
+  function maskAi(k) { return k.length < 12 ? "••••" : k.slice(0, 3) + "…" + k.slice(-4); }
+  function sendAiKeys() {
+    if (!(ws && ws.readyState === 1 && assignedSock === ws)) return;
+    if (!aiSavedAt) return;
+    var keys = {};
+    for (var p in AI_NAMES) keys[p] = typeof aiKeys[p] === "string" ? aiKeys[p] : null;
+    ws.send(JSON.stringify({ type: "set_ai_keys", keys: keys, savedAt: aiSavedAt }));
+  }
+  function renderAi() {
+    if (!el.aiBadge) return;
+    // The server's view when we have it (it also knows keys from its env);
+    // until then, what this panel holds.
+    var list = [];
+    if (aiStatus && aiStatus.providers) {
+      for (var i = 0; i < aiStatus.providers.length; i++) list.push(aiStatus.providers[i]);
+    } else {
+      for (var q in AI_NAMES) if (aiKeys[q]) list.push({ provider: q, source: "plugin", masked: maskAi(aiKeys[q]) });
+    }
+    el.aiBadge.className = "token-badge" + (list.length ? " ok" : "");
+    el.aiBadge.textContent = list.length ? list.map(function (x) { return AI_NAMES[x.provider] || x.provider; }).join(", ") : t("aiNotSet");
+    el.aiBadge.title = list.length
+      ? list.map(function (x) { return (AI_NAMES[x.provider] || x.provider) + ": " + x.masked + (x.source === "env" ? t("aiFromEnv") : ""); }).join("\n")
+      : t("aiTitle");
   }
 
   // One Figma REST request the server made: counters + an activity row.
@@ -1065,6 +1141,20 @@
         sendRestToken();
         break;
       }
+      case "ai-keys": {
+        if (msg.reason === "rejected") {
+          // Keep what was typed: one wrong character should be fixable, not retyped.
+          el.aiInput.placeholder = msg.error || t("aiRejected");
+          el.aiInput.title = msg.error || t("aiRejected");
+          break;
+        }
+        aiKeys = msg.keys && typeof msg.keys === "object" ? msg.keys : {};
+        aiSavedAt = typeof msg.savedAt === "number" ? msg.savedAt : null;
+        if (msg.reason === "saved") el.aiInput.value = "";
+        renderAi();
+        sendAiKeys();
+        break;
+      }
       case "ui-lang": {
         if (!langChosen && (msg.lang === "en" || msg.lang === "vi")) applyLang(msg.lang, true);
         break;
@@ -1185,6 +1275,7 @@
         // Joined: now (and only now) the REST token goes over — read fresh
         // from clientStorage, since another window may have changed it.
         toMain({ kind: "rest-token-request" });
+        toMain({ kind: "ai-keys-request" });
         renderMeta();
         if (askedFor && askedFor !== channel) {
           // Another window of this file still holds the stored channel (the
@@ -1210,6 +1301,11 @@
         onRestEvent(data);
         return;
       }
+      if (data.type === "ai_status" && data.status) {
+        aiStatus = data.status;
+        renderAi();
+        return;
+      }
     };
 
     sock.onerror = function () {
@@ -1219,6 +1315,9 @@
     sock.onclose = function (event) {
       if (sock !== ws) return; // a socket we already replaced or dropped
       if (assignedSock === sock) assignedSock = null;
+      // The server's AI-key view is gone with it; show what this panel holds.
+      aiStatus = null;
+      renderAi();
       // A server that went away is not "an older build": drop the 12 s
       // no-answer diagnosis; the token is sent again after the next `assigned`.
       clearTimeout(restAnswerTimer);
@@ -1420,6 +1519,22 @@
   el.tokenInput.onkeydown = function (e) {
     if (e.key === "Enter") el.tokenSave.onclick();
   };
+  el.aiSave.onclick = function () {
+    var v = (el.aiInput.value || "").trim();
+    if (!v) {
+      el.aiInput.placeholder = t("aiPasteFirst");
+      return;
+    }
+    toMain({ kind: "save-ai-key", provider: el.aiProvider.value, key: v });
+  };
+  el.aiClear.onclick = function () {
+    el.aiInput.value = "";
+    toMain({ kind: "save-ai-key", provider: el.aiProvider.value, key: null });
+  };
+  el.aiInput.onkeydown = function (e) {
+    if (e.key === "Enter") el.aiSave.onclick();
+  };
+  renderAi();
   renderToken();
   if (el.langEn) el.langEn.onclick = function () { langChosen = true; applyLang("en"); };
   if (el.langVi) el.langVi.onclick = function () { langChosen = true; applyLang("vi"); };

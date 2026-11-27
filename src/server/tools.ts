@@ -7,6 +7,7 @@
  * concrete next steps (never a bare boolean). figma_rules runs the three
  * design-system reads in parallel and formats a markdown rule sheet.
  */
+import type { AiStatusWire } from "../shared/ai-key.js";
 import {
   HEARTBEAT_DEAD_MS,
   PROTOCOL_VERSION,
@@ -116,6 +117,8 @@ export interface Diagnostics {
   sessions?: Array<{ id: string; writeCount: number; stateKeys: number; lastUsedMs: number }>;
   /** The Figma REST token's state — never the token (see rest-hub.ts). */
   restToken?: TokenStatus;
+  /** Which AI providers have a key (masked) — never a key (see ai-keys.ts). */
+  aiKeys?: AiStatusWire;
 }
 
 // ---- figma_status ----
@@ -167,6 +170,8 @@ export async function handleStatus(ctx: ToolContext): Promise<Record<string, unk
     ...(d.defaultSessionId ? { mySessionId: d.defaultSessionId } : {}),
     ...(d.boundChannel ? { myBoundChannel: d.boundChannel } : {}),
     restToken: d.restToken ?? null,
+    // generateImage / generateSvg: provider, where the key came from, a masked preview.
+    aiKeys: d.aiKeys ? d.aiKeys.providers : null,
     hints,
   };
 }
