@@ -59,8 +59,10 @@ describe("forward timeout extends while the leader is alive", () => {
       }
       // /rpc and dead /health: never respond.
     });
-    const port = 45000 + Math.floor(Math.random() * 500);
-    await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
+    // Port 0: the OS picks a free one. A random pick from a shared range
+    // collided with other files' fixed election ports (46xxx) in CI.
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as import("node:net").AddressInfo).port;
     try {
       const follower = new Follower({ port, token: "tok", pid: 1, startedAt: 0, version: "0.0.0" });
       const pending = follower.forward("build_demo", {}, "s-1", undefined, 300, {

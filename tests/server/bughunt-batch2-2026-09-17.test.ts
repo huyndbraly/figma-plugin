@@ -316,8 +316,10 @@ describe("follower: a leader body whose `error` is not an envelope", () => {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
     });
-    const port = 46000 + Math.floor(Math.random() * 500);
-    await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
+    // Port 0: the OS picks a free one. A random pick from a shared range
+    // collided with other files' fixed election ports (46xxx) in CI.
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as import("node:net").AddressInfo).port;
     try {
       const follower = new Follower({ port, token: "tok", pid: 1, startedAt: 0, version: "0.0.0" });
       const err = (await follower.forward("get_selection", {}, "s-1", undefined, 2000).catch((e) => e)) as {
