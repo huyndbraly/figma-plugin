@@ -18,7 +18,7 @@
  * agent makes ONCE, at the start of a session, to find out what already exists.
  */
 import { HandlerContext, getNodeByIdSafe } from "../context.js";
-import { canvasChildren, markedDiagramFrames, pageArtboards, readDiagramSource } from "../diagram-apply.js";
+import { canvasChildren, markedDiagramFrames, figjamDiagramSections, pageArtboards, readDiagramSource } from "../diagram-apply.js";
 import { isDiagramFrameName } from "../diagram-mark.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
@@ -80,7 +80,8 @@ function collect(
   // depth come from the one native search the re-route sweep uses. The
   // canvas-level walk stays for the unmarked, older frames only a name finds.
   const seen = new Set<string>();
-  const candidates: SceneNode[] = [...canvasChildren(page), ...(markedDiagramFrames(page) ?? [])];
+  // FigJam-native sections carry their model too, under their own key.
+  const candidates: SceneNode[] = [...canvasChildren(page), ...(markedDiagramFrames(page) ?? []), ...figjamDiagramSections(page)];
   for (const child of candidates) {
     if (seen.has(child.id)) continue;
     seen.add(child.id);
@@ -91,7 +92,8 @@ function collect(
     // page that LOOKS compared but has a diagram in it that no check ever saw,
     // which is worse than admitting the gap. One redraw fixes it.
     if (!mark.kind) {
-      if (child.type === "FRAME" && isDiagramFrameName(child.name)) {
+      // A FigJam section whose marker cannot be read is ours too: listed.
+      if ((child.type === "FRAME" && isDiagramFrameName(child.name)) || (child.type === "SECTION" && mark.native === "figjam")) {
         into.push({
           nodeId: child.id,
           name: child.name,

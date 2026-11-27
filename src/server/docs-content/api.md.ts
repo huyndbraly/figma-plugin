@@ -297,7 +297,8 @@ The token never reaches you: \`figma_status.restToken\` says only its state
 (\`not_set\` / \`checking\` / \`valid\` + handle / \`invalid\` / \`rate_limited\`).
 If it is not valid, ask the USER to paste a PAT into the plugin panel
 (REST Token → Save). File = \`{ url }\` | \`{ fileKey }\` | the open window's file.
-- \`getComments({ url?, nodeId?, unresolved?, limit? })\` → threads with replies.
+- \`getComments({ url?, nodeId?, unresolved?, limit? })\` → threads with replies
+  (all of the file; a link's node-id is NOT a filter — pass nodeId for that).
 - \`postComment({ url?, message, nodeId?, x?, y?, replyTo? })\` — needs the
   file_comments:write scope. Posting is visible to everyone on the file: only
   when the user asked for it.
@@ -307,8 +308,10 @@ If it is not valid, ask the USER to paste a PAT into the plugin panel
   \`source: "rest"\` forces REST (last saved version) even when it is open.
 
 ## FigJam, Slides, motion
-- In a FigJam window, figma_diagram userflow/activity/state/sitemap draws with
-  FigJam shapes + connectors (in a section); the checker still runs.
+- In a FigJam window, figma_diagram draws userflow/activity/state/sitemap/
+  usecase as FigJam shapes + connectors and persona/journey as stickies, in a
+  section that stores the model (get_diagram_spec, update/patch work).
+  sequence/erd keep the Design drawing. The checker still runs first.
 - Slides: figma_read get_slides; \`createSlide({ name?, row?, col?, fill? })\`,
   then \`create({ parentId: slideId, ... })\`.
 - Reads at detail full/design add \`motion\` on nodes with prototype
@@ -324,7 +327,8 @@ If it is not valid, ask the USER to paste a PAT into the plugin panel
   file whose components/styles/variables were read on this machine
   (.figma-cache/); index_design_file \`{ url }\` indexes a closed file.
 - \`htmlToFigma(url, { width?, selector?, parentId?, maxNodes? })\` — needs
-  Playwright installed next to the server; flex → auto-layout.
+  Playwright installed next to the server; flex → auto-layout. Any http(s)
+  URL (localhost, LAN, public); CDN fonts/CSS load as in a browser.
 - \`generateImage(prompt, { size?, parentId, x, y, w, h })\` (OPENAI_API_KEY),
   \`generateSvg(prompt, { width?, height?, style?, parentId })\`
   (ANTHROPIC_API_KEY). Keys are the server's env; never ask for one in chat.

@@ -77,7 +77,7 @@ export interface CoordinatorDeps {
    */
   onBridgeCreated?: (bridge: Bridge) => void;
   /** A plugin window saved/cleared the Figma REST token (see rest-hub.ts). */
-  onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null }) => void;
+  onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null; savedAt?: number | null }) => void;
   /**
    * Fires whenever this process starts following a leader — at election,
    * after a takeover by another process, after the leader restarted with a

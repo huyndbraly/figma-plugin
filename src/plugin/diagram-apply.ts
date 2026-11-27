@@ -8,6 +8,7 @@
  * Arrows are MOVED, never recreated: same layers, same z-order, same names, so
  * a re-route cannot disturb anything the user did to the diagram by hand.
  */
+import { FIGJAM_MARKER, LEGACY_FIGJAM_MARKER } from "../shared/figjam/style.js";
 import { setArrowPolyline, setPolyline, setStrokeGroup } from "./vector-path.js";
 import {
   ACTIVITY_MARKER,
@@ -489,6 +490,8 @@ export function readDiagramSource(node: BaseNode): {
   kind?: string;
   title?: string;
   source?: unknown;
+  /** "figjam" for a section drawn with FigJam's own nodes. */
+  native?: string;
 } {
   // The CONSTANTS, never a hand-typed copy of them: this list once said
   // "figma-plugin.flow" while the userflow marker was "figma-plugin.userflow", so no
@@ -512,6 +515,45 @@ export function readDiagramSource(node: BaseNode): {
       };
     } catch {
       return {};
+    }
+  }
+  // A FigJam-native diagram (a SECTION) keeps its model under its own key.
+  let fj = "";
+  try {
+    fj = node.getPluginData(FIGJAM_MARKER);
+  } catch {
+    fj = "";
+  }
+  if (!fj) {
+    // The first FigJam build stored only { kind, title } under another key:
+    // recognisably ours, with no model to patch — "redraw it once".
+    let legacy = "";
+    try {
+      legacy = node.getPluginData(LEGACY_FIGJAM_MARKER);
+    } catch {
+      legacy = "";
+    }
+    if (legacy) {
+      try {
+        const m = JSON.parse(legacy) as Record<string, unknown>;
+        return { ...(typeof m.kind === "string" ? { kind: m.kind } : {}), ...(typeof m.title === "string" ? { title: m.title } : {}), native: "figjam" };
+      } catch {
+        return { native: "figjam" };
+      }
+    }
+  }
+  if (fj) {
+    try {
+      const mark = JSON.parse(fj) as Record<string, unknown>;
+      return {
+        ...(typeof mark.kind === "string" ? { kind: mark.kind } : {}),
+        ...(typeof mark.title === "string" ? { title: mark.title } : {}),
+        ...(mark.source !== undefined ? { source: mark.source } : {}),
+        native: "figjam",
+      };
+    } catch {
+      // Unreadable marker: still OUR FigJam section (no model) — never a Design frame.
+      return { native: "figjam" };
     }
   }
   return {};
@@ -820,7 +862,7 @@ export function pageArtboards(page: BaseNode & ChildrenMixin): Array<{ nodeId: s
   return out;
 }
 
-export function pageModel(frame: FrameNode): Array<Record<string, unknown>> {
+export function pageModel(frame: SceneNode): Array<Record<string, unknown>> {
   // The PAGE, not the frame's parent: a diagram inside a SECTION saw only the
   // section's diagrams, and one on the page never saw those in a section.
   let page: BaseNode | null = frame.parent;
@@ -833,7 +875,7 @@ export function pageModel(frame: FrameNode): Array<Record<string, unknown>> {
   // a diagram drawn with parentId must still see itself and its neighbours,
   // whatever it sits in. De-duplicated, since those are usually the same nodes.
   const seen = new Set<string>();
-  const candidates: SceneNode[] = [...(markedDiagramFrames(page as PageNode) ?? canvasChildren(page as PageNode))];
+  const candidates: SceneNode[] = [...(markedDiagramFrames(page as PageNode) ?? canvasChildren(page as PageNode)), ...figjamDiagramSections(page as PageNode)];
   const parent = frame.parent;
   if (parent && parent.type !== "PAGE" && parent.type !== "SECTION" && "children" in parent) {
     candidates.push(...(parent as ChildrenMixin).children);
@@ -867,6 +909,32 @@ export function pageModel(frame: FrameNode): Array<Record<string, unknown>> {
  * A marked frame inside an instance or a component is a picture of a diagram,
  * not a diagram: the native search reaches into them, and they are skipped.
  */
+/**
+ * Every FigJam-native diagram section on the page, at any depth. Not part of
+ * markedDiagramFrames: the arrow re-router walks those, and must never treat
+ * a section of FigJam connectors as a frame of vectors.
+ */
+export function figjamDiagramSections(page: PageNode): SceneNode[] {
+  const keys = [FIGJAM_MARKER, LEGACY_FIGJAM_MARKER];
+  try {
+    if (typeof page.findAllWithCriteria === "function") {
+      return [...page.findAllWithCriteria({ types: ["SECTION"], pluginData: { keys } })];
+    }
+  } catch {
+    /* fall back to the walk */
+  }
+  const out: SceneNode[] = [];
+  const walk = (nodes: readonly SceneNode[]) => {
+    for (const n of nodes) {
+      if (n.type !== "SECTION") continue;
+      if (keys.some((k) => { try { return !!n.getPluginData(k); } catch { return false; } })) out.push(n);
+      walk(n.children);
+    }
+  };
+  walk(page.children ?? []);
+  return out;
+}
+
 export function markedDiagramFrames(page: PageNode): FrameNode[] | null {
   let marked: readonly SceneNode[] | null = null;
   try {

@@ -21,7 +21,7 @@ what these are for.
 "correct", the findings loop, frame placement, verification, redrawing. Each `SKILL.md`
 references it and carries only what is genuinely its own.
 
-**FigJam:** run the plugin inside a FigJam board and `/figma-userflow`, `/figma-activity`, `/figma-state` and `/figma-sitemap` draw with FigJam's native shapes and connectors (the model is still checked first). The other kinds draw as in Figma Design.
+**FigJam:** run the plugin inside a FigJam board and `/figma-userflow`, `/figma-activity`, `/figma-state`, `/figma-sitemap` and `/figma-usecase` draw with FigJam's native shapes and connectors, `/figma-persona` and `/figma-journey` with stickies — the model is still checked first, and the section remembers it, so patches work. `/figma-sequence` and `/figma-erd` draw as in Figma Design (FigJam connectors cannot keep lifelines in order or draw crow's-foot ends).
 
 ## Install
 

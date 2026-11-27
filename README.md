@@ -21,7 +21,7 @@ Dự án này ra đời vì phần lớn các Figma MCP khác đẩy trách nhi�
 | **Tài nguyên (Assets)** | Icons, hình ảnh, overlays, gradients, đổi màu (recolor), prototype reactions; xóa pages và styles, dọn dẹp styles không dùng |
 | **Sơ đồ BA / UX** | Userflow, activity có swimlanes, sequence, ERD, sitemap, state machine, use case, journey map, persona set; mũi tên tự bám theo khối hộp; chỉnh sửa sơ đồ tại chỗ; kiểm tra chéo mâu thuẫn giữa các sơ đồ |
 | **REST hybrid (PAT)** | Dán Figma personal access token ngay trong panel plugin (ô `REST Token`, Save/Clear, badge `Valid (@handle)` / `Expired / Invalid` / `Rate-limited`); token chỉ lưu trên máy bạn (`figma.clientStorage`), server giữ trong RAM, không ghi file, không log, không trả về cho agent. Đọc comments, trả lời/tạo comment, lịch sử phiên bản, đọc file **chưa mở** qua link hoặc `fileKey` (kể cả `generate_design_md`); mọi request REST hiện trong ACTIVITY với nhãn `[REST]` |
-| **FigJam · Slides · Motion** | Trong FigJam, `figma_diagram` vẽ bằng node gốc (shape-with-text, sticky, connector tự bám); đọc/tạo slide trong Figma Slides; đọc `motion` của prototype (trigger, SMART_ANIMATE, duration, easing bezier/spring, chuỗi CSS) để sinh code animation |
+| **FigJam · Slides · Motion** | Trong FigJam, `figma_diagram` vẽ bằng node gốc: userflow / activity / state / sitemap / usecase bằng shape + connector tự bám, persona / journey bằng sticky; section lưu model nên `update`/`patch` và kiểm tra chéo vẫn dùng được (sequence / erd giữ dạng frame). Đọc/tạo slide trong Figma Slides; đọc `motion` của prototype (trigger, SMART_ANIMATE, duration, easing bezier/spring, chuỗi CSS) để sinh code animation |
 | **Mở rộng** | Xuất/đọc file Code Connect `.figma.tsx` từ component map; chỉ mục design system đa file cục bộ (`.figma-cache/`, `search_design_index`); `htmlToFigma(url)` dựng trang web đang chạy thành cây auto-layout (Playwright tùy chọn); sinh ảnh/SVG bằng API key của bạn (BYOK) rồi chèn lên canvas |
 | **Claude skills** | `/figma-userflow`, `/figma-activity`, `/figma-sequence`, `/figma-erd`, `/figma-sitemap`, `/figma-state`, `/figma-usecase`, `/figma-journey`, `/figma-persona` |
 
@@ -98,9 +98,9 @@ Xem [`ARCHITECTURE.md`](./ARCHITECTURE.md) để hiểu đầy đủ lý do thi�
 | Tạo ảnh AI & minh họa vector AI (`generate_image`, `generate_vector_illustration`) | ❌ | ✅ (High) | ✅ (Medium, BYOK) — `generateImage` (key OpenAI của bạn) / `generateSvg` (key Anthropic, SVG đã làm sạch), chèn thẳng lên canvas |
 | Đọc ngữ cảnh Motion / Animation & keyframes (`get_motion_context`) | ❌ | ✅ (High) | ✅ (Medium) — transition của prototype dạng `motion` (SMART_ANIMATE, duration, bezier/spring, CSS); chưa có keyframes |
 | Tạo Custom Shaders, Generative Plugins & Weave AI workflows | ❌ | ✅ (High) | ❌ |
-| Chuyển Web/HTML chạy thực tế thành Figma Design (`generate_figma_design`) | ❌ | ✅ (High) | ✅ (Medium) — `htmlToFigma(url)` với Playwright tùy chọn: flex → auto-layout, font/màu theo CSS thật; ảnh là placeholder |
+| Chuyển Web/HTML chạy thực tế thành Figma Design (`generate_figma_design`) | ❌ | ✅ (High) | ✅ (Medium) — `htmlToFigma(url)` với Playwright tùy chọn: flex → auto-layout, font/màu theo CSS thật; ảnh là placeholder; mở mọi host http(s) (localhost, LAN, công khai) |
 | Xuất Video (`export_video`) | ❌ | ✅ (High) | ❌ |
-| Hỗ trợ FigJam, Figma Slides, tạo file mới & Branching (`create_branch`) | ❌ (Chỉ đọc) | ✅ (High) — Hỗ trợ gốc FigJam, Slides, Branching | ✅ (Medium) — Sơ đồ FigJam bằng node gốc (shape + connector), đọc/tạo slide cơ bản; chưa tạo file mới / branching |
+| Hỗ trợ FigJam, Figma Slides, tạo file mới & Branching (`create_branch`) | ❌ (Chỉ đọc) | ✅ (High) — Hỗ trợ gốc FigJam, Slides, Branching | ✅ (Medium) — Sơ đồ FigJam bằng node gốc cho 7/9 loại (shape + connector, sticky cho persona/journey), lưu model để patch; đọc/tạo slide cơ bản; chưa tạo file mới / branching |
 | **Cộng tác & Dữ liệu Đám mây (Cloud Metadata)** | | | |
 | Bình luận (comments), lịch sử phiên bản & webhooks | ✅ (High) | ✅ (High) — Đọc/tương tác comments & cloud metadata | ✅ (Medium) — Đọc/đăng comments & lịch sử phiên bản qua PAT dán trong panel plugin; chưa có webhooks |
 

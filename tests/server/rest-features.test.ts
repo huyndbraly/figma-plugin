@@ -79,12 +79,22 @@ describe("comments", () => {
     expect(threadComments(COMMENTS, { limit: 1 })).toMatchObject({ total: 2, returned: 1 });
   });
 
-  it("figma_read get_comments takes the file from a link, and the node too", async () => {
+  it("figma_read get_comments takes the file from a link; the link's node-id is reported, NOT applied as a filter", async () => {
     const api = figmaApi({ [`/files/${FILE}/comments`]: COMMENTS });
-    const out = (await handleRead(ctx(api), "get_comments", { url: LINK })) as { fileKey: string; threads: Array<{ id: string }> };
+    const out = (await handleRead(ctx(api), "get_comments", { url: LINK })) as { fileKey: string; threads: Array<{ id: string }>; linkNodeId?: string; hint?: string };
     expect(out.fileKey).toBe(FILE);
-    expect(out.threads.map((t) => t.id)).toEqual(["1"]); // the link's node-id filtered
+    // A copied link nearly always carries a node-id; filtering on it returned 0 threads for "this file".
+    expect(out.threads.map((t) => t.id)).toEqual(["1", "3"]);
+    expect(out.linkNodeId).toBe("12:345");
+    expect(out.hint).toMatch(/nodeId: "12:345"/);
     expect(api.seen[0]).toMatchObject({ method: "GET", url: `https://api.figma.com/v1/files/${FILE}/comments` });
+  });
+
+  it("an explicit nodeId filters, and says so", async () => {
+    const api = figmaApi({ [`/files/${FILE}/comments`]: COMMENTS });
+    const out = (await handleRead(ctx(api), "get_comments", { url: LINK, nodeId: "12:345" })) as { threads: Array<{ id: string }>; nodeFilter?: string };
+    expect(out.threads.map((t) => t.id)).toEqual(["1"]);
+    expect(out.nodeFilter).toBe("12:345");
   });
 
   it("is never served from the read cache — comments change while people talk", async () => {
@@ -277,5 +287,47 @@ describe("design.md from the live file's JSON shape (Starter plan, unpublished l
     });
     expect(out.markdown).toContain("Tone=secondary, Size=sm — id `2:14`");
     expect(out.markdown).toMatch(/`Tone`: VARIANT default=.*primary.*options=/);
+  });
+});
+
+
+describe("review fixes: REST features", () => {
+  it("figma.postComment with a url that is not a Figma link refuses instead of posting to the open file", async () => {
+    const calls: string[] = [];
+    const res = await executeWrite(`return await figma.postComment({ url: "www.figma.com/desgn/oops", message: "hi" });`, new SessionRegistry().get(), {
+      runOp: async (op) => {
+        calls.push(op);
+        return { id: "x", ok: true, result: { fileKey: "OPEN_FILE" } };
+      },
+      restFetch: async () => new Response("{}", { status: 200 }),
+    });
+    expect(res.error).toMatchObject({ code: "INVALID_PARAMS", message: expect.stringMatching(/not a Figma link/) });
+    expect(calls).not.toContain("get_document_info");
+  });
+
+  it("restDesignKit notes every sub-read it could not do, and merges LOCAL components even when some are published", async () => {
+    const scope = JSON.stringify({ error: true, status: 403, message: 'Invalid scope: ["file_content:read"]. This endpoint requires the library_content:read scope.' });
+    const api = figmaApi({
+      [`/files/${FILE}`]: { name: "F", document: { children: [] }, components: { "9:9": { name: "LocalOnly", key: "k9" } }, componentSets: {} },
+      [`/files/${FILE}/styles`]: () => new Response(scope, { status: 403 }),
+      [`/files/${FILE}/components`]: { meta: { components: [{ node_id: "1:1", name: "Published", key: "k1", containing_frame: {} }] } },
+      [`/files/${FILE}/component_sets`]: { meta: { component_sets: [] } },
+    });
+    const kit = await restDesignKit(new RestClient("t", api.fetch), FILE, {});
+    expect(kit.components!.map((c) => c.name).sort()).toEqual(["LocalOnly", "Published"]);
+    expect(kit.notes!.join("\n")).toMatch(/Published styles could not be read.*INCOMPLETE.*library_content:read/);
+  });
+
+  it("a rate limit during design.md fails the call (with when to retry) instead of returning a partial file", async () => {
+    const api = figmaApi({
+      [`/files/${FILE}`]: { name: "F", document: { children: [] } },
+      [`/files/${FILE}/styles`]: () => new Response('{"status":429,"err":"Rate limit exceeded"}', { status: 429, headers: { "retry-after": "399946", "x-figma-plan-tier": "starter" } }),
+    });
+    await expect(restDesignKit(new RestClient("t", api.fetch), FILE, {})).rejects.toMatchObject({ code: "RATE_LIMITED", message: expect.stringMatching(/4\.6 days/) });
+  });
+
+  it("postComment's rate-limit error says when to retry", async () => {
+    const api = figmaApi({ [`POST /files/${FILE}/comments`]: () => new Response("{}", { status: 429, headers: { "retry-after": "7200" } }) });
+    await expect(postComment(api.fetch, FILE, { message: "x" })).rejects.toMatchObject({ code: "RATE_LIMITED", message: expect.stringMatching(/2 h/) });
   });
 });

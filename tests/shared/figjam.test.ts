@@ -103,3 +103,84 @@ describe("layoutFigjam", () => {
     expect(sizeFor({ id: "c", label: "●", shape: "ELLIPSE", color: "gray" })).toEqual({ w: 48, h: 48 });
   });
 });
+
+describe("board kinds in FigJam (review D2)", () => {
+  it("usecase: actors and ellipse use cases; «include»/«extend» dashed with their label", () => {
+    const g = toFigjamGraph("usecase", {
+      title: "Shop",
+      actors: [{ id: "c", name: "Customer" }, { id: "pay", name: "Payment GW", kind: "system" }],
+      useCases: [{ id: "buy", label: "Buy" }, { id: "login", label: "Log in" }],
+      links: [{ from: "c", to: "buy" }, { from: "buy", to: "login", kind: "include" }],
+    });
+    expect(g.nodes.find((n) => n.id === "buy")!.shape).toBe("ELLIPSE");
+    expect(g.nodes.find((n) => n.id === "pay")!.label).toMatch(/Payment GW/);
+    expect(g.edges[1]).toEqual({ from: "buy", to: "login", label: "«include»", dashed: true });
+  });
+
+  it("persona: a column of stickies per persona, primary starred, empty sections left out", () => {
+    const g = toFigjamGraph("persona", {
+      title: "People",
+      source: "interviews",
+      personas: [
+        { id: "an", name: "An", primary: true, goals: ["ship fast"], pains: ["slow review"] },
+        { id: "bo", name: "Bo", needs: ["clarity"] },
+      ],
+    });
+    expect(g.placed).toBe(true);
+    expect(g.nodes.every((n) => n.shape === "STICKY")).toBe(true);
+    expect(g.nodes.find((n) => n.id === "an#head")!.label).toMatch(/^★ An/);
+    expect(g.nodes.find((n) => n.id === "an#goals")!.label).toBe("Goals\n• ship fast");
+    expect(g.nodes.some((n) => n.id === "bo#goals")).toBe(false);
+    const xs = new Set(g.nodes.filter((n) => n.id.startsWith("bo")).map((n) => n.x));
+    expect(xs.size).toBe(1); // one column
+  });
+
+  it("journey: phase headers chained left to right; feelings say their sign", () => {
+    const g = toFigjamGraph("journey", {
+      title: "Checkout",
+      persona: "An",
+      phases: [
+        { id: "find", label: "Find", actions: ["search"], feeling: 1 },
+        { id: "pay", label: "Pay", pains: ["card refused"], feeling: -2, feelingNote: "angry" },
+      ],
+    });
+    expect(g.edges).toEqual([{ from: "find#phase", to: "pay#phase" }]);
+    expect(g.nodes.find((n) => n.id === "pay#feels")).toMatchObject({ color: "red", label: expect.stringMatching(/^Feels 🙁 -2\n• angry/) });
+  });
+
+  it("a placed board keeps its grid and gets sizes, inside the section margins", () => {
+    const g = toFigjamGraph("persona", { title: "P", personas: [{ id: "a", name: "A", goals: ["g"] }] });
+    const { graph, width, height } = layoutFigjam(g);
+    expect(graph.nodes[0]).toMatchObject({ x: 40, y: 80, w: 240, h: 240 });
+    expect(graph.nodes[1]!.y).toBe(80 + 280);
+    expect(width).toBeGreaterThan(240);
+    expect(height).toBeGreaterThan(520);
+  });
+});
+
+describe("FigJam layout fixes (review)", () => {
+  it("a long single-line label gets the height of its WRAPPED lines", () => {
+    const short = sizeFor({ id: "a", label: "Short", shape: "ROUNDED_RECTANGLE", color: "blue" });
+    const long = sizeFor({ id: "b", label: "x".repeat(120), shape: "ROUNDED_RECTANGLE", color: "blue" });
+    expect(long.w).toBe(320);
+    expect(long.h).toBeGreaterThan(short.h + 40);
+  });
+
+  it("duplicate and empty ids are dropped with a warning; numeric ids become strings", () => {
+    const { graph, warnings } = layoutFigjam({
+      title: "x",
+      rankdir: "LR",
+      nodes: [
+        { id: "a", label: "A", shape: "SQUARE", color: "blue" },
+        { id: "a", label: "A again", shape: "SQUARE", color: "blue" },
+        { id: "", label: "nameless", shape: "SQUARE", color: "blue" },
+        { id: 7 as unknown as string, label: "seven", shape: "SQUARE", color: "blue" },
+      ],
+      edges: [{ from: "a", to: 7 as unknown as string }],
+    });
+    expect(graph.nodes.map((n) => n.id)).toEqual(["a", "7"]);
+    expect(graph.edges).toEqual([{ from: "a", to: "7" }]);
+    expect(warnings.join("\n")).toMatch(/used twice/);
+    expect(warnings.join("\n")).toMatch(/no id/);
+  });
+});

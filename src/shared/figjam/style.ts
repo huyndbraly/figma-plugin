@@ -20,3 +20,16 @@ export const FIGJAM_FILL: Record<FigjamColor, string> = {
   white: "#FFFFFF",
 };
 
+
+/**
+ * The marker a FigJam-native diagram's SECTION carries:
+ * `{ kind, title, source, native: "figjam" }` — the same model a Figma Design
+ * frame stores, so get_diagram_spec, get_page_model, crossCheck and
+ * update/patch work on it. Its own key (not in DIAGRAM_MARKERS): the live
+ * arrow re-router must never treat a section of FigJam connectors as a frame
+ * of vectors to re-route.
+ */
+export const FIGJAM_MARKER = "figma-plugin.figjam";
+
+/** What the first FigJam build wrote on its sections ({ kind, title }, no model). */
+export const LEGACY_FIGJAM_MARKER = "figjam-diagram";

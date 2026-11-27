@@ -297,3 +297,272 @@ describe("Code Connect files from figma_write", () => {
     expect(await readdir(join(dir, "src"))).toEqual(["Button.figma.tsx"]);
   });
 });
+
+describe("review fixes: design index", () => {
+  it("a search result (merge) never shrinks the indexed list", async () => {
+    const idx = new DesignIndex(dir);
+    const file = { fileKey: "A", fileName: "Lib", source: "plugin" as const };
+    await idx.record(file, Array.from({ length: 30 }, (_, i) => ({ kind: "component" as const, name: `C${i}`, id: `${i}:1` })));
+    await idx.record(file, [{ kind: "component", name: "C1", id: "1:1", description: "updated" }], "merge");
+    const [f] = await idx.files();
+    expect(f!.items).toHaveLength(30);
+    expect(f!.items.find((i) => i.name === "C1")!.description).toBe("updated");
+  });
+
+  it("figma_read find_component merges; get_components replaces", async () => {
+    const idx = new DesignIndex(dir);
+    const ctx: ToolContext = {
+      runValidated: async (op) =>
+        op === "list_channels" ? [{ channel: "c", plugin: { fileName: "Lib", fileKey: "A" } }]
+        : op === "get_components" ? { components: [{ id: "1:1", name: "Button" }, { id: "2:1", name: "Card" }] }
+        : { matches: [{ id: "1:1", name: "Button" }] },
+      runWrite: async () => ({}),
+      sessions: new SessionRegistry(),
+      diagnostics: async () => ({}) as never,
+      designIndex: idx,
+    };
+    await handleRead(ctx, "get_components", {});
+    await vi.waitFor(async () => expect((await idx.files())[0]?.items).toHaveLength(2));
+    await handleRead(ctx, "find_component", { query: "but" });
+    // Wait for the merge to land (its updatedAt moves), THEN assert it kept Card.
+    const before = (await idx.files())[0]!.updatedAt;
+    await vi.waitFor(async () => expect((await idx.files())[0]!.updatedAt).not.toBe(before));
+    expect((await idx.files())[0]!.items.map((i) => i.name).sort()).toEqual(["Button", "Card"]);
+  });
+
+  it("two files that share a NAME are never merged (nothing proves they are one file)", async () => {
+    const idx = new DesignIndex(dir);
+    await idx.record({ fileKey: null, fileName: "Untitled", source: "plugin" }, [{ kind: "style", name: "Blue" }]);
+    await idx.record({ fileKey: "A", fileName: "Untitled", source: "rest" }, [{ kind: "component", name: "Button" }]);
+    const files = await idx.files();
+    expect(files).toHaveLength(2);
+    expect(files.find((f) => f.fileKey === "A")!.items.map((i) => i.name)).toEqual(["Button"]);
+  });
+
+  it("a renamed component (same id) replaces its old name, even in merge mode", async () => {
+    const idx = new DesignIndex(dir);
+    const file = { fileKey: "A", fileName: "Lib", source: "plugin" as const };
+    await idx.record(file, [{ kind: "component", name: "Btn", id: "1:1" }, { kind: "component", name: "Card", id: "2:1" }]);
+    await idx.record(file, [{ kind: "component", name: "Button", id: "1:1" }], "merge");
+    expect((await idx.files())[0]!.items.map((i) => i.name).sort()).toEqual(["Button", "Card"]);
+  });
+
+  it("concurrent writers from two processes do not lose each other's items (lock file)", async () => {
+    const a = new DesignIndex(dir);
+    const b = new DesignIndex(dir); // a second process: its own in-memory queue
+    const file = { fileKey: "A", fileName: "Lib", source: "plugin" as const };
+    await Promise.all([
+      a.record(file, [{ kind: "component", name: "One", id: "1:1" }], "merge"),
+      b.record(file, [{ kind: "component", name: "Two", id: "2:1" }], "merge"),
+    ]);
+    expect((await a.files())[0]!.items.map((i) => i.name).sort()).toEqual(["One", "Two"]);
+  });
+
+  it("non-Latin names are words: a CJK / Cyrillic / đ query finds only what matches", async () => {
+    expect(scoreName("ボタン/プライマリ", "ボタン")).toBeGreaterThan(0);
+    expect(scoreName("Кнопка", "кнопка")).toBe(100);
+    expect(scoreName("Đơn hàng", "don hang")).toBe(100);
+    expect(scoreName("Button", "ボタン")).toBe(0);
+    expect(scoreName("Button", "!!!")).toBe(0);
+  });
+
+  it("a closed file read with generate_design_md through REST is indexed too", async () => {
+    const idx = new DesignIndex(dir);
+    const ctx: ToolContext = {
+      runValidated: async (op) => (op === "list_channels" ? [] : {}),
+      runWrite: async () => ({}),
+      sessions: new SessionRegistry(),
+      diagnostics: async () => ({}) as never,
+      designIndex: idx,
+      rest: {
+        token: "figd_test_token_000",
+        fetch: async (url) => {
+          const p = new URL(url).pathname;
+          const body = p === "/v1/files/Z" ? { name: "Remote", document: { children: [] }, components: { "4:4": { name: "Chip", key: "k" } } } : { meta: {} };
+          return new Response(JSON.stringify(body), { status: 200 });
+        },
+      },
+    };
+    const out = (await handleRead(ctx, "generate_design_md", { fileKey: "Z" })) as Record<string, unknown>;
+    expect(out).not.toHaveProperty("kit"); // not asked for
+    expect((await idx.search("chip")).hits[0]).toMatchObject({ fileKey: "Z", fileName: "Remote" });
+  });
+});
+
+
+describe("review fixes (second pass): index from capped and incomplete reads", () => {
+  it("get_components with maxComponents (omittedCount) merges instead of shrinking the index", async () => {
+    const idx = new DesignIndex(dir);
+    let call = 0;
+    const ctx: ToolContext = {
+      runValidated: async (op) =>
+        op === "list_channels" ? [{ channel: "c", plugin: { fileName: "Lib", fileKey: "A" } }]
+        : ++call === 1 ? { components: [{ id: "1:1", name: "A1" }, { id: "2:1", name: "A2" }, { id: "3:1", name: "A3" }], count: 3, total: 3 }
+        : { components: [{ id: "1:1", name: "A1" }], count: 1, total: 3, omittedCount: 2 },
+      runWrite: async () => ({}),
+      sessions: new SessionRegistry(),
+      diagnostics: async () => ({}) as never,
+      designIndex: idx,
+    };
+    await handleRead(ctx, "get_components", {});
+    await vi.waitFor(async () => expect((await idx.files())[0]?.items).toHaveLength(3));
+    const before = (await idx.files())[0]!.updatedAt;
+    await handleRead(ctx, "get_components", { maxComponents: 1 });
+    await vi.waitFor(async () => expect((await idx.files())[0]!.updatedAt).not.toBe(before));
+    expect((await idx.files())[0]!.items).toHaveLength(3);
+  });
+});
+
+
+describe("third pass: lock file and index_design_file", () => {
+  it("a lock that cannot be created (missing folder) does not stall the write", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const started = Date.now();
+    const out = await withFileLock(join(dir, "no-such-dir", "x.lock"), async (locked) => locked);
+    expect(out).toBe(false); // ran, unlocked
+    expect(Date.now() - started).toBeLessThan(1000); // not the 5 s contention wait
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("a read-only cache folder (EACCES) does not stall the write", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { mkdir: md, chmod } = await import("node:fs/promises");
+    const ro = join(dir, "ro");
+    await md(ro);
+    await chmod(ro, 0o500);
+    try {
+      const started = Date.now();
+      expect(await withFileLock(join(ro, "x.lock"), async (locked) => locked)).toBe(false);
+      expect(Date.now() - started).toBeLessThan(1000);
+    } finally {
+      await chmod(ro, 0o700);
+    }
+  });
+
+  it("a lock left by a DEAD process is broken at once", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf } = await import("node:fs/promises");
+    const { spawnSync } = await import("node:child_process");
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid; // ran and exited
+    const lock = join(dir, "y.lock");
+    await wf(lock, `${dead}:old`);
+    const started = Date.now();
+    expect(await withFileLock(lock, async (locked) => locked)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("an EMPTY lock file (a writer mid-write, older builds) is not taken for a dead owner", async () => {
+    const { lockOwner } = await import("../../src/server/design-index.js");
+    expect(lockOwner("")).toBeNull();
+    expect(lockOwner("123:abc")).toBe(123);
+    expect(lockOwner("123")).toBe(123);
+  });
+
+  it("a LIVE writer's lock is waited on, not broken, and is not deleted by the waiter", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf, readFile: rf } = await import("node:fs/promises");
+    const lock = join(dir, "z.lock");
+    await wf(lock, `${process.ppid}`); // alive (the parent process), fresh
+    const { rm } = await import("node:fs/promises");
+    setTimeout(() => void rm(lock, { force: true }), 120); // the holder releases
+    let inside = "";
+    expect(
+      await withFileLock(lock, async (locked) => {
+        inside = await rf(lock, "utf8");
+        return locked;
+      }),
+    ).toBe(true);
+    expect(inside).toBe(String(process.pid)); // our own lock, taken after the release
+  });
+
+  it("the lock holds just the pid, so an OLDER build (Number(content)) reads it as a live owner", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { readFile: rf } = await import("node:fs/promises");
+    const lock = join(dir, "v.lock");
+    let content = "";
+    await withFileLock(lock, async () => {
+      content = await rf(lock, "utf8");
+    });
+    expect(content).toBe(String(process.pid));
+    expect(Number.isInteger(Number(content))).toBe(true);
+  });
+
+  it("a lock that names no pid is broken once it is 3 s old (not after the full wait)", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf, utimes } = await import("node:fs/promises");
+    const lock = join(dir, "u.lock");
+    await wf(lock, "");
+    const old = new Date(Date.now() - 10_000);
+    await utimes(lock, old, old);
+    const started = Date.now();
+    expect(await withFileLock(lock, async (locked) => locked)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("a lock with OUR pid that this process does not hold (a crashed predecessor with the same pid) is broken at once", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf } = await import("node:fs/promises");
+    const lock = join(dir, "t.lock");
+    await wf(lock, String(process.pid));
+    const started = Date.now();
+    expect(await withFileLock(lock, async (locked) => locked)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("two holders in ONE process still take turns (our own pid on a lock we hold is not 'dead')", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const lock = join(dir, "s.lock");
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const a = withFileLock(lock, async (locked) => {
+      order.push(`a:${locked}`);
+      await gate;
+      order.push("a-done");
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const b = withFileLock(lock, async (locked) => {
+      order.push(`b:${locked}`);
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    release();
+    await Promise.all([a, b]);
+    expect(order).toEqual(["a:true", "a-done", "b:true"]);
+  });
+
+  it("releasing never deletes a lock that is no longer ours", async () => {
+    const { withFileLock } = await import("../../src/server/design-index.js");
+    const { writeFile: wf, readFile: rf } = await import("node:fs/promises");
+    const lock = join(dir, "w.lock");
+    const { rm } = await import("node:fs/promises");
+    await withFileLock(lock, async () => {
+      await rm(lock); // ours was broken…
+      await wf(lock, `${process.ppid}`); // …and re-taken by another process: a NEW file (maybe our old inode, as on ext4)
+    });
+    expect(await rf(lock, "utf8")).toBe(`${process.ppid}`);
+  });
+
+  it("index_design_file with a failed REST sub-read only ADDS", async () => {
+    const idx = new DesignIndex(dir);
+    await idx.record({ fileKey: "Z", fileName: "Remote", source: "plugin" }, [{ kind: "style", name: "KeepMe" }]);
+    const ctx: ToolContext = {
+      runValidated: async () => [],
+      runWrite: async () => ({}),
+      sessions: new SessionRegistry(),
+      diagnostics: async () => ({}) as never,
+      designIndex: idx,
+      rest: {
+        token: "figd_test_token_000",
+        fetch: async (url) => {
+          const p = new URL(url).pathname;
+          if (p === "/v1/files/Z") return new Response(JSON.stringify({ name: "Remote", document: { children: [] }, components: { "3:3": { name: "Chip" } } }), { status: 200 });
+          if (p.endsWith("/styles")) return new Response(JSON.stringify({ message: "Invalid scope: []. This endpoint requires the library_content:read scope." }), { status: 403 });
+          return new Response(JSON.stringify({ meta: {} }), { status: 200 });
+        },
+      },
+    };
+    const out = (await handleRead(ctx, "index_design_file", { fileKey: "Z" })) as any;
+    expect(out.incomplete).toBe(true);
+    const names = (await idx.files())[0]!.items.map((i) => i.name).sort();
+    expect(names).toEqual(["Chip", "KeepMe"]);
+  });
+});

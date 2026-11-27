@@ -648,6 +648,7 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
         )
         .min(1),
       edges: z.array(z.object({ from: z.string(), to: z.string() }).passthrough()),
+      intoSectionId: z.string().min(1).optional(),
     })
     .passthrough(),
   create_slide: z

@@ -11,7 +11,7 @@
  * Metadata only — names, ids, keys, types, descriptions. No node trees, no
  * images, no token. The folder is gitignored; `FIGMA_CACHE=off` disables it.
  */
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileNameKey } from "../shared/figma-url.js";
 
@@ -44,12 +44,17 @@ const MAX_ITEMS_PER_FILE = 5000;
 /** figma_read ops answered from the index (server-side, no plugin round-trip for search). */
 export const LOCAL_INDEX_OPS = ["search_design_index", "index_design_file"] as const;
 
+/**
+ * Lowercase words, accents dropped ("Nút bấm" → nut bam, "Đơn" → don) —
+ * any script's letters kept: a CJK or Cyrillic name is words too, not "".
+ */
 function words(s: string): string[] {
   return s
+    .replace(/[đĐ]/g, "d")
     .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .split(/[^a-z0-9]+/)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean);
 }
 
@@ -57,7 +62,8 @@ function words(s: string): string[] {
 export function scoreName(name: string, query: string): number {
   const n = words(name).join(" ");
   const q = words(query).join(" ");
-  if (!q) return 1;
+  // An empty query lists everything; a query of only punctuation matches nothing.
+  if (!q) return query.trim() ? 0 : 1;
   if (n === q) return 100;
   const last = words(name.split("/").pop() ?? name).join(" ");
   if (last === q) return 90;
@@ -121,6 +127,182 @@ export function itemsFromResult(op: string, result: unknown): IndexedItem[] {
   return out;
 }
 
+/**
+ * How old a lock may get while its writer is still running before it is
+ * taken for a hung one. Far above any index write — a live writer is never
+ * broken in practice; a DEAD writer's lock is broken at once (pid check).
+ */
+const LOCK_STALE_MS = 30_000;
+/** How long to wait for another process's lock before writing without it. */
+const LOCK_WAIT_MS = 5_000;
+const LOCK_POLL_MS = 25;
+
+/** Is the process that wrote this lock still running? */
+function alive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** A lock that names no pid (empty: an older build mid-write) is broken once this old. */
+const LOCK_NO_PID_MS = 3_000;
+/** link() errors that mean "this filesystem has no hard links" (exFAT, FAT, some network mounts). */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS", "EINVAL"]);
+
+/** The pid a lock's content names, or null when it does not name one. */
+export function lockOwner(content: string): number | null {
+  const m = /^(\d+)(?::|\s*$)/.exec(content);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Run `fn` holding an exclusive lock file — best effort: the index is a
+ * cache, so a lost race costs at most one index update, never a read.
+ *
+ * - The lock's content is just the writer's pid (what every build reads).
+ *   It is written COMPLETE to a private file, then hard-linked into place
+ *   (`link` fails with EEXIST when it is taken), so nobody reads it half
+ *   written. Where the filesystem has no hard links, an O_EXCL create is used.
+ * - Ownership is the lock file's INODE (a hard link shares ours): a lock is
+ *   released only while it is still ours, and a broken lock that turns out to
+ *   be a different file than the one judged dead is put back.
+ * - Only EEXIST means "someone else holds it" and is waited on; any other
+ *   error (a read-only cache folder) skips the lock at once.
+ * - A lock is broken when its writer is dead, when it names no pid and is
+ *   LOCK_NO_PID_MS old, or when it is LOCK_STALE_MS old.
+ * - After LOCK_WAIT_MS the write goes ahead unlocked, and `fn` is told so.
+ * - Not covered (no compare-and-rename on a filesystem): a third process
+ *   taking the lock in the instant it is put back or released, and a cache
+ *   folder shared by several MACHINES (pids are per machine).
+ */
+export async function withFileLock<T>(lockPath: string, fn: (locked: boolean) => Promise<T>): Promise<T> {
+  const pid = String(process.pid);
+  const mine = `${lockPath}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  let held = false;
+  let myIno: number | undefined;
+  try {
+    await writeFile(mine, pid, { flag: "wx" });
+    myIno = (await stat(mine)).ino;
+  } catch {
+    await unlink(mine).catch(() => undefined);
+    return fn(false); // the folder cannot be written: no lock to be had
+  }
+  let hardLinks = true;
+  /** true = taken, false = someone holds it, undefined = cannot lock here. */
+  const take = async (): Promise<boolean | undefined> => {
+    if (hardLinks) {
+      try {
+        await link(mine, lockPath);
+        return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code ?? "";
+        if (code === "EEXIST") return false;
+        if (!NO_HARD_LINKS.has(code)) return undefined;
+        hardLinks = false;
+      }
+    }
+    // No hard links here: an exclusive create. If the create worked but the
+    // write did not (ENOSPC, EIO), the file is OURS — remove it, or every
+    // other writer would wait on an empty lock nobody holds.
+    let created = false;
+    try {
+      const h = await open(lockPath, "wx");
+      created = true;
+      try {
+        await h.writeFile(pid);
+      } finally {
+        await h.close();
+      }
+      myIno = (await stat(lockPath)).ino;
+      return true;
+    } catch (e) {
+      if (created) {
+        await unlink(lockPath).catch(() => undefined);
+        return undefined;
+      }
+      return (e as NodeJS.ErrnoException).code === "EEXIST" ? false : undefined;
+    }
+  };
+  /** Inode numbers mean something here (some FAT/SMB drivers report 0 or make them up). */
+  const inodesUsable = () => hardLinks && !!myIno;
+  try {
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    while (Date.now() < deadline) {
+      const got = await take();
+      if (got) {
+        held = true;
+        break;
+      }
+      if (got === undefined) break;
+      let owner: string;
+      let seen: { ino: number; mtimeMs: number };
+      try {
+        const [st, content] = await Promise.all([stat(lockPath), readFile(lockPath, "utf8")]);
+        owner = content;
+        seen = st;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; // released between the calls
+        break; // unreadable: do not spin on it
+      }
+      const ownerPid = lockOwner(owner);
+      const age = Date.now() - seen.mtimeMs;
+      const breakable =
+        (ownerPid !== null && !alive(ownerPid)) ||
+        // Our OWN pid on a lock this process does not hold: a crashed
+        // predecessor that had the same pid (a container's pid 1).
+        (ownerPid === process.pid && !heldHere.has(lockPath)) ||
+        (ownerPid === null && age > LOCK_NO_PID_MS) ||
+        age > LOCK_STALE_MS;
+      if (breakable) {
+        const grave = `${lockPath}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}.stale`;
+        const moved = await rename(lockPath, grave).then(() => true, () => false);
+        if (moved) {
+          const [g, content] = await Promise.all([stat(grave).catch(() => null), readFile(grave, "utf8").catch(() => null)]);
+          // Someone took the lock between our look and our rename: its content
+          // (a live pid) differs — or, where inodes are stable, its inode does.
+          const taken = (content !== null && content !== owner) || (inodesUsable() && !!g && !!seen.ino && g.ino !== seen.ino);
+          let restored = false;
+          if (taken) {
+            restored = await link(grave, lockPath).then(() => true, () => false);
+            // No hard links (or link refused): move it back, if nobody else took the place.
+            if (!restored && !(await stat(lockPath).then(() => true, () => false))) {
+              restored = await rename(grave, lockPath).then(() => true, () => false);
+              if (restored) continue; // the grave IS the lock again
+            }
+          }
+          await unlink(grave).catch(() => undefined);
+          continue;
+        }
+      }
+      await sleep(LOCK_POLL_MS);
+    }
+  } finally {
+    await unlink(mine).catch(() => undefined);
+  }
+  if (held) heldHere.add(lockPath);
+  try {
+    return await fn(held);
+  } finally {
+    if (held) {
+      heldHere.delete(lockPath);
+      // Still OURS: our pid inside, and — where inodes mean something — our
+      // inode (a freed inode is handed out again at once on ext4, so the
+      // content check is what tells a newcomer apart).
+      const [st, content] = await Promise.all([stat(lockPath).catch(() => null), readFile(lockPath, "utf8").catch(() => null)]);
+      const ours = st !== null && content !== null && lockOwner(content) === process.pid && (!inodesUsable() || !st.ino || st.ino === myIno);
+      if (ours) await unlink(lockPath).catch(() => undefined);
+    }
+  }
+}
+
+/** Lock paths this process holds right now (a lock with our pid that is NOT here is a dead predecessor's). */
+const heldHere = new Set<string>();
+
 export class DesignIndex {
   readonly dir: string;
   private writing = Promise.resolve();
@@ -144,39 +326,69 @@ export class DesignIndex {
    * that kind's old items (a re-read of components replaces components and
    * leaves styles alone). Writes are serialised and atomic (tmp + rename).
    */
-  record(file: { fileKey: string | null; fileName: string; source: "plugin" | "rest" }, items: IndexedItem[]): Promise<IndexedFile | null> {
+  record(
+    file: { fileKey: string | null; fileName: string; source: "plugin" | "rest" },
+    items: IndexedItem[],
+    /**
+     * "replace": `items` is the file's WHOLE list of those kinds (an
+     * unfiltered read) and replaces it. "merge": a partial answer
+     * (find_component, a capped read) — adds and updates, never removes;
+     * replacing there shrank 300 indexed components to the 3 a search found.
+     */
+    mode: "replace" | "merge" = "replace",
+  ): Promise<IndexedFile | null> {
     if (!items.length) return Promise.resolve(null);
     const run = this.writing.then(async () => {
       await mkdir(this.filesDir(), { recursive: true });
       const id = safeFileId(file.fileKey, file.fileName);
       const path = join(this.filesDir(), `${id}.json`);
-      let prev: IndexedFile | null = null;
-      try {
-        prev = JSON.parse(await readFile(path, "utf8")) as IndexedFile;
-      } catch {
-        /* first time */
-      }
+      // Two files with one name ("Untitled") are two files: an entry stored
+      // by name is never folded into a keyed one — nothing here can prove
+      // they are the same file.
       const kinds = new Set(items.map((i) => (i.kind === "component_set" ? "component" : i.kind)));
-      const kept = (prev?.items ?? []).filter((i) => !kinds.has(i.kind === "component_set" ? "component" : i.kind));
-      const seen = new Set<string>();
-      const merged = [...kept, ...items].filter((i) => {
-        const k = `${i.kind}|${i.id ?? ""}|${i.name}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      const entry: IndexedFile = {
-        fileKey: file.fileKey ?? prev?.fileKey ?? null,
-        fileName: file.fileName || prev?.fileName || "",
-        updatedAt: new Date().toISOString(),
-        source: file.source,
-        items: merged.slice(0, MAX_ITEMS_PER_FILE),
+      // Identity: the node id when there is one (a rename keeps it, and must
+      // not leave the old name behind), else the name.
+      const identity = (i: IndexedItem) => (i.id ? `${i.kind === "component_set" ? "component" : i.kind}|#${i.id}` : `${i.kind}|${i.name}`);
+      const build = (prev: IndexedFile | null): IndexedFile => {
+        const previous = prev?.items ?? [];
+        const kept = mode === "merge" ? previous : previous.filter((i) => !kinds.has(i.kind === "component_set" ? "component" : i.kind));
+        // New items first: an update wins, and when the cap cuts, it cuts what is oldest.
+        const seen = new Set<string>();
+        const merged = [...items, ...kept].filter((i) => {
+          const k = identity(i);
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+        return {
+          fileKey: file.fileKey ?? prev?.fileKey ?? null,
+          fileName: file.fileName || prev?.fileName || "",
+          updatedAt: new Date().toISOString(),
+          source: file.source,
+          items: merged.slice(0, MAX_ITEMS_PER_FILE),
+        };
       };
-      const tmp = `${path}.${process.pid}.tmp`;
-      await writeFile(tmp, JSON.stringify(entry), "utf8");
-      await rename(tmp, path);
-      await this.ensureGitignore();
-      return entry;
+      // Leader and follower share this folder: the read-modify-write runs
+      // under a lock file, so neither overwrites what the other just wrote.
+      return withFileLock(`${path}.lock`, async () => {
+        let prev: IndexedFile | null = null;
+        try {
+          prev = JSON.parse(await readFile(path, "utf8")) as IndexedFile;
+        } catch {
+          prev = null;
+        }
+        const entry = build(prev);
+        const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+        try {
+          await writeFile(tmp, JSON.stringify(entry), "utf8");
+          await rename(tmp, path);
+        } catch (e) {
+          await unlink(tmp).catch(() => undefined);
+          throw e;
+        }
+        await this.ensureGitignore();
+        return entry;
+      });
     });
     this.writing = run.then(() => undefined, () => undefined);
     return run;

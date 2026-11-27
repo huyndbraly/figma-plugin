@@ -127,10 +127,10 @@ describe("token lifecycle", () => {
     expect(h.token()).toBeUndefined();
   });
 
-  it("refuses a malformed token without sending it anywhere", () => {
+  it("refuses a malformed token without sending it anywhere, and without touching the state", () => {
     const net = fakeNet(() => json({}));
     const h = hub(net);
-    expect(h.setPluginToken("not a token").state).toBe("invalid");
+    expect(h.setPluginToken("not a token").state).toBe("not_set");
     expect(net.calls).toHaveLength(0);
     expect(h.token()).toBeUndefined();
   });
@@ -234,7 +234,7 @@ describe("hub.fetch — the one door every REST request goes through", () => {
     await settle(h);
     await h.fetch("https://api.figma.com/v1/files/KEY", {});
     expect(h.getStatus()).toMatchObject({ state: "rate_limited", httpStatus: 429 });
-    expect(h.getStatus().message).toMatch(/retry in 3 s/);
+    expect(h.getStatus().message).toMatch(/works again in 3 s/);
     status = 200;
     await h.fetch("https://api.figma.com/v1/files/KEY", {});
     expect(h.getStatus().state).toBe("valid");
@@ -348,18 +348,12 @@ describe("bridge ↔ plugin token messages", () => {
     port = await bridge.listen(0, "t");
   });
 
-  it("takes a saved token from the hello, and tells the window the status right after assigning it", async () => {
+  it("ignores a token in the hello (it is sent only after assigned), and tells the window the status right after assigning it", async () => {
     const p = await plugin(port, { restToken: TOKEN });
-    expect(tokens).toEqual([TOKEN]);
+    expect(tokens).toEqual([]);
     const types = p.got.map((m) => m.type);
     expect(types.indexOf("rest_status")).toBeGreaterThan(types.indexOf("assigned"));
     expect(JSON.stringify(p.got)).not.toContain(TOKEN);
-    p.ws.close();
-  });
-
-  it("a hello WITHOUT a token never clears one (a window that missed the save must not wipe it)", async () => {
-    const p = await plugin(port, { restToken: null });
-    expect(tokens).toEqual([]);
     p.ws.close();
   });
 
@@ -567,7 +561,7 @@ describe("429 with a long Retry-After (live: 399946 s on a Starter plan)", () =>
     await settle(h);
     await h.fetch("https://api.figma.com/v1/files/K", {});
     expect(h.getStatus()).toMatchObject({ state: "rate_limited", retryAt: now + 399946_000, planTier: "starter", rateLimitType: "low" });
-    expect(h.getStatus().message).toMatch(/retry in 4\.6 days/);
+    expect(h.getStatus().message).toMatch(/works again in 4\.6 days/);
   });
 
   it("a follower gets the tier headers from the leader too", async () => {
@@ -580,5 +574,177 @@ describe("429 with a long Retry-After (live: 399946 s on a Starter plan)", () =>
     expect(res.status).toBe(429);
     expect(res.headers.get("x-figma-plan-tier")).toBe("starter");
     expect(res.headers.get("retry-after")).toBe("399946");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Code-review fixes (2026-11-27). Each case was a reproduced gap.
+// ---------------------------------------------------------------------------
+describe("review fixes: token lifecycle", () => {
+  const okNet = () => fakeNet((c) => (c.url.endsWith("/me") ? json({ handle: "h" }) : c.url.includes("/teams/") ? json({}, 404) : json({ ok: 1 })));
+
+  it("an OLDER save (a stale window) never replaces a newer one, nor undoes a Clear", async () => {
+    const h = hub(okNet());
+    h.setPluginToken(TOKEN, { savedAt: 2000 });
+    await settle(h);
+    h.setPluginToken(`${TOKEN}OLD`, { savedAt: 1000 });
+    expect(h.token()).toBe(TOKEN);
+    h.setPluginToken(null, { savedAt: 3000 }); // Clear
+    expect(h.token()).toBeUndefined();
+    h.setPluginToken(TOKEN, { savedAt: 2000 }); // the stale window re-syncs
+    expect(h.token()).toBeUndefined();
+    h.setPluginToken(`${TOKEN}NEW`, { savedAt: 4000 });
+    expect(h.token()).toBe(`${TOKEN}NEW`);
+  });
+
+  it("junk input keeps the token in use AND its state", async () => {
+    const h = hub(okNet());
+    h.setPluginToken(TOKEN);
+    await settle(h);
+    h.setPluginToken("has a space inside");
+    expect(h.token()).toBe(TOKEN);
+    expect(h.getStatus()).toMatchObject({ state: "valid", masked: "figd_…1234" });
+  });
+
+  it("invalid recovers: on a later 2xx, and when the same token is saved again", async () => {
+    let refuse = true;
+    const h = hub(fakeNet((c) => (c.url.endsWith("/me") ? (refuse ? json({ err: "Invalid token" }, 401) : json({ handle: "h" })) : c.url.includes("/teams/") ? json({}, 404) : json({}))));
+    h.setPluginToken(TOKEN);
+    expect((await settle(h)).state).toBe("invalid");
+    await h.fetch("https://api.figma.com/v1/files/K", {});
+    expect(h.getStatus().state).toBe("valid");
+    refuse = true;
+    await h.check();
+    expect(h.getStatus().state).toBe("invalid");
+    refuse = false;
+    h.setPluginToken(TOKEN); // the user saves it again: "try it"
+    expect((await settle(h)).state).toBe("valid");
+  });
+
+  it("an explicit null expiry clears the date for the same token", async () => {
+    const h = hub(okNet());
+    h.setPluginToken(TOKEN, { expiresAt: Date.now() + 1000 });
+    await settle(h);
+    h.setPluginToken(TOKEN, { expiresAt: null });
+    expect(h.getStatus().expiresAt).toBeUndefined();
+  });
+
+  it("zero-width / non-ASCII characters inside a token are refused; at the ends they are trimmed", () => {
+    expect(cleanToken(`\u200b${TOKEN}\ufeff`)).toBe(TOKEN);
+    expect(cleanToken(`figd_abc\u200bdefghijklmnop`)).toBeNull();
+    expect(cleanToken(`figd_abcdefghij\u201cklmnop`)).toBeNull();
+  });
+
+  it("the scope probe runs once per token, and is reported (403 expected, not an error)", async () => {
+    const net = fakeNet((c) => (c.url.endsWith("/me") ? json({ handle: "h" }) : new Response(LIVE.scope, { status: 403 })));
+    const h = hub(net);
+    const events: RestEvent[] = [];
+    h.onEvent((e) => events.push(e));
+    h.setPluginToken(TOKEN);
+    await settle(h);
+    await h.check();
+    expect(net.calls.filter((c) => c.url.includes("/teams/"))).toHaveLength(1);
+    expect(events.find((e) => e.op === "scope_probe")).toMatchObject({ ok: true, status: 403 });
+  });
+
+  it("plain 403s re-check /me at most once per gap (quota)", async () => {
+    const net = fakeNet((c) => (c.url.endsWith("/me") ? json({ handle: "h" }) : c.url.includes("/teams/") ? json({}, 404) : json({ err: "Forbidden" }, 403)));
+    const h = hub(net);
+    h.setPluginToken(TOKEN);
+    await settle(h);
+    for (let i = 0; i < 5; i++) await h.fetch(`https://api.figma.com/v1/files/K${i}`, {});
+    await new Promise((r) => setTimeout(r, 400));
+    expect(net.calls.filter((c) => c.url.endsWith("/me"))).toHaveLength(2); // the save + ONE re-check
+  });
+
+  it("a rate limit ages out once Retry-After has passed, and a check does not spend quota before then", async () => {
+    let now = 1_000_000;
+    const net = fakeNet((c) => (c.url.endsWith("/me") ? json({ handle: "h" }) : c.url.includes("/teams/") ? json({}, 404) : new Response("{}", { status: 429, headers: { "retry-after": "60" } })));
+    const h = new RestHub({ env: () => undefined, fetch: net.fetch, now: () => now });
+    h.setPluginToken(TOKEN);
+    await settle(h);
+    await h.fetch("https://api.figma.com/v1/files/K", {});
+    expect(h.getStatus().state).toBe("rate_limited");
+    const meCalls = net.calls.filter((c) => c.url.endsWith("/me")).length;
+    await h.check();
+    expect(net.calls.filter((c) => c.url.endsWith("/me")).length).toBe(meCalls);
+    now += 61_000;
+    expect(h.getStatus()).toMatchObject({ state: "unverified" });
+    expect(h.getStatus().retryAt).toBeUndefined();
+  });
+
+  it("requests carry redirect:error and a timeout signal", async () => {
+    let init: RequestInit | undefined;
+    const h = new RestHub({ env: () => TOKEN, fetch: async (_u, i) => ((init = i), json({})) });
+    await h.fetch("https://api.figma.com/v1/files/K", {});
+    expect(init!.redirect).toBe("error");
+    expect(init!.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("the leader forwards only GET and POST …/comments", async () => {
+    const leader = new RestHub({ env: () => TOKEN, fetch: async () => json({}) });
+    await expect(leader.serveForwarded({ url: "https://api.figma.com/v1/files/K/comments/1", method: "DELETE" })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+    await expect(leader.serveForwarded({ url: "https://api.figma.com/v1/webhooks", method: "POST", body: "{}" })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+    expect((await leader.serveForwarded({ url: "https://api.figma.com/v1/files/K/comments", method: "POST", body: "{}" })).status).toBe(200);
+  });
+});
+
+describe("review fixes: followers", () => {
+  it("a forward the leader cannot run falls back to the follower's own FIGMA_TOKEN", async () => {
+    const followerNet = fakeNet(() => json({ mine: true }));
+    const follower = new RestHub({ env: () => ENV_TOKEN, fetch: followerNet.fetch });
+    follower.setRemote(() => async () => {
+      throw Object.assign(new Error('Unknown operation "__rest_fetch__".'), { code: "UNSUPPORTED_OPERATION" });
+    });
+    expect(await (await follower.fetch("https://api.figma.com/v1/files/K", {})).json()).toEqual({ mine: true });
+  });
+
+  it("without its own token, the version skew is named", async () => {
+    const follower = new RestHub({ env: () => undefined, fetch: async () => json({}) });
+    follower.setRemote(() => async () => {
+      throw Object.assign(new Error('Unknown operation "__rest_fetch__".'), { code: "UNSUPPORTED_OPERATION" });
+    });
+    await expect(follower.fetch("https://api.figma.com/v1/files/K", {})).rejects.toMatchObject({ code: "UNSUPPORTED_OPERATION", message: expect.stringMatching(/older build/) });
+  });
+
+  it("a leader that does not answer the status RPC is not cached as 'no token'", async () => {
+    let fail = true;
+    const follower = new RestHub({ env: () => undefined, fetch: async () => json({}) });
+    follower.setRemote(
+      () => async () => ({ noToken: true }),
+      async () => {
+        if (fail) throw new Error("timeout");
+        return { state: "valid", source: "plugin", masked: "figd_…1234", checkedAt: 5 };
+      },
+    );
+    expect(await follower.available()).toBe(true); // unknown → try the request
+    fail = false;
+    expect(await follower.effectiveStatus()).toMatchObject({ state: "valid" });
+    expect(await follower.cacheKey()).toMatch(/^leader\|figd_…1234\|\d+$/); // an old leader without tokenGen: the mask is all there is
+  });
+});
+
+describe("review fixes: hints", () => {
+  it("a broad legacy scope (files:read) is not reported as lacking the granular read scopes", async () => {
+    const { restTokenHints } = await import("../../src/server/tools.js");
+    const out = restTokenHints({ state: "valid", source: "plugin", scopes: ["files:read", "file_comments:write"] }, 0).join("\n");
+    expect(out).not.toMatch(/file_content:read|file_versions:read|file_comments:read \(/);
+  });
+});
+
+describe("the token never reaches an agent through the REAL bridge state (review)", () => {
+  it("channelSummaries / list_channels carry no token, whatever a plugin put in its hello", async () => {
+    const tokens: Array<string | null> = [];
+    const b = new Bridge({ onRestToken: (t) => tokens.push(t) });
+    bridges.push(b);
+    const port = await b.listen(0, "t");
+    const p = await plugin(port, { restToken: TOKEN, restTokenExpiresAt: 5 });
+    p.ws.send(JSON.stringify({ type: "set_rest_token", token: TOKEN, savedAt: 1 }));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(tokens).toEqual([TOKEN]); // it did arrive…
+    expect(JSON.stringify(b.channelSummaries())).not.toContain(TOKEN); // …and is nowhere an agent can read
+    expect(JSON.stringify(b.channelSummaries())).not.toContain("figd_");
+    p.ws.close();
   });
 });
