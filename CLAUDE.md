@@ -19,6 +19,14 @@ npm run verify      # typecheck + test — run before every commit
 `plugin/code.js` is committed (Figma loads it from the repo); rebuild before
 committing a plugin change. `dist/` is not committed.
 
+## Test report — read this before testing
+
+[`docs/TEST-REPORT.md`](docs/TEST-REPORT.md) records what is tested, what was fixed (and which
+test guards each fix), what was tried on live Figma, known gaps, and **which test files to run for
+the code you touched** — run that subset while working instead of the whole suite, then
+`npm run verify` once before committing. Update the report in the same commit when you add tests,
+fix a bug, or try something on live Figma. Port rule for tests: `listen(0)`, never a random port.
+
 ## Adding a plugin operation
 
 One op touches these, in this order — the tests fail if one is missed:
