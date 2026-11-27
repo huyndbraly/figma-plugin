@@ -11,6 +11,7 @@
  * server has FIGMA_TOKEN, the same export runs through the REST API instead
  * (/v1/images, many ids per request, 429 Retry-After honoured).
  */
+import { restError, retryDelayMs } from "./rest-hub.js";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { ErrorCode, OpError } from "./errors.js";
@@ -113,11 +114,11 @@ export function normalizeScales(s: unknown): number[] {
 }
 
 /** The folder, checked: absolute, resolved, and not the filesystem root. */
-export function resolveDir(dir: unknown): string {
+export function resolveDir(dir: unknown, who = "exportAssets"): string {
   if (typeof dir !== "string" || !dir.trim()) {
     throw new OpError(
       ErrorCode.INVALID_PARAMS,
-      "exportAssets needs a `dir`.",
+      `${who} needs a \`dir\`.`,
       "Pass an ABSOLUTE folder in your codebase, e.g. { dir: \"/Users/me/app/src/assets/icons\" }.",
     );
   }
@@ -260,22 +261,18 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** GET with the token, honouring 429 Retry-After a few times. */
+/** GET with the token; a 429 is retried only for a short Retry-After (retryDelayMs). */
 async function restGet(url: string, token: string, fetchImpl: RestFetch, signal?: AbortSignal): Promise<unknown> {
   for (let attempt = 0; ; attempt++) {
     const res = await fetchImpl(url, { headers: { "X-Figma-Token": token }, ...(signal ? { signal } : {}) });
-    if (res.status === 429 && attempt < 4) {
-      const retry = Number(res.headers.get("retry-after"));
-      await wait(Math.min(60, Number.isFinite(retry) && retry > 0 ? retry : 2 ** attempt * 2) * 1000, signal);
-      continue;
+    if (res.status === 429) {
+      const ms = retryDelayMs(res.headers, attempt);
+      if (ms !== null) {
+        await wait(ms, signal);
+        continue;
+      }
     }
-    if (res.status === 403) {
-      throw new OpError(ErrorCode.UNAUTHORIZED, "Figma refused the token (403).", "Check FIGMA_TOKEN is a valid personal access token with file read access to this file.");
-    }
-    if (res.status === 404) {
-      throw new OpError(ErrorCode.NODE_NOT_FOUND, "Figma has no such file (404).", "Check `fileKey` — it is the part after /file/ or /design/ in the file URL.");
-    }
-    if (!res.ok) throw new OpError(ErrorCode.INTERNAL, `Figma REST ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    if (!res.ok) throw restError(res.status, await res.text().catch(() => ""), "export from this file", res.headers);
     return res.json();
   }
 }

@@ -20,6 +20,9 @@ It exists because most Figma MCPs make agents responsible for discipline they do
 | **Code ↔ Figma** | A component map between code components and Figma components (props ↔ variants and properties): export a starting map, check it against the file, and `render("Button", { tone, size, children })` the exact Figma variant |
 | **Assets** | Icons, images, overlays, gradients, recolor, prototype reactions; delete pages and styles, sweep unused styles |
 | **BA / UX diagrams** | Userflow, activity with swimlanes, sequence, ERD, sitemap, state machine, use case, journey map, persona set; arrows follow the boxes; edit a diagram in place; cross-check diagrams against each other |
+| **REST hybrid (PAT)** | Paste a Figma personal access token right in the plugin panel (`REST Token` field, Save/Clear, live badge `Valid (@handle)` / `Expired / Invalid` / `Rate-limited`); stored on your machine only (`figma.clientStorage`), held in RAM by the server, never written to a file, logged or returned to an agent. Read comments, reply / post comments, version history, read files that are **not open** from a link or `fileKey` (`generate_design_md` included); every REST request shows in ACTIVITY tagged `[REST]` |
+| **FigJam · Slides · Motion** | In FigJam, `figma_diagram` draws with native nodes (shapes-with-text, stickies, connectors that follow their shapes); read and add slides in Figma Slides; read prototype `motion` (trigger, SMART_ANIMATE, duration, bezier/spring easing, a CSS timing string) to generate animation code |
+| **Extensions** | Export / read Code Connect `.figma.tsx` files from the component map; a local multi-file design-system index (`.figma-cache/`, `search_design_index`); `htmlToFigma(url)` rebuilds a running web page as an auto-layout tree (optional Playwright); generate images / SVGs with your own API key (BYOK) and place them on the canvas |
 | **Claude skills** | `/figma-userflow`, `/figma-activity`, `/figma-sequence`, `/figma-erd`, `/figma-sitemap`, `/figma-state`, `/figma-usecase`, `/figma-journey`, `/figma-persona` |
 
 ## Why this one
@@ -75,7 +78,7 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design rationale and the
 | Create Component Sets, Variants & Properties | ❌ | ✅ (Medium) | ✅ (High — grid layout + auto-bound properties) |
 | Instantiate by name (auto-resolve variant & `#id` keys) | ❌ | ❌ (Requires raw IDs/keys) | ✅ (High — `instantiate("Button", { variant, properties })`) |
 | Search org/team Design System libraries in the Cloud | ✅ (Medium) — Team/file endpoints | ✅ (High) — `search_design_system`, `get_libraries` | ❌ (Only inspects the currently open file) |
-| Code ↔ Figma component mapping | ❌ | ✅ (High) — Cloud-synced Dev Mode Code Connect | ✅ (Medium) — Local `export_component_map` + `render()` |
+| Code ↔ Figma component mapping | ❌ | ✅ (High) — Cloud-synced Dev Mode Code Connect | ✅ (Medium) — Local `export_component_map` + `render()`, export/read Code Connect `.figma.tsx` files (no cloud publish) |
 | Design system compliance audit & auto-bind | ❌ | ❌ | ✅ (High — `audit_design_system` + one-call auto-bind) |
 | **Verification & Output Product Quality** | | | |
 | Screenshot / image export | ✅ (High — server-rendered PNG/SVG) | ✅ (High) | ✅ (High) |
@@ -93,13 +96,13 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design rationale and the
 | Smart connectors (arrows stay attached) | ❌ | ✅ (Medium — FigJam connectors) | ✅ (High — re-routes automatically on move) |
 | **AI Creative, Media & Multi-Surface Figma (Official / Paid)** | | | |
 | AI Image & Vector Illustration generation (`generate_image`, `generate_vector_illustration`) | ❌ | ✅ (High) | ❌ |
-| Motion / Animation context & keyframes (`get_motion_context`) | ❌ | ✅ (High) | ❌ |
+| Motion / Animation context & keyframes (`get_motion_context`) | ❌ | ✅ (High) | ✅ (Medium) — prototype transitions as `motion` (SMART_ANIMATE, duration, bezier/spring, CSS); no keyframes |
 | Custom Shaders, Generative Plugins & Weave AI workflows | ❌ | ✅ (High) | ❌ |
 | Live Web / HTML → Editable Figma Design (`generate_figma_design`) | ❌ | ✅ (High) | ❌ (Must build frames via JS or `render()`) |
 | Video export (`export_video`) | ❌ | ✅ (High) | ❌ |
-| FigJam, Figma Slides, new file creation & Branching (`create_branch`) | ❌ (Read-only) | ✅ (High) — Native FigJam, Slides, Branching | ❌ (Focused on Figma Design canvas only) |
+| FigJam, Figma Slides, new file creation & Branching (`create_branch`) | ❌ (Read-only) | ✅ (High) — Native FigJam, Slides, Branching | ✅ (Medium) — Native FigJam diagrams (shapes + connectors), basic Slides read/create; no new files or branching |
 | **Collaboration & Cloud Metadata** | | | |
-| Comments, version history & webhooks | ✅ (High) | ✅ (High) — Read/manage comments & cloud metadata | ❌ (Focused on live canvas & design systems) |
+| Comments, version history & webhooks | ✅ (High) | ✅ (High) — Read/manage comments & cloud metadata | ✅ (Medium) — Read/post comments & version history through the plugin-panel PAT; no webhooks |
 
 ### Key Takeaways by Use Case
 
@@ -140,14 +143,16 @@ claude mcp add figma-plugin -s user -- /absolute/path/to/figma-plugin/scripts/fi
 
 **Check the connection:** ask your agent to call `figma_status`. Full walkthrough and troubleshooting: [`docs/SETUP.md`](./docs/SETUP.md) and [`docs/INSTALL.md`](./docs/INSTALL.md). Several editors at once: [`docs/MULTI-AGENT.md`](./docs/MULTI-AGENT.md).
 
+**(Optional) REST token:** in the plugin panel, paste a Figma personal access token (`figd_…`) into **REST Token (PAT)** → **Save**. The badge turns `Valid (@handle)` once the server has checked it with `GET /v1/me`. It powers comments, version history and reads of files that are not open, and replaces the `FIGMA_TOKEN` environment variable (still used as a fallback).
+
 > **Every session:** open your Figma file → **Plugins → Development → Figma Plugin MCP** → leave the window open. Figma doesn't auto-start plugins.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `figma_status` | Rich connection diagnostics — plugin connection, leader/follower mode, heartbeat, queue, sessions, and an ordered `hints` list. Never a bare boolean. |
-| `figma_read` | Read the canvas via an `op` enum (`get_document_info`, `get_selection`, `read_selection`, `get_design_context`, `get_design_system_kit`, `generate_design_md`, `search_nodes`, `find_component`, `get_instance_overrides`, `a11y_audit`, `audit_design_system`, `export_component_map`, `screenshot`, `layout_audit`, `get_diagram_spec`, `get_page_model`, ...) with token-frugal responses. |
+| `figma_status` | Rich connection diagnostics — plugin connection, leader/follower mode, heartbeat, queue, sessions, the REST token's state (`restToken`: state/handle/masked `figd_…a1b2`, never the token), and an ordered `hints` list. Never a bare boolean. |
+| `figma_read` | Read the canvas via an `op` enum (`get_document_info`, `get_selection`, `read_selection`, `get_design_context`, `get_design_system_kit`, `generate_design_md`, `search_nodes`, `find_component`, `get_instance_overrides`, `a11y_audit`, `audit_design_system`, `export_component_map`, `screenshot`, `layout_audit`, `get_diagram_spec`, `get_page_model`, `get_slides`, REST: `get_comments`, `get_versions`, local index: `search_design_index`, `index_design_file`, ...) with token-frugal responses. Pass `{ url }` or `{ fileKey }` to read a file that is not open through REST. |
 | `figma_write` | Execute modern-ES JavaScript against the `figma.*` proxy to create/modify the canvas — including components, variants, properties and instances. `state` persists per session. |
 | `figma_rules` | One-call design-system rule sheet (styles + variables + components) as markdown — read before drawing so you reuse instead of hardcode. For a durable spec, use `figma_read` op `generate_design_md` and save the returned markdown as `design-kit.md`. |
 | `figma_diagram` | Draw **nine** diagram kinds from a model **you** derived from the spec, each with findings on the *content*, not the drawing. `type:"activity"` — a business process, with swimlanes or without: one band per owner, the handoffs between bands; reports an unlabelled handoff, a step nobody owns, a fork that never joins. `type:"sequence"` — an exchange over time: participants as columns, messages in the order you list them, activation bars derived from the calls and their replies, alt/loop blocks; reports a call nobody answers, a reply with no call, an alt with no else. `type:"state"` — the lifecycle of ONE entity: the values it can hold and every change that is allowed, written `event [guard] / action`; reports a state nothing can reach, a state nothing can leave, two transitions racing on one event. `type:"erd"` — a data model: tables, columns, keys, crow's-foot cardinality; reports what bites after a migration (no primary key, a foreign key to a column that does not exist, a many-to-many with no join table). `type:"userflow"` — the screens a user moves through, from a graph or a mermaid `flowchart`; reports a question with one way out, a dead end, an unreachable screen. `type:"sitemap"` — the pages a product is made of and what contains what, drawn as a tidy tree; reports an orphan page, a section with nothing under it, a depth nobody will navigate, and cross-checks against the userflows on the page. `type:"usecase"` — actors, use cases inside a system boundary, «include»/«extend»/generalization; reports an actor that uses nothing and a use case nobody can start. `type:"journey"` — one persona through one scenario with an emotion curve; reports a low point with no pain and a pain with no opportunity. `type:"persona"` — one card per person the product is for; reports a missing research source, no primary, a persona with no goal or pain. Write any of them in the compact `text` form at ~a third of the tokens, draw a whole set in one call (`diagrams: [...]`, placed for you), and **change** one with `update` + `patch` instead of re-authoring it. Every draw is cross-checked against the other diagrams on the page. On the six graph kinds arrows stay attached: drag a box and every line touching it re-routes. |

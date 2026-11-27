@@ -292,6 +292,43 @@ These change existing nodes rather than drawing new ones. See the
   naming what is on it: show that to the user, and pass \`force: true\` only
   after they agree. (\`delete(pageId)\` does not remove pages.)
 
+## Figma REST (token from the plugin panel or FIGMA_TOKEN)
+The token never reaches you: \`figma_status.restToken\` says only its state
+(\`not_set\` / \`checking\` / \`valid\` + handle / \`invalid\` / \`rate_limited\`).
+If it is not valid, ask the USER to paste a PAT into the plugin panel
+(REST Token → Save). File = \`{ url }\` | \`{ fileKey }\` | the open window's file.
+- \`getComments({ url?, nodeId?, unresolved?, limit? })\` → threads with replies.
+- \`postComment({ url?, message, nodeId?, x?, y?, replyTo? })\` — needs the
+  file_comments:write scope. Posting is visible to everyone on the file: only
+  when the user asked for it.
+- \`getVersions({ url?, limit?, namedOnly? })\`.
+- Reads of a CLOSED file: figma_read get_node / get_design_context /
+  generate_design_md / screenshot with \`{ url }\` or \`{ fileKey, nodeId }\`;
+  \`source: "rest"\` forces REST (last saved version) even when it is open.
+
+## FigJam, Slides, motion
+- In a FigJam window, figma_diagram userflow/activity/state/sitemap draws with
+  FigJam shapes + connectors (in a section); the checker still runs.
+- Slides: figma_read get_slides; \`createSlide({ name?, row?, col?, fill? })\`,
+  then \`create({ parentId: slideId, ... })\`.
+- Reads at detail full/design add \`motion\` on nodes with prototype
+  reactions: trigger, transition type (SMART_ANIMATE…), duration (s),
+  easing (bezier or spring) and a CSS timing string.
+
+## Code Connect, design index, html → Figma, generation
+- \`exportCodeConnect({ dir, importFrom?, importPaths?, map?, url?, overwrite? })\`
+  writes \`<Component>.figma.tsx\` from the component map (absolute dir;
+  existing files are kept unless overwrite). \`readCodeConnect({ dir, use? })\`
+  rebuilds the map from them (\`use: true\` = useComponentMap).
+- figma_read search_design_index \`{ query, kinds?, file? }\` searches every
+  file whose components/styles/variables were read on this machine
+  (.figma-cache/); index_design_file \`{ url }\` indexes a closed file.
+- \`htmlToFigma(url, { width?, selector?, parentId?, maxNodes? })\` — needs
+  Playwright installed next to the server; flex → auto-layout.
+- \`generateImage(prompt, { size?, parentId, x, y, w, h })\` (OPENAI_API_KEY),
+  \`generateSvg(prompt, { width?, height?, style?, parentId })\`
+  (ANTHROPIC_API_KEY). Keys are the server's env; never ask for one in chat.
+
 ## Deleting components and styles
 - \`delete(componentId, {force?})\` removes a COMPONENT / COMPONENT_SET. With
   instances it needs \`force: true\`; the instances stay and can "Restore

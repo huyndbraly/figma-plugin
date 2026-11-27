@@ -49,6 +49,9 @@ import {
   type Operation,
   type PluginHello,
   type SessionSummaryWire,
+  type RestStatusWire,
+  type RestStatusUpdate,
+  type RestEventWire,
   type WireMessage,
 } from "../shared/protocol.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
@@ -252,6 +255,12 @@ export interface BridgeHandlers {
     route?: RouteArg,
     signal?: AbortSignal,
   ) => Promise<unknown>;
+  /**
+   * A plugin window saved (string) or cleared (null) the Figma REST token —
+   * in its hello, or with set_rest_token. The bridge never stores or echoes
+   * it; whoever handles this owns it (see rest-hub.ts).
+   */
+  onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null }) => void;
 }
 
 export interface BridgeOptions {
@@ -507,6 +516,7 @@ export class Bridge {
   >();
   /** Supplied by index.ts so channel pushes can list agent sessions. */
   private sessionsProvider?: () => SessionSummaryWire[];
+  private restStatusProvider?: () => RestStatusWire;
 
   private boundPort = 0;
   private authToken = "";
@@ -522,6 +532,19 @@ export class Bridge {
     this.maxPayloadBytes = opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD;
     this.livenessProbeMs = opts.livenessProbeMs ?? DEFAULT_LIVENESS_PROBE_MS;
     this.reconnectGraceMs = opts.reconnectGraceMs ?? RECONNECT_GRACE_MS;
+  }
+
+  /** What a window joining now is told about the REST token (rest_status). */
+  setRestStatusProvider(fn: () => RestStatusWire): void {
+    this.restStatusProvider = fn;
+  }
+
+  /**
+   * Push a server→plugin message to every established window (REST token
+   * status, REST activity). Never used for requests — those are routed.
+   */
+  broadcast(msg: RestStatusUpdate | RestEventWire): void {
+    for (const conn of this.channels.values()) conn.send(msg);
   }
 
   setSessionsProvider(fn: () => SessionSummaryWire[]): void {
@@ -749,6 +772,16 @@ export class Bridge {
         this.broadcastChannels();
         break;
       }
+      case "set_rest_token": {
+        // Only an established window may set it: a socket that never said
+        // hello is nobody the user can see in a Figma panel.
+        if (!conn) break;
+        const token = (msg as { token?: unknown }).token;
+        if (token !== null && (typeof token !== "string" || token.length > 512)) break;
+        const exp = (msg as { expiresAt?: unknown }).expiresAt;
+        this.handlers.onRestToken?.(token, conn.channel, { expiresAt: typeof exp === "number" ? exp : null });
+        break;
+      }
       case "context": {
         if (!conn) break;
         if (typeof msg.fileName === "string" && msg.fileName.length > 0) {
@@ -805,6 +838,7 @@ export class Bridge {
       if (hello.pageName && hello.pageName !== prevPage) {
         established.lastUserActivityAt = Date.now();
       }
+      this.takeHelloToken(hello, established.channel);
       this.broadcastChannels();
       return;
     }
@@ -859,6 +893,13 @@ export class Bridge {
         this.establish(client, hello, this.generateChannel(), newResumeToken());
       }
     });
+  }
+
+  /** A hello carrying a saved REST token hands it over (never a clear — see PluginHello.restToken). */
+  private takeHelloToken(hello: PluginHello, channel: string): void {
+    const t = hello.restToken;
+    const exp = hello.restTokenExpiresAt;
+    if (typeof t === "string" && t.length > 0 && t.length <= 512) this.handlers.onRestToken?.(t, channel, { expiresAt: typeof exp === "number" ? exp : null });
   }
 
   /** Resolve true when `ws` answers a protocol ping within the probe window. */
@@ -939,6 +980,8 @@ export class Bridge {
     // user so they can point specific agents at specific windows). When it
     // differs from the one the plugin asked for, the UI says so.
     conn.send({ type: "assigned", channel, resumeToken });
+    this.takeHelloToken(hello, channel);
+    if (this.restStatusProvider) conn.send({ type: "rest_status", status: this.restStatusProvider() });
 
     for (const item of carried) conn.enqueue(item.request, item.pending);
 

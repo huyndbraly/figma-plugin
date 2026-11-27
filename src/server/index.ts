@@ -44,6 +44,9 @@ import type { AnyOperation, BridgeResponse } from "../shared/protocol.js";
 import { DOC_SECTION_NAMES } from "./docs-content/index.js";
 import { READ_OPERATIONS, DEFAULT_PORT, PORT_RANGE } from "../shared/protocol.js";
 import { parseRouteArg, type RouteArg } from "./route.js";
+import { REST_ONLY_READ_OPS } from "./rest-features.js";
+import { DesignIndex, LOCAL_INDEX_OPS } from "./design-index.js";
+import { restHub, type ForwardedRequest, type ForwardedResponse, type TokenStatus } from "./rest-hub.js";
 
 // ---- JSON tool schemas (match ARCHITECTURE.md) ----
 
@@ -97,12 +100,12 @@ export const TOOLS: Tool[] = [
       properties: {
         op: {
           type: "string",
-          enum: [...READ_OPERATIONS, "list_channels"],
+          enum: [...READ_OPERATIONS, "list_channels", ...REST_ONLY_READ_OPS, ...LOCAL_INDEX_OPS],
           description: "The read operation to run. list_channels lists connected Figma windows (file, page, focused) — pass those names as file/page on later tools; channel ids are optional.",
         },
         params: {
           type: "object",
-          description: "Operation parameters (e.g. { nodeId }, { nodeIds }, { detail: 'sparse'|'compact'|'full' }, read_selection: { detail?, depth? }). { url } takes a Figma link (Copy link to selection) instead of nodeId.",
+          description: "Operation parameters (e.g. { nodeId }, { nodeIds }, { detail: 'sparse'|'compact'|'full' }, read_selection: { detail?, depth? }). { url } takes a Figma link (Copy link to selection) instead of nodeId; { fileKey } too; source:'rest' reads via the REST token.",
           additionalProperties: true,
         },
         ...ROUTE_TARGET,
@@ -383,6 +386,11 @@ export async function createServer(): Promise<ServerHandle> {
         if (!b) throw new OpError(ErrorCode.NOT_CONNECTED, "Bridge unavailable on leader.", "Restart the leader.");
         return leaderPluginState(b);
       }
+      // __rest_fetch__ runs a follower's Figma REST request with THIS
+      // process's token, so the plugin's token never leaves the leader.
+      if (op === "__rest_fetch__") {
+        return restHub.serveForwarded(params as unknown as ForwardedRequest);
+      }
       if (op === "__write__") {
         const code = typeof params["code"] === "string" ? (params["code"] as string) : "";
         return executeWrite(code, sessions.get(sessionId), {
@@ -412,8 +420,14 @@ export async function createServer(): Promise<ServerHandle> {
     onFollowerCreated: () => {
       void coordinator.forward("__register__", {}, defaultSessionId).catch(() => {});
     },
+    // The plugin panel's REST Token field. Held in RAM by the hub, never
+    // written anywhere; a takeover leader learns it again from the next hello.
+    onRestToken: (token, _channel, meta) => {
+      restHub.setPluginToken(token, meta ?? {});
+    },
     // Runs for the initial bridge AND any takeover replacement.
     onBridgeCreated: (bridge) => {
+      bridge.setRestStatusProvider(() => restHub.getStatus());
       // Feed agent-session summaries to the bridge so plugin UIs can render
       // the "which agent drives this window?" picker. Sessions idle for over
       // an hour are hidden: a dead MCP process leaves no disconnect signal,
@@ -540,7 +554,7 @@ export async function createServer(): Promise<ServerHandle> {
   type LeaderPluginState = Pick<
     Diagnostics,
     "pluginConnected" | "plugin" | "channels" | "lastHeartbeatMs" | "queueLength" | "pendingCount"
-  > & { sessions?: Diagnostics["sessions"] };
+  > & { sessions?: Diagnostics["sessions"]; restToken?: TokenStatus };
 
   function leaderPluginState(bridge: Bridge): LeaderPluginState {
     return {
@@ -567,6 +581,7 @@ export async function createServer(): Promise<ServerHandle> {
       queueLength: bridge.queueLength,
       pendingCount: bridge.pendingCount,
       sessions: sessions.summaries(),
+      restToken: restHub.getStatus(),
     };
   }
 
@@ -574,6 +589,7 @@ export async function createServer(): Promise<ServerHandle> {
     const info = coordinator.info();
     const bridge = liveBridge();
     if (coordinator.role === "leader" && bridge) {
+      restHub.ensureChecked();
       return {
         mode: "leader",
         port: bridge.port,
@@ -606,10 +622,15 @@ export async function createServer(): Promise<ServerHandle> {
       const boundChannel = state.channels?.find((c) =>
         c.boundSessions?.includes(defaultSessionId),
       )?.channel;
+      // The leader's token wins; with none there, this process's own
+      // FIGMA_TOKEN is what its requests fall back to.
+      const ownRest = restHub.getStatus();
+      const restToken = state.restToken && state.restToken.state !== "not_set" ? state.restToken : ownRest;
       return {
         ...base,
         statusSource: "leader",
         ...state,
+        restToken,
         ...(boundChannel ? { boundChannel } : {}),
       };
     } catch (err) {
@@ -645,7 +666,24 @@ export async function createServer(): Promise<ServerHandle> {
     }
   };
 
-  const ctx: ToolContext = { runValidated, runWrite, sessions, diagnostics };
+  // REST token plumbing. Status changes and every REST request reach every
+  // plugin window of THIS process's bridge (only a leader has one); a
+  // follower's requests run on the leader, so the leader reports them.
+  restHub.setRemote(
+    () =>
+      coordinator.role === "follower"
+        ? (req: ForwardedRequest) => coordinator.forward("__rest_fetch__", req as unknown as Record<string, unknown>, defaultSessionId) as Promise<ForwardedResponse>
+        : undefined,
+    async () => {
+      if (coordinator.role !== "follower") return undefined;
+      const state = (await coordinator.forward("__status__", {}, defaultSessionId, undefined, STATUS_RPC_TIMEOUT_MS)) as LeaderPluginState;
+      return state.restToken;
+    },
+  );
+  const offRestStatus = restHub.onStatus((status) => liveBridge()?.broadcast({ type: "rest_status", status }));
+  const offRestEvent = restHub.onEvent((e) => liveBridge()?.broadcast(e));
+
+  const ctx: ToolContext = { runValidated, runWrite, sessions, diagnostics, designIndex: DesignIndex.fromEnv() };
 
   // Elect role + start bridge/forwarding. Bridge wiring (rpc routing, session
   // provider, follower registration) happens inside the coordinator deps
@@ -699,6 +737,8 @@ export async function createServer(): Promise<ServerHandle> {
     ready,
     diagnostics,
     close: async () => {
+      offRestStatus();
+      offRestEvent();
       await ready.catch(() => undefined);
       await coordinator.close();
     },

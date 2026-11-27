@@ -76,6 +76,8 @@ export interface CoordinatorDeps {
    * every op after a takeover failed NOT_CONNECTED).
    */
   onBridgeCreated?: (bridge: Bridge) => void;
+  /** A plugin window saved/cleared the Figma REST token (see rest-hub.ts). */
+  onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null }) => void;
   /**
    * Fires whenever this process starts following a leader — at election,
    * after a takeover by another process, after the leader restarted with a
@@ -183,6 +185,7 @@ export class Coordinator {
         // The /rpc forward path: a follower forwarded an op → leader runs it
         // through the SAME validate+dispatch choke point as its own calls.
         onRpc: (op, params, sessionId, channel) => this.deps.runValidated(op, params, sessionId, channel),
+        onRestToken: (token, channel, meta) => this.deps.onRestToken?.(token, channel, meta),
       });
       try {
         const bound = await bridge.listen(port, token);

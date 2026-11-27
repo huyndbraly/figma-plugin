@@ -1,4 +1,5 @@
 /// <reference types="@figma/plugin-typings" />
+import { describeMotion } from "./motion-util.js";
 import { r2 } from "./num.js";
 import { rgbToHex, rgbaToHex } from "./color-util.js";
 
@@ -123,7 +124,13 @@ export function serializeNode(
     base.childCount = (node as ChildrenMixin).children.length;
   }
   const reactions = summarizeReactions(node);
-  if (reactions) base.reactions = reactions;
+  if (reactions) {
+    base.reactions = reactions;
+    // HOW each link animates — trigger, transition (SMART_ANIMATE…), duration,
+    // easing curve or spring, a CSS timing string — for code that has to
+    // reproduce the prototype. Only nodes with reactions pay for it.
+    base.motion = describeMotion((node as SceneNode & { reactions?: readonly Reaction[] }).reactions);
+  }
   if (detail !== "design") {
     return base;
   }

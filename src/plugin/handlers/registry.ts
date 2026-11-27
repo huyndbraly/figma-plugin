@@ -3,6 +3,7 @@ import { Operation, OPERATIONS } from "../../shared/protocol.js";
 import { HandlerContext } from "../context.js";
 
 import { create } from "./create.js";
+import { createFigjamDiagram, getSlides, createSlide } from "./surfaces.js";
 import {
   modify,
   deleteNode,
@@ -159,6 +160,7 @@ export const HANDLERS: Record<Operation, Handler> = {
   audit_design_system: auditDesignSystem,
   export_component_map: exportComponentMap,
   check_component_map: checkComponentMap,
+  get_slides: getSlides,
   // writes
   create: create,
   modify: modify,
@@ -224,6 +226,8 @@ export const HANDLERS: Record<Operation, Handler> = {
   apply_design_system: applyDesignSystem,
   responsive_audit: responsiveAudit,
   create_board: whileDrawing(createBoard),
+  create_figjam_diagram: whileDrawing(createFigjamDiagram),
+  create_slide: createSlide,
 };
 
 /** Compile-time-ish safety net: every declared op has a handler. */

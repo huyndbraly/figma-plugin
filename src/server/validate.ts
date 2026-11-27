@@ -630,6 +630,34 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
       h: z.number().positive(),
     })
     .passthrough(),
+  // Laid out by the server (figma_diagram in a FigJam window); the plugin only draws.
+  create_figjam_diagram: z
+    .object({
+      title: z.string().optional(),
+      nodes: z
+        .array(
+          z
+            .object({
+              id: z.string().min(1),
+              label: z.string(),
+              shape: z.enum(["ROUNDED_RECTANGLE", "SQUARE", "ELLIPSE", "DIAMOND", "PARALLELOGRAM_RIGHT", "TRIANGLE_DOWN", "STICKY"]),
+              x: z.number(),
+              y: z.number(),
+            })
+            .passthrough(),
+        )
+        .min(1),
+      edges: z.array(z.object({ from: z.string(), to: z.string() }).passthrough()),
+    })
+    .passthrough(),
+  create_slide: z
+    .object({
+      name: z.string().optional(),
+      row: z.number().int().min(0).optional(),
+      col: z.number().int().min(0).optional(),
+      fill: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+    })
+    .passthrough(),
 };
 
 export interface ValidatedOp {

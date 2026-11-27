@@ -52,7 +52,17 @@ import { loadIconSvg, searchIcons as searchIconsSvc, type Fetcher, type IconLibr
 import { runUserflow } from "./userflow.js";
 import { translateProps, type ComponentMap, type Translated } from "../shared/component-map.js";
 import { fileNameKey, parseFigmaLink } from "../shared/figma-url.js";
+import { restHub } from "./rest-hub.js";
+import { RestClient } from "./rest-read.js";
+import { getComments, getVersions, postComment } from "./rest-features.js";
+import { capturePage, type PlaywrightLoader } from "./html-capture.js";
+import { domToFigma } from "../shared/html-to-figma.js";
+import { generateImage, generateSvg, loadByokConfig, type AiFetch, type ByokConfig } from "./byok.js";
+import { mapToCodeConnect, parseCodeConnect, codeConnectToMap, type ParsedCodeConnect } from "../shared/code-connect.js";
+import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+import { join } from "node:path";
 import {
+  resolveDir,
   restRenderer,
   restTargets,
   writeAssets,
@@ -96,6 +106,12 @@ export interface ExecutorDeps {
   resolveHost?: HostResolver;
   /** Injectable for tests — the transport exportAssets' REST fallback calls api.figma.com with. */
   restFetch?: RestFetch;
+  /** Injectable for tests — Playwright for htmlToFigma (default: import("playwright")). */
+  playwrightLoader?: PlaywrightLoader;
+  /** Injectable for tests — the transport generateImage / generateSvg call providers with. */
+  aiFetch?: AiFetch;
+  /** Injectable for tests — BYOK keys/models (default: env + FIGMA_MCP_BYOK_CONFIG). */
+  byok?: ByokConfig;
   /** Injectable for tests — the personal access token for the REST fallback (default: FIGMA_TOKEN). */
   figmaToken?: string;
 }
@@ -204,6 +220,9 @@ const METHOD_TO_OP: Record<string, AnyOperation> = {
   currentPage: "get_document_info", // convenience; returns doc/page info
   // Server-answered (never hits the plugin): connected Figma windows.
   listChannels: "list_channels",
+  // Figma Slides.
+  getSlides: "get_slides",
+  createSlide: "create_slide",
 };
 
 /**
@@ -1185,7 +1204,8 @@ function buildFigmaProxy(
       source = n > 0 ? "plugin" : "rest";
     }
     if (source === "rest") {
-      const token = deps.figmaToken ?? process.env.FIGMA_TOKEN;
+      // The plugin panel's token (RAM, leader) else FIGMA_TOKEN — restHub.
+      const token = deps.figmaToken ?? restHub.token();
       if (link && linkFileMatches === false && !token) {
         throw new OpError(
           ErrorCode.NOT_CONNECTED,
@@ -1205,7 +1225,7 @@ function buildFigmaProxy(
       if (selection || childrenOf) {
         throw new OpError(ErrorCode.INVALID_PARAMS, "The REST fallback needs explicit node ids.", "Selection and childrenOf need the plugin; pass ids instead (?node-id=1-2 in a URL is 1:2).");
       }
-      const restFetch: RestFetch = deps.restFetch ?? ((u, init) => fetch(u, init));
+      const restFetch: RestFetch = deps.restFetch ?? (deps.figmaToken !== undefined ? (u, init) => fetch(u, init) : restHub.fetch);
       const list = await restTargets(o.fileKey, ids, token, restFetch, deps.signal);
       const download = async (url: string): Promise<Uint8Array> => {
         const res = await fetchImageFollowingSafeRedirects(url, deps.imageFetch, deps.resolveHost, deps.signal);
@@ -1286,6 +1306,175 @@ function buildFigmaProxy(
       ...(Object.keys(t.properties).length ? { properties: t.properties } : {}),
       ...rest,
     });
+  };
+
+  // ---- Figma REST: comments and version history ----
+  // Not Plugin API features at all — they exist only in the REST API, with
+  // the token from the plugin panel (or FIGMA_TOKEN). The file is the one in
+  // { url | fileKey }, else the file this call's window has open.
+  const restFetchFn: RestFetch = deps.restFetch ?? restHub.fetch;
+  const restFileKey = async (o: Record<string, unknown>): Promise<{ fileKey: string; nodeId?: string }> => {
+    const link = parseFigmaLink(o.url ?? o.link);
+    if (link) return { fileKey: link.fileKey, ...(link.nodeId ? { nodeId: link.nodeId } : {}) };
+    if (typeof o.fileKey === "string" && o.fileKey) return { fileKey: o.fileKey };
+    const info = (await call("get_document_info", {})) as { fileKey?: string | null };
+    if (info?.fileKey) return { fileKey: info.fileKey };
+    throw new OpError(ErrorCode.INVALID_PARAMS, "Which file? This REST call needs the file's key.", "Pass { url: <Figma link> } or { fileKey }.");
+  };
+  const requireRestToken = async () => {
+    if (deps.restFetch) return;
+    if (!(await restHub.available())) {
+      throw new OpError(ErrorCode.UNAUTHORIZED, "No Figma REST token is set.", "Ask the user to paste a personal access token into the plugin panel (REST Token → Save), or set FIGMA_TOKEN on the MCP server.");
+    }
+  };
+  proxy["getComments"] = async (opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    await requireRestToken();
+    const { fileKey, nodeId } = await restFileKey(o);
+    return getComments(new RestClient("", restFetchFn), fileKey, { ...o, ...(nodeId && o.nodeId === undefined ? { nodeId } : {}) }, deps.signal);
+  };
+  proxy["getVersions"] = async (opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    await requireRestToken();
+    const { fileKey } = await restFileKey(o);
+    return getVersions(new RestClient("", restFetchFn), fileKey, o, deps.signal);
+  };
+  proxy["postComment"] = async (opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    await requireRestToken();
+    const { fileKey, nodeId } = await restFileKey(o);
+    return postComment(restFetchFn, fileKey, {
+      message: String(o.message ?? ""),
+      ...(o.replyTo !== undefined ? { replyTo: String(o.replyTo) } : {}),
+      ...(typeof o.nodeId === "string" ? { nodeId: o.nodeId } : nodeId ? { nodeId } : {}),
+      ...(typeof o.x === "number" ? { x: o.x } : {}),
+      ...(typeof o.y === "number" ? { y: o.y } : {}),
+    }, deps.signal);
+  };
+
+  // ---- html → Figma (optional Playwright) ----
+  proxy["htmlToFigma"] = async (url: unknown, opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    const tree = await capturePage(url, {
+      ...(typeof o.width === "number" ? { width: o.width } : {}),
+      ...(typeof o.height === "number" ? { height: o.height } : {}),
+      ...(typeof o.selector === "string" ? { selector: o.selector } : {}),
+      ...(typeof o.waitMs === "number" ? { waitMs: o.waitMs } : {}),
+    }, deps.playwrightLoader);
+    const built = domToFigma(tree, {
+      name: typeof o.name === "string" ? o.name : String(url),
+      ...(typeof o.maxNodes === "number" ? { maxNodes: o.maxNodes } : {}),
+      ...(typeof o.fallbackFont === "string" ? { fallbackFont: o.fallbackFont } : {}),
+    });
+    const created = (await call("create", {
+      ...built.spec,
+      ...(typeof o.parentId === "string" ? { parentId: o.parentId } : {}),
+      ...(typeof o.x === "number" ? { x: o.x } : {}),
+      ...(typeof o.y === "number" ? { y: o.y } : {}),
+    })) as Record<string, unknown>;
+    if (built.dropped) {
+      const w = `htmlToFigma: ${built.dropped} small element(s) were left out to stay within maxNodes; raise maxNodes or pass a selector for one part of the page.`;
+      if (!warnings.includes(w)) warnings.push(w);
+    }
+    return { ...(isObj(created) ? created : { result: created }), nodes: built.nodes, dropped: built.dropped };
+  };
+
+  // ---- BYOK image / SVG generation ----
+  proxy["generateImage"] = async (prompt: unknown, opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    const img = await generateImage(prompt, {
+      ...(typeof o.size === "string" ? { size: o.size } : {}),
+      ...(typeof o.quality === "string" ? { quality: o.quality } : {}),
+    }, deps.byok ?? loadByokConfig(), deps.aiFetch, deps.signal);
+    const { size: _s, quality: _q, ...place } = o;
+    const placed = (await call("load_image", { base64: img.base64, name: typeof o.name === "string" ? o.name : String(prompt).slice(0, 60), ...place })) as Record<string, unknown>;
+    return { ...(isObj(placed) ? placed : {}), model: img.model, size: img.size };
+  };
+  proxy["generateSvg"] = async (prompt: unknown, opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    const out = await generateSvg(prompt, {
+      ...(typeof o.width === "number" ? { width: o.width } : {}),
+      ...(typeof o.height === "number" ? { height: o.height } : {}),
+      ...(typeof o.style === "string" ? { style: o.style } : {}),
+    }, deps.byok ?? loadByokConfig(), deps.aiFetch, deps.signal);
+    const created = (await call("create", {
+      type: "ICON",
+      svg: out.svg,
+      name: typeof o.name === "string" ? o.name : String(prompt).slice(0, 60),
+      ...(typeof o.parentId === "string" ? { parentId: o.parentId } : {}),
+      ...(typeof o.x === "number" ? { x: o.x } : {}),
+      ...(typeof o.y === "number" ? { y: o.y } : {}),
+    })) as Record<string, unknown>;
+    return { ...(isObj(created) ? created : {}), model: out.model };
+  };
+
+  // ---- Code Connect (.figma.tsx) ↔ the component map ----
+  proxy["exportCodeConnect"] = async (opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    const dir = resolveDir(o.dir, "exportCodeConnect");
+    let map = (isObj(o.map) ? o.map : session.state.componentMap) as ComponentMap | undefined;
+    if (!map || !isObj(map.components)) map = ((await call("export_component_map", {})) as { map: ComponentMap }).map;
+    const link = parseFigmaLink(o.url);
+    const fileKey = link?.fileKey ?? (typeof o.fileKey === "string" ? o.fileKey : ((await call("get_document_info", {})) as { fileKey?: string | null }).fileKey);
+    if (!fileKey) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, "Code Connect needs the file's key for its URLs.", "Pass { url: <the file's Figma link> } or { fileKey }.");
+    }
+    const comps = ((await call("get_components", {})) as { components?: Array<{ id: string; name: string; type?: string }> }).components ?? [];
+    const idByName: Record<string, string> = {};
+    // A set wins over a same-named variant: Code Connect points at the set.
+    for (const c of comps) if (!idByName[c.name] || c.type === "COMPONENT_SET") idByName[c.name] = c.id;
+    const { files, missing } = mapToCodeConnect(map, idByName, {
+      fileKey,
+      ...(typeof o.importFrom === "string" ? { importFrom: o.importFrom } : {}),
+      ...(isObj(o.importPaths) ? { importPaths: o.importPaths as Record<string, string> } : {}),
+    });
+    await mkdir(dir, { recursive: true });
+    const written: string[] = [];
+    const skipped: string[] = [];
+    for (const f of files) {
+      const path = join(dir, f.fileName);
+      try {
+        await writeFile(path, f.source, { encoding: "utf8", flag: o.overwrite === true ? "w" : "wx" });
+        written.push(path);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "EEXIST") skipped.push(path);
+        else throw e;
+      }
+    }
+    if (skipped.length) {
+      const w = `exportCodeConnect: ${skipped.length} file(s) already existed and were kept — pass overwrite: true to replace them.`;
+      if (!warnings.includes(w)) warnings.push(w);
+    }
+    return { written, skipped, missing, fileKey };
+  };
+  proxy["readCodeConnect"] = async (opts?: Record<string, unknown>) => {
+    const o = isObj(opts) ? opts : {};
+    const sources: Array<{ path: string; source: string }> = [];
+    if (Array.isArray(o.sources)) {
+      for (const [i, src] of (o.sources as unknown[]).entries()) if (typeof src === "string") sources.push({ path: `source[${i}]`, source: src });
+    } else {
+      const dir = resolveDir(o.dir, "readCodeConnect");
+      for (const path of await findCodeConnectFiles(dir)) sources.push({ path, source: await readFile(path, "utf8") });
+    }
+    const connections: ParsedCodeConnect[] = [];
+    const skippedNotes: string[] = [];
+    for (const s of sources) {
+      const parsed = parseCodeConnect(s.source);
+      connections.push(...parsed.connections);
+      for (const n of parsed.skipped) skippedNotes.push(`${s.path}: ${n}`);
+    }
+    const ids = [...new Set(connections.map((c) => c.nodeId).filter((x): x is string => !!x))];
+    const names: Record<string, string> = {};
+    if (ids.length) {
+      const r = (await call("get_nodes", { nodeIds: ids, detail: "sparse" })) as { nodes?: Array<{ id: string; name?: string; missing?: boolean }> };
+      for (const n of r.nodes ?? []) if (!n.missing && n.name) names[n.id] = n.name;
+    }
+    const { map, unresolved } = codeConnectToMap(connections, names);
+    if (o.use === true) {
+      session.state.componentMap = map;
+      stateOverlay.set("componentMap", map);
+    }
+    return { files: sources.length, connections: connections.length, map, unresolved, skipped: skippedNotes };
   };
 
   // Official-plugin-API muscle memory → the sandbox equivalent. Each entry is
@@ -2162,3 +2351,26 @@ function flattenNodes(nodes: unknown[]): Record<string, unknown>[] {
 }
 
 export { isReadOp };
+
+/** Every *.figma.tsx / *.figma.ts under `dir` (node_modules and dot-folders skipped, 500 max). */
+async function findCodeConnectFiles(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (d: string, depth: number): Promise<void> => {
+    if (out.length >= 500 || depth > 12) return;
+    let entries: import("node:fs").Dirent[] = [];
+    try {
+      entries = await readdir(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const p = join(d, e.name);
+      if (e.isDirectory()) await walk(p, depth + 1);
+      else if (/\.figma\.(tsx|ts|jsx|js)$/.test(e.name)) out.push(p);
+      if (out.length >= 500) return;
+    }
+  };
+  await walk(dir, 0);
+  return out;
+}

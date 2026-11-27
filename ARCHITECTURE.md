@@ -57,6 +57,41 @@ The plugin UI shows: the window's channel chip (copy/change/join), and an **agen
 
 Each MCP server process generates a private default sessionId (`s-xxxxxxxx`) for its one stdio client, so N parallel Claude Code / Codex instances get isolated vm `state` automatically — no more accidental sharing through the old global `"default"` session. Passing an explicit `sessionId` remains the opt-in for deliberate state sharing. `figma_status` reports `mySessionId`.
 
+## The REST token and the hybrid REST path
+
+Some things only the Figma REST API can do — comments, version history, reading a file nobody has open — and they need a personal access token. The token's whole lifecycle is designed around one rule: **it is a request header and nothing else.**
+
+```
+plugin panel (REST Token field, password input)
+   │ postMessage
+   ▼
+code.js ── figma.clientStorage (per user, every file; never the document)
+   │ hello.restToken (only when saved) · set_rest_token {token|null}
+   ▼  WS
+LEADER bridge ──► rest-hub.ts (RAM) ──► GET /v1/me  ──► rest_status ──► every window's badge
+   ▲                    │ fetch(): injects X-Figma-Token, times, classifies 401/403/429
+   │ __rest_fetch__     └──────────────────────────────► rest_event ──► READS/WRITES/ERRORS + [REST] log
+FOLLOWER (no token; its requests run on the leader)
+```
+
+- `src/server/rest-hub.ts` holds the token (plugin's first, then `FIGMA_TOKEN`) and is the only `fetch` every REST caller uses (`rest-read.ts`, `assets-export.ts`, `rest-features.ts`). It checks a new token with `/v1/me` **from Node**, so the plugin's `networkAccess` stays localhost-only. Real requests move the state too: 401 (or a 403 that names the token) → invalid at once; a plain 403 → re-check, because no access to one file is not a bad token; 429 → rate-limited until the next success. A check started for a token that has since been replaced is discarded.
+- A follower holds no plugin token: its requests are forwarded to the leader as `__rest_fetch__` (api.figma.com only, GET/POST/DELETE) and run with the leader's token, so the token stays in one process; with none there, the follower uses its own `FIGMA_TOKEN`.
+- Clearing is always explicit (`set_rest_token {token:null}`); a hello never clears, so a second window that has not heard about a newer token cannot wipe it.
+- `figma_status.restToken` reports state, source, handle and a masked preview; hints say what the USER must do when it is rejected.
+
+On top of it: `get_comments` / `get_versions` (server-answered `figma_read` ops, never sent to the plugin), `figma.postComment` / `getComments` / `getVersions` in the sandbox, and REST reads of closed files — `get_node`, `get_design_context`, `generate_design_md` (a `DesignSystemKit` built from `/files`, `/styles` + the style nodes' values, `/components`, `/component_sets`, rendered by the same `renderDesignMarkdown`), `screenshot`, `export_node` — with `{ url }` or `{ fileKey }`, and `source: "rest"` to force REST.
+
+## FigJam, Slides, motion
+
+The manifest runs in `figma`, `figjam` and `slides`. In a FigJam window `figma_diagram` draws userflow / activity / state / sitemap with FigJam's native nodes: `src/shared/figjam/` turns the kind's model into a graph with FigJam shapes and places it with dagre; the plugin op `create_figjam_diagram` creates shapes-with-text, stickies and connectors in a section. Connectors follow their shapes natively, so none of the Design path's live re-routing is needed — and the kind's checker still runs first (a dry run), because proof-reading the model is the point. Slides get `get_slides` / `create_slide`. Reads at `full`/`design` detail add `motion` per node with reactions (`src/plugin/motion-util.ts`): trigger, transition type, duration, easing as bezier or spring, and a CSS timing string — the units are the trap (trigger delays are ms, transition durations s).
+
+## Code Connect, the local design index, html → Figma, BYOK
+
+- `src/shared/code-connect.ts` writes `<Component>.figma.tsx` (Figma's Code Connect format) from the component map and reads it back; `figma.exportCodeConnect` / `readCodeConnect` do the file I/O on the server (absolute dirs only, existing files kept).
+- `src/server/design-index.ts` keeps component / style / variable METADATA of every file this machine has read in `.figma-cache/` (self-gitignored; `FIGMA_CACHE=off`), recorded off the response path of the reads that return them; `search_design_index` searches across files, `index_design_file` indexes a closed file through REST.
+- `src/server/html-capture.ts` (optional Playwright, resolved at call time) captures boxes + computed CSS of an http(s) page; `src/shared/html-to-figma.ts` turns that into one `create()` tree with flex → auto-layout.
+- `src/server/byok.ts`: `generateImage` (OpenAI Images) and `generateSvg` (Anthropic Messages, output sanitised to an inert SVG) with keys from the server's environment or `FIGMA_MCP_BYOK_CONFIG`; like the Figma token, a key is only a header.
+
 ## One rule about the tests
 
 A check is only worth trusting when it can go RED at the moment the thing it
@@ -95,7 +130,7 @@ not evidence.
 
 ### `figma_status` — diagnostics, not a boolean
 
-Returns JSON: `{ pluginConnected, statusSource, statusError?, mode: "leader"|"follower", port, bridgeAuth: "ok"|"missing", plugin: {version, apiVersionMatch, fileName, pageName, editorType}, channels: [{channel, fileName, pageName, queueLength, lastHeartbeatMs, boundSessions?}], lastHeartbeatMs, queueLength, pendingCount, sessions: [...], mySessionId, myBoundChannel?, hints: [...] }`.
+Returns JSON: `{ pluginConnected, statusSource, statusError?, mode: "leader"|"follower", port, bridgeAuth: "ok"|"missing", plugin: {version, apiVersionMatch, fileName, pageName, editorType}, channels: [{channel, fileName, pageName, queueLength, lastHeartbeatMs, boundSessions?}], lastHeartbeatMs, queueLength, pendingCount, sessions: [...], mySessionId, myBoundChannel?, restToken: {state, source, handle?, masked?} | null, hints: [...] }`.
 
 **Plugin state on a follower is measured, not guessed.** A follower holds no bridge, so it forwards a synthetic `__status__` op over `/rpc` (short 2 s timeout — a diagnostic must not inherit the 130 s drawing-op timeout) and reports whatever the leader actually sees. `statusSource` says where the numbers came from: `"local"` (own bridge), `"leader"` (read over `/rpc`), or `"unknown"`.
 
@@ -191,12 +226,15 @@ figma-plugin/
 ├── src/
 │   ├── server/          # MCP server: index.ts, bridge.ts, leader.ts, follower.ts,
 │   │                    # executor.ts, session.ts, validate.ts, tools.ts, icons.ts,
+│   │                    # rest-hub.ts (token), rest-read.ts, rest-features.ts,
+│   │                    # design-index.ts, html-capture.ts, byok.ts,
 │   │                    # errors.ts, paths.ts, version.ts, docs-content/*.md.ts
 │   ├── plugin/          # main.ts, serialize.ts, layout-math.ts, fonts.ts, paints.ts,
 │   │                    # structure-sig.ts, …, handlers/{read,write,create,components,
 │   │                    # design-system,tokens,text,audit,assets,export,
-│   │                    # instance-overrides,paint-edit,registry}.ts
-│   └── shared/          # protocol.ts, design-system.ts, token-format.ts — imported by both
+│   │                    # instance-overrides,paint-edit,surfaces,registry}.ts
+│   └── shared/          # protocol.ts, design-system.ts, token-format.ts, rest-token.ts,
+│                        # code-connect.ts, html-to-figma.ts, figjam/ — imported by both
 ├── plugin/              # manifest.json, ui.html, code.js (built artifact)
 ├── scripts/build.mjs    # esbuild: server → dist/, plugin → plugin/code.js (target es2017, iife)
 ├── tests/               # vitest: server/ (executor, validate, tools, bridge, leader/follower),
