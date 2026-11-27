@@ -94,7 +94,7 @@ async function newBridge(
 ): Promise<{ bridge: Bridge; port: number }> {
   const bridge = new Bridge(onRpc ? { onRpc } : {}, { livenessProbeMs: 200, reconnectGraceMs: 600, ...opts });
   bridges.push(bridge);
-  const port = await bridge.listen(44000 + Math.floor(Math.random() * 900), "tok");
+  const port = await bridge.listen(0, "tok");
   return { bridge, port };
 }
 
