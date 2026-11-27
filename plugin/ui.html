@@ -56,9 +56,23 @@
     width: 28px; height: 28px; border-radius: 8px; flex: 0 0 auto;
     display: block; object-fit: contain;
   }
-  .header-text { display: flex; flex-direction: column; min-width: 0; }
+  .header-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
   .title { font-weight: 600; font-size: 13px; }
   .subtitle { color: var(--muted); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lang-switch {
+    display: inline-flex; flex: 0 0 auto; border: 1px solid var(--line);
+    border-radius: 6px; overflow: hidden; background: var(--panel);
+  }
+  .lang-btn {
+    flex: 0 0 auto; border: none; border-radius: 0; background: transparent;
+    color: var(--muted); font-size: 10px; font-weight: 600; padding: 3px 6px;
+    cursor: pointer; line-height: 1.2;
+  }
+  .lang-btn:hover { color: var(--fg); border-color: transparent; }
+  .lang-btn.active {
+    background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+    color: #fff;
+  }
 
   .status-row {
     display: flex; align-items: center; gap: 8px;
@@ -231,74 +245,78 @@
       <span class="title">Figma Plugin MCP</span>
       <span class="subtitle" id="file">AI-powered design bridge</span>
     </div>
+    <div class="lang-switch" id="lang-switch" title="Switch interface language (English / Tiếng Việt)">
+      <button type="button" class="lang-btn active" id="lang-en">EN</button>
+      <button type="button" class="lang-btn" id="lang-vi">VI</button>
+    </div>
   </div>
 
-  <div class="status-row">
+  <div class="status-row" id="status-row" title="WebSocket connection status between this Figma plugin and the local MCP server.">
     <span id="dot" class="dot connecting"></span>
     <span class="status" id="status">Connecting…</span>
-    <span class="port-chip" id="port">—</span>
+    <span class="port-chip" id="port" title="Local WebSocket port of the MCP server (scans 38470–38479).">—</span>
   </div>
 
   <div class="channel-row">
-    <span class="channel-label">Channel</span>
+    <span class="channel-label" id="channel-label" title="Channel ID that identifies this Figma window so AI agents can route commands to the right file.">Channel</span>
     <span class="channel-chip" id="channel-chip" title="Click to copy">—</span>
-    <button class="mini" id="channel-edit">Change</button>
+    <button class="mini" id="channel-edit" title="Rename this window's channel ID (useful when multiple Figma files are open).">Change</button>
   </div>
   <div class="channel-editor" id="channel-editor">
-    <input id="channel-input" placeholder="channel name (a-z 0-9 - _ .)" maxlength="64">
-    <button class="mini primary" id="channel-join">Join</button>
-    <button class="mini" id="channel-cancel">✕</button>
+    <input id="channel-input" placeholder="channel name (a-z 0-9 - _ .)" maxlength="64" title="Allowed characters: letters, digits, -, _, . (max 64 chars).">
+    <button class="mini primary" id="channel-join" title="Save this channel name and reconnect to the MCP server.">Join</button>
+    <button class="mini" id="channel-cancel" title="Cancel editing channel">✕</button>
   </div>
 
   <div class="token-row">
     <div class="token-head">
-      <span class="token-label" title="Figma personal access token. Stored on this machine only (figma.clientStorage); the MCP server keeps it in memory and uses it for links to files that are not open, comments and version history.">REST Token (PAT)</span>
+      <span class="token-label" id="token-label" title="Figma personal access token. Stored on this machine only (figma.clientStorage); the MCP server keeps it in memory and uses it for links to files that are not open, comments and version history.">REST Token (PAT)</span>
       <span class="token-badge" id="token-badge">Not set</span>
     </div>
     <div class="token-editor">
-      <input id="token-input" type="password" placeholder="figd_…" autocomplete="off" spellcheck="false" maxlength="512">
+      <input id="token-input" type="password" placeholder="figd_…" autocomplete="off" spellcheck="false" maxlength="512" title="Paste your Figma Personal Access Token (figd_…). Stored locally in figma.clientStorage, never in the Figma file.">
       <select id="token-expiry" class="token-expiry" title="Expiration you picked when creating the token in Figma. Figma's API cannot report it, so the panel counts down from here.">
-        <option value="">Exp: ?</option>
-        <option value="1">1 day</option>
-        <option value="7">7 days</option>
-        <option value="30">30 days</option>
-        <option value="90">90 days</option>
+        <option value="" id="opt-exp-unknown">Exp: ?</option>
+        <option value="1" id="opt-exp-1">1 day</option>
+        <option value="7" id="opt-exp-7">7 days</option>
+        <option value="30" id="opt-exp-30">30 days</option>
+        <option value="90" id="opt-exp-90">90 days</option>
       </select>
-      <button class="mini primary" id="token-save">Save</button>
-      <button class="mini" id="token-clear">Clear</button>
+      <button class="mini primary" id="token-save" title="Save token locally and verify it with the MCP server (/v1/me).">Save</button>
+      <button class="mini" id="token-clear" title="Remove the saved REST token from this machine and server memory.">Clear</button>
     </div>
   </div>
 
-  <div class="section-label" title="Each row is one Claude Code / Codex instance. Connect routes its commands to this window.">AI sessions (<span id="agent-count">0</span>)</div>
+  <div class="section-label" id="sessions-label" title="Each row is one Claude Code / Codex instance. Connect routes its commands to this window."><span id="sessions-label-text">AI sessions</span> (<span id="agent-count">0</span>)</div>
   <div class="agents" id="agents">
     <div class="agents-empty" id="agents-empty">No AI sessions yet.</div>
   </div>
 
 
   <div class="stats">
-    <div class="stat-card">
+    <div class="stat-card" id="stat-writes-card" title="Number of canvas or REST write operations executed in this session.">
       <span class="stat-num writes" id="stat-writes">0</span>
-      <span class="stat-label">Writes</span>
+      <span class="stat-label" id="stat-writes-label">Writes</span>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" id="stat-reads-card" title="Number of canvas or REST read operations executed in this session.">
       <span class="stat-num reads" id="stat-reads">0</span>
-      <span class="stat-label">Reads</span>
+      <span class="stat-label" id="stat-reads-label">Reads</span>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" id="stat-errors-card" title="Number of failed operations (canvas or REST API) in this session.">
       <span class="stat-num errors" id="stat-errors">0</span>
-      <span class="stat-label">Errors</span>
+      <span class="stat-label" id="stat-errors-label">Errors</span>
     </div>
   </div>
 
-  <div class="section-label">Activity</div>
+  <div class="section-label" id="activity-label" title="Live log of recent plugin and [REST] operations with execution time.">Activity</div>
   <div class="activity" id="activity">
     <div class="activity-empty" id="activity-empty">No activity yet.</div>
   </div>
 
   <div class="actions">
-    <button id="clear">Clear</button>
-    <button id="autodetect">Auto-detect</button>
-    <button id="retry" class="primary">Reconnect</button>
+    <button id="clear" title="Clear the Activity log and reset the Writes/Reads/Errors counters.">Clear</button>
+    <button id="autodetect" title="Immediately scan ports 38470–38479 to find and connect to a running MCP server.">Auto-detect</button>
+    <button id="retry" class="primary" title="Close the current socket and reconnect to the MCP server immediately.">Reconnect</button>
   </div>
 
   <div class="foot" id="foot">Connects to the local Figma Plugin MCP bridge (localhost:38470 +9).</div>
@@ -410,40 +428,268 @@
     tokenSave: document.getElementById("token-save"),
     tokenClear: document.getElementById("token-clear"),
     tokenExpiry: document.getElementById("token-expiry"),
+    langEn: document.getElementById("lang-en"),
+    langVi: document.getElementById("lang-vi"),
+    statusRow: document.getElementById("status-row"),
+    channelLabel: document.getElementById("channel-label"),
+    tokenLabel: document.getElementById("token-label"),
+    sessionsLabel: document.getElementById("sessions-label"),
+    sessionsLabelText: document.getElementById("sessions-label-text"),
+    statWritesCard: document.getElementById("stat-writes-card"),
+    statReadsCard: document.getElementById("stat-reads-card"),
+    statErrorsCard: document.getElementById("stat-errors-card"),
+    statWritesLabel: document.getElementById("stat-writes-label"),
+    statReadsLabel: document.getElementById("stat-reads-label"),
+    statErrorsLabel: document.getElementById("stat-errors-label"),
+    activityLabel: document.getElementById("activity-label"),
+    grip: document.getElementById("grip"),
+    optExpUnknown: document.getElementById("opt-exp-unknown"),
+    optExp1: document.getElementById("opt-exp-1"),
+    optExp7: document.getElementById("opt-exp-7"),
+    optExp30: document.getElementById("opt-exp-30"),
+    optExp90: document.getElementById("opt-exp-90"),
   };
 
+  var I18N = {
+    en: {
+      subtitleDefault: "AI-powered design bridge",
+      statusRowTitle: "WebSocket connection status between this Figma plugin and the local MCP server.",
+      portTitle: "Local WebSocket port of the MCP server (scans 38470–38479).",
+      channelLabel: "Channel",
+      channelTitle: "Channel ID that identifies this Figma window so AI agents can route commands to the right file.",
+      channelChange: "Change",
+      channelChangeTitle: "Rename this window's channel ID (useful when multiple Figma files are open).",
+      channelInputPlaceholder: "channel name (a-z 0-9 - _ .)",
+      channelInputTitle: "Allowed characters: letters, digits, -, _, . (max 64 chars).",
+      channelJoin: "Join",
+      channelJoinTitle: "Save this channel name and reconnect to the MCP server.",
+      channelCancelTitle: "Cancel editing channel",
+      channelCopyPrefix: "Click to copy \"",
+      channelWaiting: "Waiting for the server to assign a channel",
+      copied: "copied!",
+      tokenLabel: "REST Token (PAT)",
+      tokenTitle: "Figma personal access token. Stored on this machine only (figma.clientStorage); the MCP server keeps it in memory and uses it for links to files that are not open, comments and version history.",
+      tokenInputTitle: "Paste your Figma Personal Access Token (figd_…). Stored locally in figma.clientStorage, never in the Figma file.",
+      tokenPasteFirst: "paste a figd_… token first",
+      tokenExpiryTitle: "Expiration you picked when creating the token in Figma. Figma's API cannot report it, so the panel counts down from here.",
+      expUnknown: "Exp: ?", exp1: "1 day", exp7: "7 days", exp30: "30 days", exp90: "90 days",
+      tokenSave: "Save",
+      tokenSaveTitle: "Save token locally and verify it with the MCP server (/v1/me).",
+      tokenClear: "Clear",
+      tokenClearTitle: "Remove the saved REST token from this machine and server memory.",
+      sessionsLabel: "AI sessions",
+      sessionsTitle: "Each row is one Claude Code / Codex instance. Connect routes its commands to this window.",
+      noSessions: "No AI sessions yet.",
+      here: "✓ here",
+      hereTitle: "Pinned to this window",
+      auto: "auto",
+      autoTitle: "Only window open — commands route here automatically",
+      pairedWith: "Paired with channel ",
+      moveHere: "Move here",
+      connect: "Connect",
+      writes: "Writes",
+      writesTitle: "Number of canvas or REST write operations executed in this session.",
+      reads: "Reads",
+      readsTitle: "Number of canvas or REST read operations executed in this session.",
+      errors: "Errors",
+      errorsTitle: "Number of failed operations (canvas or REST API) in this session.",
+      activityLabel: "Activity",
+      activityTitle: "Live log of recent plugin and [REST] operations with execution time.",
+      noActivity: "No activity yet.",
+      clearBtn: "Clear",
+      clearBtnTitle: "Clear the Activity log and reset the Writes/Reads/Errors counters.",
+      autodetectBtn: "Auto-detect",
+      autodetectBtnTitle: "Immediately scan ports 38470–38479 to find and connect to a running MCP server.",
+      reconnectBtn: "Reconnect",
+      reconnectBtnTitle: "Close the current socket and reconnect to the MCP server immediately.",
+      foot: "Connects to the local Figma Plugin MCP bridge (localhost:38470 +9).",
+      gripTitle: "Drag to resize",
+      notSet: "Not set",
+      checking: "Checking…",
+      unverified: "Set (not checked)",
+      expiredDate: "Expired? (date passed)",
+      valid: "Valid",
+      expiredInvalid: "Expired / Invalid",
+      rateLimited: "Rate-limited (429)",
+      checkFailed: "Check failed",
+      retryIn: "retry in ",
+      expired: "expired",
+      leftSuffix: " left",
+      agoSuffix: " ago",
+      connecting: "Connecting…",
+      connected: "Connected",
+      autodetecting: "Auto-detecting…",
+      noToken: "No token",
+      tokenPrefix: "Token ",
+      missingScopes: "Missing scopes: ",
+      scopes: "Scopes: ",
+      expires: "Expires ",
+    },
+    vi: {
+      subtitleDefault: "Cầu nối thiết kế cho AI",
+      statusRowTitle: "Trạng thái kết nối WebSocket giữa plugin Figma này và MCP server cục bộ.",
+      portTitle: "Cổng WebSocket cục bộ của MCP server (quét từ 38470–38479).",
+      channelLabel: "Channel",
+      channelTitle: "Mã Channel định danh cửa sổ Figma này để AI agent gửi lệnh đúng file.",
+      channelChange: "Đổi",
+      channelChangeTitle: "Đổi tên Channel của cửa sổ này (hữu ích khi mở nhiều file Figma cùng lúc).",
+      channelInputPlaceholder: "tên channel (a-z 0-9 - _ .)",
+      channelInputTitle: "Ký tự hợp lệ: chữ cái, số, -, _, . (tối đa 64 ký tự).",
+      channelJoin: "Vào",
+      channelJoinTitle: "Lưu tên channel này và kết nối lại tới MCP server.",
+      channelCancelTitle: "Hủy đổi channel",
+      channelCopyPrefix: "Bấm để copy \"",
+      channelWaiting: "Đang chờ server cấp tên channel",
+      copied: "đã copy!",
+      tokenLabel: "REST Token (PAT)",
+      tokenTitle: "Personal Access Token của Figma. Chỉ lưu trên máy này (figma.clientStorage); MCP server giữ trong RAM để đọc link file chưa mở, comments và lịch sử phiên bản.",
+      tokenInputTitle: "Dán Figma Personal Access Token (figd_…). Lưu cục bộ trong figma.clientStorage, không lưu vào file Figma.",
+      tokenPasteFirst: "hãy dán token figd_… trước",
+      tokenExpiryTitle: "Thời hạn bạn đã chọn khi tạo token trên Figma. API Figma không trả về hạn dùng nên bảng sẽ tự đếm ngược từ mốc này.",
+      expUnknown: "Hạn: ?", exp1: "1 ngày", exp7: "7 ngày", exp30: "30 ngày", exp90: "90 ngày",
+      tokenSave: "Lưu",
+      tokenSaveTitle: "Lưu token cục bộ và xác thực với MCP server (/v1/me).",
+      tokenClear: "Xóa",
+      tokenClearTitle: "Xóa REST token đã lưu khỏi máy này và RAM của server.",
+      sessionsLabel: "Phiên AI",
+      sessionsTitle: "Mỗi dòng là một phiên Claude Code / Codex. Bấm Kết nối để điều hướng lệnh về cửa sổ này.",
+      noSessions: "Chưa có phiên AI nào.",
+      here: "✓ ở đây",
+      hereTitle: "Đang gắn với cửa sổ này",
+      auto: "tự động",
+      autoTitle: "Chỉ mở một cửa sổ — lệnh tự động đi về đây",
+      pairedWith: "Đang gắn với channel ",
+      moveHere: "Chuyển về đây",
+      connect: "Kết nối",
+      writes: "Ghi",
+      writesTitle: "Số thao tác ghi lên canvas hoặc REST API trong phiên này.",
+      reads: "Đọc",
+      readsTitle: "Số thao tác đọc từ canvas hoặc REST API trong phiên này.",
+      errors: "Lỗi",
+      errorsTitle: "Số thao tác bị lỗi (canvas hoặc REST API) trong phiên này.",
+      activityLabel: "Hoạt động",
+      activityTitle: "Nhật ký thời gian thực các lệnh plugin và [REST] kèm thời gian chạy.",
+      noActivity: "Chưa có hoạt động nào.",
+      clearBtn: "Xóa log",
+      clearBtnTitle: "Xóa nhật ký Hoạt động và đặt lại bộ đếm Ghi/Đọc/Lỗi về 0.",
+      autodetectBtn: "Tự dò port",
+      autodetectBtnTitle: "Quét ngay dải port 38470–38479 để tìm và kết nối lại MCP server.",
+      reconnectBtn: "Kết nối lại",
+      reconnectBtnTitle: "Đóng kết nối hiện tại và kết nối lại MCP server ngay lập tức.",
+      foot: "Kết nối tới cầu nối Figma Plugin MCP cục bộ (localhost:38470 +9).",
+      gripTitle: "Kéo để đổi kích thước",
+      notSet: "Chưa đặt",
+      checking: "Đang kiểm tra…",
+      unverified: "Đã lưu (chưa kiểm tra)",
+      expiredDate: "Hết hạn? (quá ngày)",
+      valid: "Hợp lệ",
+      expiredInvalid: "Hết hạn / Không hợp lệ",
+      rateLimited: "Quá giới hạn (429)",
+      checkFailed: "Kiểm tra thất bại",
+      retryIn: "thử lại sau ",
+      expired: "hết hạn",
+      leftSuffix: " còn lại",
+      agoSuffix: " trước",
+      connecting: "Đang kết nối…",
+      connected: "Đã kết nối",
+      autodetecting: "Đang tự dò port…",
+      noToken: "Chưa có token",
+      tokenPrefix: "Token ",
+      missingScopes: "Thiếu quyền: ",
+      scopes: "Quyền: ",
+      expires: "Hết hạn ",
+    }
+  };
+
+  var lang = "en";
+  try {
+    var savedLang = typeof localStorage !== "undefined" && localStorage.getItem("figma_mcp_ui_lang");
+    if (savedLang === "vi" || savedLang === "en") lang = savedLang;
+  } catch (e) {}
+
+  function t(key) {
+    return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
+  }
+
+  function applyLang(next) {
+    if (next === "vi" || next === "en") lang = next;
+    try { if (typeof localStorage !== "undefined") localStorage.setItem("figma_mcp_ui_lang", lang); } catch (e) {}
+    if (el.langEn) el.langEn.className = "lang-btn" + (lang === "en" ? " active" : "");
+    if (el.langVi) el.langVi.className = "lang-btn" + (lang === "vi" ? " active" : "");
+
+    if (!hello && el.file) el.file.textContent = t("subtitleDefault");
+    if (el.statusRow) el.statusRow.title = t("statusRowTitle");
+    if (el.port) el.port.title = t("portTitle");
+    if (el.channelLabel) { el.channelLabel.textContent = t("channelLabel"); el.channelLabel.title = t("channelTitle"); }
+    if (el.channelEdit) { el.channelEdit.textContent = t("channelChange"); el.channelEdit.title = t("channelChangeTitle"); }
+    if (el.channelInput) { el.channelInput.placeholder = t("channelInputPlaceholder"); el.channelInput.title = t("channelInputTitle"); }
+    if (el.channelJoin) { el.channelJoin.textContent = t("channelJoin"); el.channelJoin.title = t("channelJoinTitle"); }
+    if (el.channelCancel) el.channelCancel.title = t("channelCancelTitle");
+    if (el.tokenLabel) { el.tokenLabel.textContent = t("tokenLabel"); el.tokenLabel.title = t("tokenTitle"); }
+    if (el.tokenInput) el.tokenInput.title = t("tokenInputTitle");
+    if (el.tokenExpiry) el.tokenExpiry.title = t("tokenExpiryTitle");
+    if (el.optExpUnknown) el.optExpUnknown.textContent = t("expUnknown");
+    if (el.optExp1) el.optExp1.textContent = t("exp1");
+    if (el.optExp7) el.optExp7.textContent = t("exp7");
+    if (el.optExp30) el.optExp30.textContent = t("exp30");
+    if (el.optExp90) el.optExp90.textContent = t("exp90");
+    if (el.tokenSave) { el.tokenSave.textContent = t("tokenSave"); el.tokenSave.title = t("tokenSaveTitle"); }
+    if (el.tokenClear) { el.tokenClear.textContent = t("tokenClear"); el.tokenClear.title = t("tokenClearTitle"); }
+    if (el.sessionsLabel) el.sessionsLabel.title = t("sessionsTitle");
+    if (el.sessionsLabelText) el.sessionsLabelText.textContent = t("sessionsLabel");
+    if (el.statWritesCard) el.statWritesCard.title = t("writesTitle");
+    if (el.statReadsCard) el.statReadsCard.title = t("readsTitle");
+    if (el.statErrorsCard) el.statErrorsCard.title = t("errorsTitle");
+    if (el.statWritesLabel) el.statWritesLabel.textContent = t("writes");
+    if (el.statReadsLabel) el.statReadsLabel.textContent = t("reads");
+    if (el.statErrorsLabel) el.statErrorsLabel.textContent = t("errors");
+    if (el.activityLabel) { el.activityLabel.textContent = t("activityLabel"); el.activityLabel.title = t("activityTitle"); }
+    if (el.activityEmpty) el.activityEmpty.textContent = t("noActivity");
+    if (el.clear) { el.clear.textContent = t("clearBtn"); el.clear.title = t("clearBtnTitle"); }
+    if (el.autodetect) { el.autodetect.textContent = t("autodetectBtn"); el.autodetect.title = t("autodetectBtnTitle"); }
+    if (el.retry) { el.retry.textContent = t("reconnectBtn"); el.retry.title = t("reconnectBtnTitle"); }
+    if (el.foot) el.foot.textContent = t("foot");
+    if (el.grip) el.grip.title = t("gripTitle");
+
+    if (lastStateKind) setState(lastStateKind, lastStateRawText);
+    renderToken();
+    renderMeta();
+    if (channelsUpdate) renderAgents();
+    else if (el.agentsEmpty) el.agentsEmpty.textContent = t("noSessions");
+  }
+
   function humanLeft(ms) {
-    if (ms <= 0) return "expired";
-    if (ms < 3600000) return Math.max(1, Math.round(ms / 60000)) + "m left";
-    if (ms < 172800000) return Math.round(ms / 3600000) + "h left";
-    return Math.round(ms / 86400000) + "d left";
+    if (ms <= 0) return t("expired");
+    if (ms < 3600000) return Math.max(1, Math.round(ms / 60000)) + "m" + t("leftSuffix");
+    if (ms < 172800000) return Math.round(ms / 3600000) + "h" + t("leftSuffix");
+    return Math.round(ms / 86400000) + "d" + t("leftSuffix");
   }
 
   // ---- REST token badge ----
   // Not set · Checking… · Valid (@handle) · Expired / Invalid (401/403) · Rate-limited (429)
   function restBadge(st) {
-    if (!st || st.state === "not_set") return { cls: "", text: "Not set" };
+    if (!st || st.state === "not_set") return { cls: "", text: t("notSet") };
     var env = st.source === "env" ? " · env" : "";
     switch (st.state) {
-      case "checking": return { cls: "warn", text: "Checking…" };
-      case "unverified": return { cls: "warn", text: "Set (not checked)" + env };
+      case "checking": return { cls: "warn", text: t("checking") };
+      case "unverified": return { cls: "warn", text: t("unverified") + env };
       case "valid": {
         var exp = st.expiresAt || restExpiresAt;
         if (exp) {
           var left = exp - Date.now();
           // Figma has not refused it yet, but the date the user gave has passed.
-          if (left <= 0) return { cls: "bad", text: "Expired? (date passed)" + env };
-          var name = st.handle ? "Valid (@" + st.handle + ")" : "Valid";
+          if (left <= 0) return { cls: "bad", text: t("expiredDate") + env };
+          var name = st.handle ? t("valid") + " (@" + st.handle + ")" : t("valid");
           return { cls: left < 86400000 ? "warn" : "ok", text: name + " · " + humanLeft(left) + env };
         }
-        return { cls: st.missingScopes && st.missingScopes.length ? "warn" : "ok", text: (st.handle ? "Valid (@" + st.handle + ")" : "Valid") + env };
+        return { cls: st.missingScopes && st.missingScopes.length ? "warn" : "ok", text: (st.handle ? t("valid") + " (@" + st.handle + ")" : t("valid")) + env };
       }
-      case "invalid": return { cls: "bad", text: "Expired / Invalid (" + (st.httpStatus || "401/403") + ")" + env };
+      case "invalid": return { cls: "bad", text: t("expiredInvalid") + " (" + (st.httpStatus || "401/403") + ")" + env };
       case "rate_limited": {
         var wait = st.retryAt ? st.retryAt - Date.now() : 0;
-        return { cls: "warn", text: "Rate-limited (429)" + (wait > 0 ? " · retry in " + humanLeft(wait).replace(" left", "") : "") + env };
+        return { cls: "warn", text: t("rateLimited") + (wait > 0 ? " · " + t("retryIn") + humanLeft(wait).replace(t("leftSuffix"), "") : "") + env };
       }
-      case "error": return { cls: "bad", text: "Check failed" + env };
+      case "error": return { cls: "bad", text: t("checkFailed") + env };
       default: return { cls: "", text: String(st.state) };
     }
   }
@@ -452,12 +698,12 @@
     var b = restBadge(restStatus);
     el.tokenBadge.className = "token-badge" + (b.cls ? " " + b.cls : "");
     el.tokenBadge.textContent = b.text;
-    var title = restStatus && restStatus.masked ? "Token " + restStatus.masked : "No token";
+    var title = restStatus && restStatus.masked ? t("tokenPrefix") + restStatus.masked : t("noToken");
     if (restStatus && restStatus.message) title += " — " + restStatus.message;
-    if (restStatus && restStatus.missingScopes && restStatus.missingScopes.length) title += "\nMissing scopes: " + restStatus.missingScopes.join(", ");
-    if (restStatus && restStatus.scopes && restStatus.scopes.length) title += "\nScopes: " + restStatus.scopes.join(", ");
+    if (restStatus && restStatus.missingScopes && restStatus.missingScopes.length) title += "\n" + t("missingScopes") + restStatus.missingScopes.join(", ");
+    if (restStatus && restStatus.scopes && restStatus.scopes.length) title += "\n" + t("scopes") + restStatus.scopes.join(", ");
     var expAt = (restStatus && restStatus.expiresAt) || restExpiresAt;
-    if (expAt) title += "\nExpires " + new Date(expAt).toLocaleString();
+    if (expAt) title += "\n" + t("expires") + new Date(expAt).toLocaleString();
     el.tokenBadge.title = title;
   }
 
@@ -484,9 +730,22 @@
     logRow(text, e.ok ? (isWrite ? "write" : "read") : "error", "REST");
   }
 
+  var lastStateKind = "";
+  var lastStateRawText = "";
+  function translateStatus(text) {
+    if (lang === "en") return text;
+    if (text === "Connected") return t("connected");
+    if (text === "Connecting…") return t("connecting");
+    if (text === "Auto-detecting…") return t("autodetecting");
+    return text.replace(/^Connecting to :(\d+)…$/, "Đang kết nối :$1…")
+               .replace(/^No answer on :(\d+)$/, "Không phản hồi tại :$1");
+  }
+
   function setState(kind, text) {
+    lastStateKind = kind;
+    lastStateRawText = text;
     el.dot.className = "dot " + kind;
-    el.status.textContent = text;
+    el.status.textContent = translateStatus(text);
   }
 
   function renderMeta() {
@@ -495,14 +754,14 @@
       el.file.textContent = (hello.fileName || "?") + " · " + (hello.pageName || "");
     }
     el.channelChip.textContent = channel || "—";
-    el.channelChip.title = channel ? "Click to copy \"" + channel + "\"" : "Waiting for the server to assign a channel";
+    el.channelChip.title = channel ? t("channelCopyPrefix") + channel + "\"" : t("channelWaiting");
   }
 
   function humanAge(ms) {
     if (ms < 0 || ms == null) return "";
-    if (ms < 60000) return Math.max(1, Math.round(ms / 1000)) + "s ago";
-    if (ms < 3600000) return Math.round(ms / 60000) + "m ago";
-    return Math.round(ms / 3600000) + "h ago";
+    if (ms < 60000) return Math.max(1, Math.round(ms / 1000)) + "s" + t("agoSuffix");
+    if (ms < 3600000) return Math.round(ms / 60000) + "m" + t("agoSuffix");
+    return Math.round(ms / 3600000) + "h" + t("agoSuffix");
   }
 
   // Render the agent-session picker from the latest server push. Each row is
@@ -515,7 +774,7 @@
     if (sessions.length === 0) {
       var empty = document.createElement("div");
       empty.className = "agents-empty";
-      empty.textContent = "No AI sessions yet.";
+      empty.textContent = t("noSessions");
       el.agents.appendChild(empty);
       return;
     }
@@ -551,27 +810,27 @@
       if (s.boundChannel === self) {
         var here = document.createElement("span");
         here.className = "agent-state-here";
-        here.textContent = "✓ here";
-        here.title = "Pinned to this window";
+        here.textContent = t("here");
+        here.title = t("hereTitle");
         row.appendChild(here);
       } else if (!s.boundChannel && windowCount <= 1) {
         // Single window: everything routes here anyway — no button needed.
         var auto = document.createElement("span");
         auto.className = "agent-meta";
-        auto.textContent = "auto";
-        auto.title = "Only window open — commands route here automatically";
+        auto.textContent = t("auto");
+        auto.title = t("autoTitle");
         row.appendChild(auto);
       } else {
         if (s.boundChannel) {
           var other = document.createElement("span");
           other.className = "agent-state-other";
           other.textContent = "→ " + windowLabel(s.boundChannel);
-          other.title = "Paired with channel " + s.boundChannel;
+          other.title = t("pairedWith") + s.boundChannel;
           row.appendChild(other);
         }
         var btn = document.createElement("button");
         btn.className = "mini primary";
-        btn.textContent = s.boundChannel ? "Move here" : "Connect";
+        btn.textContent = s.boundChannel ? t("moveHere") : t("connect");
         btn.onclick = function () {
           if (ws && ws.readyState === 1) {
             ws.send(JSON.stringify({ type: "bind", sessionId: s.id }));
@@ -622,7 +881,7 @@
     var empty = document.createElement("div");
     empty.className = "activity-empty";
     empty.id = "activity-empty";
-    empty.textContent = "No activity yet.";
+    empty.textContent = t("noActivity");
     el.activity.appendChild(empty);
     el.activityEmpty = empty;
   }
@@ -1030,7 +1289,7 @@
     try { document.execCommand("copy"); } catch (e) {}
     document.body.removeChild(ta);
     var old = el.channelChip.textContent;
-    el.channelChip.textContent = "copied!";
+    el.channelChip.textContent = t("copied");
     setTimeout(function () { el.channelChip.textContent = channel || old; }, 900);
   };
 
@@ -1066,7 +1325,7 @@
   el.tokenSave.onclick = function () {
     var v = (el.tokenInput.value || "").trim();
     if (!v) {
-      el.tokenInput.placeholder = "paste a figd_… token first";
+      el.tokenInput.placeholder = t("tokenPasteFirst");
       return;
     }
     restStatus = { state: "checking", source: "plugin" };
@@ -1082,6 +1341,9 @@
     if (e.key === "Enter") el.tokenSave.onclick();
   };
   renderToken();
+  if (el.langEn) el.langEn.onclick = function () { applyLang("en"); };
+  if (el.langVi) el.langVi.onclick = function () { applyLang("vi"); };
+  applyLang(lang);
   // The countdown moves on its own.
   setInterval(function () { if (restStatus && restStatus.state === "valid") renderToken(); }, 60000);
 
