@@ -422,7 +422,8 @@
   var pendingStatus = null;        // the badge before a Save, restored if the Save is refused
   var restAnswerTimer = null;      // armed when the token is sent; any rest_status disarms it
   var aiKeys = {};                 // AI keys from clientStorage (main thread); sent to the server, never shown
-  var aiSavedAt = null;            // when they were last saved; the server keeps the newest
+  var aiSavedAt = null;            // when they were last saved
+  var aiSavedAtBy = {};            // per provider: the server merges each provider by its own time
   var aiStatus = null;             // latest ai_status from the server (masked previews only)
   var assignedSock = null;         // the socket that received `assigned` — only it may carry the token
   var langChosen = false;          // the user clicked a language; a late stored value must not undo it
@@ -521,6 +522,9 @@
       aiSaveTitle: "Save this provider's key locally and hand it to the MCP server.",
       aiClearTitle: "Remove this provider's key from this machine and server memory.",
       aiFromEnv: " (server env)",
+      aiRejectedShort: "Not saved",
+      aiPlaceholder: "API key",
+      aiInputTitle: "Paste the provider's API key. Stored locally in figma.clientStorage, never in the Figma file.",
       sessionsLabel: "AI sessions",
       sessionsTitle: "Each row is one Claude Code / Codex instance. Connect routes its commands to this window.",
       noSessions: "No AI sessions yet.",
@@ -606,6 +610,9 @@
       aiSaveTitle: "Lưu key của provider này trên máy và gửi cho MCP server.",
       aiClearTitle: "Xóa key của provider này khỏi máy và RAM của server.",
       aiFromEnv: " (env của server)",
+      aiRejectedShort: "Chưa lưu",
+      aiPlaceholder: "API key",
+      aiInputTitle: "Dán API key của provider. Lưu cục bộ trong figma.clientStorage, không lưu vào file Figma.",
       sessionsLabel: "Phiên AI",
       sessionsTitle: "Mỗi dòng là một phiên Claude Code / Codex. Bấm Kết nối để điều hướng lệnh về cửa sổ này.",
       noSessions: "Chưa có phiên AI nào.",
@@ -817,16 +824,28 @@
 
   // ---- AI keys ----
   var AI_NAMES = { openai: "OpenAI", gemini: "Gemini", flux: "Flux", anthropic: "Anthropic" };
-  function maskAi(k) { return k.length < 12 ? "••••" : k.slice(0, 3) + "…" + k.slice(-4); }
+  function maskAi(k) { return k.length < 24 ? "••••" : k.slice(0, 3) + "…" + k.slice(-4); }
   function sendAiKeys() {
     if (!(ws && ws.readyState === 1 && assignedSock === ws)) return;
     if (!aiSavedAt) return;
     var keys = {};
     for (var p in AI_NAMES) keys[p] = typeof aiKeys[p] === "string" ? aiKeys[p] : null;
-    ws.send(JSON.stringify({ type: "set_ai_keys", keys: keys, savedAt: aiSavedAt }));
+    ws.send(JSON.stringify({ type: "set_ai_keys", keys: keys, savedAt: aiSavedAt, savedAtBy: aiSavedAtBy }));
+  }
+  var aiError = null;              // the last refusal, shown on the badge until the next change
+  function resetAiHints() {
+    aiError = null;
+    el.aiInput.placeholder = t("aiPlaceholder");
+    el.aiInput.title = t("aiInputTitle");
   }
   function renderAi() {
     if (!el.aiBadge) return;
+    if (aiError) {
+      el.aiBadge.className = "token-badge bad";
+      el.aiBadge.textContent = t("aiRejectedShort");
+      el.aiBadge.title = aiError;
+      return;
+    }
     // The server's view when we have it (it also knows keys from its env);
     // until then, what this panel holds.
     var list = [];
@@ -1143,14 +1162,21 @@
       }
       case "ai-keys": {
         if (msg.reason === "rejected") {
-          // Keep what was typed: one wrong character should be fixable, not retyped.
-          el.aiInput.placeholder = msg.error || t("aiRejected");
-          el.aiInput.title = msg.error || t("aiRejected");
+          // Keep what was typed: one wrong character should be fixable, not
+          // retyped. A placeholder does not show over typed text, so the
+          // refusal goes on the badge until the next change.
+          aiError = msg.error || t("aiRejected");
+          el.aiInput.title = aiError;
+          renderAi();
           break;
         }
         aiKeys = msg.keys && typeof msg.keys === "object" ? msg.keys : {};
         aiSavedAt = typeof msg.savedAt === "number" ? msg.savedAt : null;
-        if (msg.reason === "saved") el.aiInput.value = "";
+        aiSavedAtBy = msg.savedAtBy && typeof msg.savedAtBy === "object" ? msg.savedAtBy : {};
+        if (msg.reason === "saved") {
+          el.aiInput.value = "";
+          resetAiHints();
+        }
         renderAi();
         sendAiKeys();
         break;
@@ -1525,6 +1551,7 @@
       el.aiInput.placeholder = t("aiPasteFirst");
       return;
     }
+    if (aiError) { aiError = null; renderAi(); }
     toMain({ kind: "save-ai-key", provider: el.aiProvider.value, key: v });
   };
   el.aiClear.onclick = function () {
@@ -1533,6 +1560,10 @@
   };
   el.aiInput.onkeydown = function (e) {
     if (e.key === "Enter") el.aiSave.onclick();
+  };
+  el.aiInput.oninput = function () {
+    if (aiError) resetAiHints();
+    renderAi();
   };
   renderAi();
   renderToken();

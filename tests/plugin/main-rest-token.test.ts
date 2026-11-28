@@ -88,3 +88,27 @@ describe("main.ts REST token handlers", () => {
     await vi.waitFor(() => expect(lastOf("ui-lang")).toEqual({ kind: "ui-lang", lang: "vi" }));
   });
 });
+
+describe("main.ts AI key handlers", () => {
+  const A = "sk-openai-abcdefghijklmnopqrstu";
+  const B = "AIza-gemini-abcdefghijklmnopqrs";
+
+  it("two Saves sent back to back both land (saves run one at a time)", async () => {
+    store.delete("figma-plugin:ai-keys");
+    // Not awaited between: two clicks, or two windows, in quick succession.
+    void send({ kind: "save-ai-key", provider: "openai", key: A });
+    void send({ kind: "save-ai-key", provider: "gemini", key: B });
+    await send({ kind: "ai-keys-request" }); // waits for the queued saves
+    expect(lastOf("ai-keys")).toMatchObject({ reason: "sync", keys: { openai: A, gemini: B } });
+    const by = (lastOf("ai-keys") as { savedAtBy: Record<string, number> }).savedAtBy;
+    expect(by.gemini).toBeGreaterThan(by.openai!);
+  });
+
+  it("a bad key is refused with a reason and nothing is stored", async () => {
+    const before = JSON.stringify(store.get("figma-plugin:ai-keys"));
+    await send({ kind: "save-ai-key", provider: "flux", key: "has a space" });
+    await send({ kind: "ai-keys-request" });
+    expect([...posted].reverse().find((m) => m.kind === "ai-keys" && m.reason === "rejected")).toMatchObject({ error: expect.stringMatching(/API key/) });
+    expect(JSON.stringify(store.get("figma-plugin:ai-keys"))).toBe(before);
+  });
+});

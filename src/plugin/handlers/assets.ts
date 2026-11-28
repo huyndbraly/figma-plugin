@@ -97,8 +97,6 @@ export async function loadImage(ctx: HandlerContext): Promise<unknown> {
   const image = figma.createImage(base64ToBytes(b64));
   const { width, height } = await image.getSizeAsync();
 
-  if (typeof p.replaceId === "string" && p.replaceId) return replaceImageFill(ctx, p.replaceId, image, { w: width, h: height });
-
   const rect = figma.createRectangle();
   rect.name = typeof p.name === "string" ? p.name : "image";
   const w = typeof p.w === "number" ? p.w : width;
@@ -110,11 +108,6 @@ export async function loadImage(ctx: HandlerContext): Promise<unknown> {
     | "CROP"
     | "TILE";
   rect.fills = [{ type: "IMAGE", scaleMode, imageHash: image.hash }];
-
-  if (typeof p.besideId === "string" && p.besideId) {
-    await placeBeside(ctx, rect, p.besideId, typeof p.w === "number" || typeof p.h === "number");
-    return { id: rect.id, imageSize: { w: width, h: height }, besideId: p.besideId, node: serializeNode(rect, "compact") };
-  }
 
   const parent = await resolveParent(p.parentId);
   const frame = parentFrame(parent);
@@ -128,67 +121,6 @@ export async function loadImage(ctx: HandlerContext): Promise<unknown> {
     imageSize: { w: width, h: height },
     node: serializeNode(rect, "compact"),
   };
-}
-
-/** Gap between an original and the copy placed beside it. */
-const BESIDE_GAP = 24;
-
-/**
- * Put a new image layer right of `refId`, at the reference's size, in the
- * reference's parent (just above it in the layer list). An auto-layout parent
- * places it itself; on a page or section it then keeps clear of everything else.
- */
-async function placeBeside(ctx: HandlerContext, rect: RectangleNode, refId: string, sized: boolean): Promise<void> {
-  const ref = await getNodeByIdSafe(refId);
-  if (!ref || !("parent" in ref) || !ref.parent || ref.type === "PAGE" || ref.type === "DOCUMENT") {
-    rect.remove();
-    throw err(ErrorCode.NODE_NOT_FOUND, `Node ${refId} was not found (or is a page).`, "Read the selection again (get_selection) and pass a layer id.");
-  }
-  const scene = ref as SceneNode;
-  if (!sized && "width" in scene && scene.width > 0 && scene.height > 0) rect.resize(scene.width, scene.height);
-  const parent = scene.parent as BaseNode & ChildrenMixin;
-  let into: BaseNode & ChildrenMixin = parent;
-  try {
-    parent.insertChild(parent.children.indexOf(scene) + 1, rect);
-  } catch {
-    // Inside an instance (or anything else that takes no new children): the
-    // page, at the reference's absolute position.
-    into = figma.currentPage;
-    figma.currentPage.appendChild(rect);
-  }
-  const managed = "layoutMode" in into && (into as FrameNode).layoutMode !== "NONE";
-  if (!managed) {
-    const box = into === parent ? { x: scene.x, y: scene.y } : { x: scene.absoluteTransform[0][2], y: scene.absoluteTransform[1][2] };
-    rect.x = box.x + scene.width + BESIDE_GAP;
-    rect.y = box.y;
-  }
-  keepClearOnCanvas(rect, ctx.params, ctx);
-}
-
-/**
- * Swap the picture of an existing image layer (removeBackground mode
- * "replace"). The new image is a render of the WHOLE layer, so its old fills
- * all go; a layer with children is refused — they would show twice.
- */
-async function replaceImageFill(ctx: HandlerContext, id: string, image: Image, size: { w: number; h: number }): Promise<unknown> {
-  const node = await getNodeByIdSafe(id);
-  if (!node || !("fills" in node)) {
-    throw err(ErrorCode.NODE_NOT_FOUND, `Node ${id} was not found or has no fills.`, "Use mode \"beside\" for groups and other layers without fills.");
-  }
-  const fills = (node as GeometryMixin).fills;
-  if (!Array.isArray(fills) || !fills.some((f: Paint) => f.type === "IMAGE")) {
-    throw err(ErrorCode.INVALID_PARAMS, `"${node.name}" has no image fill to replace.`, "Use mode \"beside\" (the default): it places the cut-out next to the original.");
-  }
-  if ("children" in node && (node as ChildrenMixin).children.some((c) => c.visible)) {
-    throw err(ErrorCode.INVALID_PARAMS, `"${node.name}" has visible children, which the cut-out already contains.`, "Use mode \"beside\", or run it on the image layer itself.");
-  }
-  (node as GeometryMixin).fills = [{ type: "IMAGE", scaleMode: "FILL", imageHash: image.hash }];
-  const strokes = "strokes" in node ? (node as GeometryMixin).strokes : [];
-  const effects = "effects" in node ? (node as BlendMixin).effects : [];
-  if ((Array.isArray(strokes) && strokes.length) || (Array.isArray(effects) && effects.length)) {
-    ctx.warn(`"${node.name}" has strokes or effects; they were rendered into the cut-out too and now show twice — remove them from the layer if so.`);
-  }
-  return { id: node.id, replaced: true, imageSize: size, node: serializeNode(node as SceneNode, "compact") };
 }
 
 /**

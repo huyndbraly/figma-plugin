@@ -1,23 +1,20 @@
 /**
  * Module 1 of the Claude Desktop upgrade (2026-11-27): images from a file or
- * URL without base64 in the agent's context, local background removal, and
- * BYOK image generation with keys from the plugin panel (OpenAI, Gemini, Flux).
+ * URL without base64 in the agent's context, and BYOK image generation with keys from the plugin panel (OpenAI, Gemini, Flux).
  */
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, mkdir, chmod } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { MAX_IMAGE_FILE_BYTES, readImageFile, resolveImagePath, sniffImage } from "../../src/server/image-file.js";
-import { loadBackgroundRemover, removeBackgroundPng, resetBackgroundRemover, type BackgroundRemover } from "../../src/server/bg-removal.js";
-import { chooseImageProvider, generateImage, loadByokConfig } from "../../src/server/byok.js";
+import { MAX_IMAGE_FILE_BYTES, looksLikeImagePath, readImageFile, resolveImagePath, sniffImage } from "../../src/server/image-file.js";
+import { chooseImageProvider, generateImage, loadByokConfig, readByokFile } from "../../src/server/byok.js";
 import { AiKeyStore } from "../../src/server/ai-keys.js";
 import { cleanAiKeySet, maskAiKey } from "../../src/shared/ai-key.js";
 import { executeWrite } from "../../src/server/executor.js";
 import { SessionRegistry } from "../../src/server/session.js";
 import { Bridge } from "../../src/server/bridge.js";
-import { validateOperation } from "../../src/server/validate.js";
 import type { BridgeResponse, WireMessage } from "../../src/shared/protocol.js";
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
@@ -25,14 +22,12 @@ const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16]);
 const GIF = Buffer.from("GIF89a\u0001\u0000", "latin1");
 const WEBP = Buffer.concat([Buffer.from("RIFF"), Buffer.from([0, 0, 0, 0]), Buffer.from("WEBPVP8 ")]);
 const PNG_B64 = PNG.toString("base64");
-const CUT = Buffer.concat([PNG, Buffer.from("cut-out")]);
 
 const ok = (result: unknown): BridgeResponse => ({ id: "x", ok: true, result });
 
 let dir: string;
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "figma-media-"));
-  resetBackgroundRemover();
 });
 afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
@@ -146,110 +141,63 @@ describe("figma.loadImage without base64 in the agent's context", () => {
     expect(sent).toContain(GIF.toString("base64"));
     expect(sent).not.toContain("filePath");
   });
-
-  it("load_image validates replaceId / besideId as node ids, one at a time", () => {
-    expect(() => validateOperation("load_image", { base64: "x", replaceId: "1:2", besideId: "1:3" })).toThrow(/OR besideId/);
-    expect(() => validateOperation("load_image", { base64: "x", besideId: "" })).toThrow();
-    expect(validateOperation("load_image", { base64: "x", besideId: "1:3" }).params).toMatchObject({ besideId: "1:3" });
-  });
-});
-
-// ---------------------------------------------------------------------------
-describe("removeBackground (local, optional package)", () => {
-  const remover: BackgroundRemover = async (png) => {
-    expect(sniffImage(png)).toBe("png");
-    return CUT;
-  };
-  const answer = (selection: Array<{ id: string; name: string }>) => (op: string) =>
-    op === "get_selection" ? { selection } : op === "export_node" ? { base64: PNG_B64, nodeId: "5:5" } : { id: "9:9", besideId: "5:5" };
-
-  it("selection → render → cut → placed BESIDE the original; no bytes in the result", async () => {
-    const { res, calls } = await write(`return await figma.removeBackground();`, { bgRemover: remover }, answer([{ id: "5:5", name: "Photo" }]));
-    expect(res.ok, JSON.stringify(res.error)).toBe(true);
-    expect(calls.map((c) => c[0])).toEqual(["get_selection", "export_node", "load_image"]);
-    expect(calls[1]![1]).toEqual({ nodeId: "5:5", format: "PNG", scale: 1 });
-    expect(calls[2]![1]).toEqual({ base64: CUT.toString("base64"), besideId: "5:5" });
-    expect(res.result).toMatchObject({ id: "9:9", mode: "beside", sourceId: "5:5", model: "medium" });
-    expect(JSON.stringify(res.result)).not.toContain(CUT.toString("base64"));
-  });
-
-  it("an id and mode replace swap the fill in place; scale is clamped", async () => {
-    const { res, calls } = await write(`return await figma.removeBackground("5:5", { mode: "replace", scale: 9, model: "small", name: "Cut" });`, { bgRemover: remover }, answer([]));
-    expect(res.ok, JSON.stringify(res.error)).toBe(true);
-    expect(calls[0]).toEqual(["export_node", { nodeId: "5:5", format: "PNG", scale: 4 }]);
-    expect(calls[1]![1]).toEqual({ base64: CUT.toString("base64"), name: "Cut", replaceId: "5:5" });
-  });
-
-  it("nothing or several selected: a clear error, no render", async () => {
-    const none = await write(`return await figma.removeBackground();`, { bgRemover: remover }, answer([]));
-    expect(none.res.error?.message).toMatch(/Nothing is selected/);
-    const many = await write(`return await figma.removeBackground();`, { bgRemover: remover }, answer([{ id: "1:1", name: "A" }, { id: "1:2", name: "B" }]));
-    expect(many.res.error?.message).toMatch(/2 layers are selected/);
-    expect(many.res.error?.hint).toContain("1:2 (B)");
-    expect([...none.calls, ...many.calls].some((c) => c[0] === "export_node")).toBe(false);
-  });
-
-  it("an unknown mode is refused", async () => {
-    const { res } = await write(`return await figma.removeBackground("5:5", { mode: "erase" });`, { bgRemover: remover });
-    expect(res.error?.message).toMatch(/"beside" or "replace"/);
-  });
-
-  it("package not installed: UNSUPPORTED_OPERATION with the install line, before anything is rendered", async () => {
-    const r = await loadBackgroundRemover(async () => {
-      throw new Error("Cannot find package");
-    }).catch((e) => e);
-    expect(r).toMatchObject({ code: "UNSUPPORTED_OPERATION" });
-    expect(r.hint).toContain("npm i @imgly/background-removal-node");
-  });
-
-  it("wraps the package's API: a Blob in, PNG bytes out; a load failure is not cached", async () => {
-    await loadBackgroundRemover(async () => ({})).catch(() => {});
-    const seen: unknown[] = [];
-    const rm = await loadBackgroundRemover(async () => ({
-      default: {
-        removeBackground: async (input: Blob, cfg: unknown) => {
-          seen.push(input.type, cfg);
-          return new Blob([CUT]);
-        },
-      },
-    }));
-    expect(Buffer.from(await rm(PNG, { model: "small" }))).toEqual(CUT);
-    expect(seen).toEqual(["image/png", { model: "small", output: { format: "image/png" } }]);
-  });
-
-  it("a remover that returns no PNG, or throws, is reported plainly", async () => {
-    await expect(removeBackgroundPng(PNG, async () => JPEG)).rejects.toThrow(/not a PNG/);
-    await expect(removeBackgroundPng(PNG, async () => {
-      throw new Error("onnx exploded\nstack");
-    })).rejects.toThrow(/Background removal failed: onnx exploded$/);
-    await expect(removeBackgroundPng(JPEG, remover)).rejects.toThrow(/render of the node was not a PNG/);
-  });
 });
 
 // ---------------------------------------------------------------------------
 describe("AI keys from the plugin panel", () => {
   const K = "sk-panel-abcdefghijklmnop";
+  const K2 = "AIza-second-key-qrstuvwxyz";
 
-  it("keeps only known providers with clean keys, masks them, newest savedAt wins", () => {
+  it("keeps only known providers with clean keys; masks show nothing of a short key", () => {
     expect(cleanAiKeySet({ openai: K, gemini: "x", evil: K, flux: "has space inside" })).toEqual({ openai: K });
     expect(maskAiKey(K)).toBe("sk-…mnop");
-    const s = new AiKeyStore();
-    let changes = 0;
-    s.onChange(() => changes++);
-    expect(s.set({ openai: K }, 10)).toBe(true);
-    expect(s.set({ openai: null }, 5)).toBe(false); // an older window's cache
-    expect(s.get("openai")).toBe(K);
-    expect(s.set({ openai: K }, 11)).toBe(true);
-    expect(changes).toBe(1); // same keys again: no broadcast
-    s.set({ gemini: K }, 12);
-    expect(s.get("openai")).toBeUndefined();
-    expect(s.status({ anthropic: "sk-env-0000000000000" })).toEqual({
+    expect(maskAiKey("sk-short-key-12345")).toBe("••••"); // 18 chars: 7 shown would be too much
+    const s = new AiKeyStore(() => 1_000);
+    s.set({ gemini: K }, 10, { gemini: 10 });
+    expect(s.status({ anthropic: "sk-env-00000000000000000000" })).toEqual({
       providers: [
         { provider: "gemini", source: "plugin", masked: "sk-…mnop" },
         { provider: "anthropic", source: "env", masked: "sk-…0000" },
       ],
     });
     expect(JSON.stringify(s.status())).not.toContain(K);
+  });
+
+  it("merges per provider: a panel that never saved a provider does not erase another panel's key", () => {
+    const s = new AiKeyStore(() => 1_000);
+    let changes = 0;
+    s.onChange(() => changes++);
+    // Figma Desktop saved OpenAI at 10.
+    expect(s.set({ openai: K, gemini: null }, 10, { openai: 10 })).toBe(true);
+    // Figma in a browser (its own storage) saved Gemini at 20 and never touched OpenAI.
+    s.set({ openai: null, gemini: K2 }, 20, { gemini: 20 });
+    expect([s.get("openai"), s.get("gemini")]).toEqual([K, K2]);
+    // A real Clear of OpenAI (dated) does remove it; an older cache cannot bring it back.
+    s.set({ openai: null }, 30, { openai: 30 });
+    expect(s.get("openai")).toBeUndefined();
+    expect(s.set({ openai: K }, 15, { openai: 15 })).toBe(false);
+    expect(s.get("openai")).toBeUndefined();
+    // The same save sent again changes nothing (no broadcast).
+    const before = changes;
+    s.set({ gemini: K2 }, 20, { gemini: 20 });
+    expect(changes).toBe(before);
+  });
+
+  it("a time from the future is clamped to now, so it cannot pin a key against later saves", () => {
+    let now = 1_000;
+    const s = new AiKeyStore(() => now);
+    s.set({ openai: K }, 1e308, { openai: 1e308 });
+    now = 2_000;
+    expect(s.set({ openai: K2 }, 1_500, { openai: 1_500 })).toBe(true);
+    expect(s.get("openai")).toBe(K2);
+  });
+
+  it("a legacy message (no savedAtBy) still applies its savedAt to the providers it names", () => {
+    const s = new AiKeyStore(() => 1_000);
+    s.set({ openai: K }, 5);
+    expect(s.get("openai")).toBe(K);
+    s.set({ openai: null }, 4);
+    expect(s.get("openai")).toBe(K);
   });
 
   it("panel keys beat the environment; env names for Gemini and Flux are read", () => {
@@ -383,5 +331,142 @@ describe("image providers", () => {
     expect(calls[0]).toEqual(["load_image", { base64: PNG_B64, name: "hero", parentId: "1:1" }]);
     expect(res.result).toMatchObject({ provider: "gemini" });
     expect(JSON.stringify(res)).not.toContain(K);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("code review fixes (2026-11-28)", () => {
+  const K = "provider-key-SECRET-123456";
+  const PANEL = "sk-panel-abcdefghijklmnop";
+
+  it("a config file holding null / an array is refused as an OpError, not a TypeError later", async () => {
+    for (const body of ["null", "[1]", "42", "not json"]) {
+      const p = join(dir, "byok.json");
+      await writeFile(p, body);
+      expect(() => readByokFile({ FIGMA_MCP_BYOK_CONFIG: p } as NodeJS.ProcessEnv)).toThrow(/not a readable JSON object/);
+    }
+  });
+
+  it("a broken config file does not hide a panel or env key; with no key at all it is reported", async () => {
+    const p = join(dir, "byok.json");
+    await writeFile(p, "null");
+    const panel = new AiKeyStore(() => 1_000);
+    panel.set({ openai: PANEL }, 1, { openai: 1 });
+    expect(loadByokConfig({ FIGMA_MCP_BYOK_CONFIG: p } as NodeJS.ProcessEnv, panel).openaiApiKey).toBe(PANEL);
+    expect(loadByokConfig({ FIGMA_MCP_BYOK_CONFIG: p, GEMINI_API_KEY: "env-gemini-key" } as NodeJS.ProcessEnv, new AiKeyStore()).geminiApiKey).toBe("env-gemini-key");
+    expect(() => loadByokConfig({ FIGMA_MCP_BYOK_CONFIG: p } as NodeJS.ProcessEnv, new AiKeyStore())).toThrow(/not a readable JSON object/);
+  });
+
+  it("a set_ai_keys handler that throws does not take the process down; the bridge keeps serving", async () => {
+    const bridge = new Bridge({ onAiKeys: () => { throw new TypeError("boom"); } });
+    bridge.setAiStatusProvider(() => { throw new TypeError("boom too"); });
+    const port = await bridge.listen(0, "t");
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const msgs: WireMessage[] = [];
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      ws.on("message", (d) => msgs.push(JSON.parse(d.toString()) as WireMessage));
+      ws.send(JSON.stringify({ type: "hello", protocolVersion: 9, pluginVersion: "1", fileKey: null, fileName: "F", pageName: "P", editorType: "figma" }));
+      await new Promise((r) => setTimeout(r, 40));
+      ws.send(JSON.stringify({ type: "set_ai_keys", keys: { openai: PANEL }, savedAt: 1 }));
+      ws.send(JSON.stringify({ type: "ping" }));
+      await new Promise((r) => setTimeout(r, 40));
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      expect(msgs.some((m) => m.type === "assigned")).toBe(true);
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("Flux: \"Task not found\" right after submit is waited out, not a failure", async () => {
+    let polls = 0;
+    const out = await generateImage("x", { provider: "flux", sleep: async () => {} }, { fluxApiKey: K }, async (url) => {
+      if (url.includes("get_result")) return new Response(JSON.stringify(++polls === 1 ? { status: "Task not found" } : { status: "Ready", result: { sample: "https://delivery.bfl.ai/s.png" } }));
+      if (url.startsWith("https://delivery")) return new Response(PNG);
+      return new Response(JSON.stringify({ id: "j" }));
+    });
+    expect(out.provider).toBe("flux");
+    expect(polls).toBe(2);
+  });
+
+  it("Flux: a sample over the size cap is refused; a *.bfl.ml polling URL gets no key", async () => {
+    const big = await generateImage("x", { provider: "flux", sleep: async () => {} }, { fluxApiKey: K }, async (url) => {
+      if (url.includes("get_result")) return new Response(JSON.stringify({ status: "Ready", result: { sample: "https://delivery.bfl.ai/s.png" } }));
+      if (url.startsWith("https://delivery")) return new Response(PNG, { headers: { "content-length": String(MAX_IMAGE_FILE_BYTES + 1) } });
+      return new Response(JSON.stringify({ id: "j" }));
+    }).catch((e) => e);
+    expect(big.message).toMatch(/over 32 MB/);
+    const urls: string[] = [];
+    const ml = await generateImage("x", { provider: "flux", sleep: async () => {} }, { fluxApiKey: K }, async (url) => {
+      urls.push(url);
+      return new Response(JSON.stringify({ id: "j", polling_url: "https://api.bfl.ml/v1/get_result?id=j" }));
+    }).catch((e) => e);
+    expect(ml.message).toMatch(/outside bfl.ai/);
+    expect(urls).toHaveLength(1);
+  });
+
+  it("Flux: the whole call stops at its deadline, inside the figma_write budget", async () => {
+    const realNow = Date.now;
+    let t = realNow();
+    Date.now = () => t;
+    try {
+      const e = await generateImage("x", { provider: "flux", sleep: async (ms) => { t += ms * 10; } }, { fluxApiKey: K }, async (url) =>
+        new Response(JSON.stringify(url.includes("get_result") ? { status: "Pending" } : { id: "j" })),
+      ).catch((x) => x);
+      expect(e.message).toMatch(/did not finish within 90 s/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("transparent: OpenAI is asked for a transparent PNG; other providers are refused; no provider → OpenAI", async () => {
+    const bodies: any[] = [];
+    const fetchImpl = async (_u: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }));
+    };
+    const out = await generateImage("a mug", { transparent: true }, { geminiApiKey: K, openaiApiKey: K, imageProvider: "gemini" }, fetchImpl);
+    expect(out.provider).toBe("openai");
+    expect(bodies[0]).toMatchObject({ background: "transparent", output_format: "png" });
+    await expect(generateImage("x", { transparent: true, provider: "flux" }, { fluxApiKey: K }, fetchImpl)).rejects.toThrow(/Flux cannot make a transparent background/);
+    await expect(generateImage("x", { transparent: true }, { geminiApiKey: K }, fetchImpl)).rejects.toThrow(/No OpenAI key/);
+    const { res, calls } = await write(`return await figma.generateImage("mug", { transparent: true, parentId: "1:1" });`, { byok: { openaiApiKey: K }, aiFetch: fetchImpl });
+    expect(res.ok, JSON.stringify(res.error)).toBe(true);
+    expect(calls[0]).toEqual(["load_image", { base64: PNG_B64, name: "mug", parentId: "1:1" }]);
+  });
+
+  it("a positional plain path is read as a file (base64 never holds '.' or '~'); a JPEG's base64 stays base64", async () => {
+    expect(looksLikeImagePath("/Users/me/hero.png")).toBe(true);
+    expect(looksLikeImagePath("~/Pictures/a.png")).toBe(true);
+    expect(looksLikeImagePath("/9j/4AAQSkZJRgABAQ==")).toBe(false);
+    expect(looksLikeImagePath("iVBORw0KGgo=")).toBe(false);
+    const p = join(dir, "pos.png");
+    await writeFile(p, PNG);
+    const { res, calls } = await write(`return await figma.loadImage(${JSON.stringify(p)});`);
+    expect(res.ok, JSON.stringify(res.error)).toBe(true);
+    expect(calls[0]![1]).toEqual({ base64: PNG_B64 });
+    const jpegB64 = await write(`return await figma.loadImage("/9j/4AAQSkZJRgABAQ==");`);
+    expect(jpegB64.calls[0]![1]).toEqual({ base64: "/9j/4AAQSkZJRgABAQ==" });
+  });
+
+  it("a batch item with a non-string filePath / imageUrl gets a clear error, not 'requires base64'", async () => {
+    // Batch errors are per item, in the result.
+    const a = await write(`return await figma.batch([{ op: "load_image", params: { filePath: 123 } }]);`);
+    expect(JSON.stringify(a.res.result)).toMatch(/filePath must be a non-empty string/);
+    const b = await write(`return await figma.batch([{ op: "load_image", params: { imageUrl: {} } }]);`);
+    expect(JSON.stringify(b.res.result)).toMatch(/imageUrl must be an http\(s\) URL/);
+    expect(a.calls.concat(b.calls)).toEqual([]);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("a file stat can see but open cannot read is a clear permission error", async () => {
+    const p = join(dir, "locked.png");
+    await writeFile(p, PNG);
+    await chmod(p, 0o000);
+    try {
+      await expect(readImageFile(p)).rejects.toMatchObject({ code: "INVALID_PARAMS", message: expect.stringMatching(/may not read/) });
+    } finally {
+      await chmod(p, 0o644);
+    }
   });
 });

@@ -32,11 +32,29 @@ export function cleanAiKey(raw: unknown): string | null {
   return cleanRestToken(raw);
 }
 
-/** `sk…a1b2` — enough to tell two keys apart, never enough to use one. */
+/**
+ * `sk-…a1b2` — enough to tell two keys apart, never enough to use one: real
+ * provider keys are 39+ characters, and below 24 the 7 shown would be too
+ * large a share of the key, so nothing is shown.
+ */
 export function maskAiKey(key: string | null | undefined): string | undefined {
   if (!key) return undefined;
-  if (key.length < 12) return "••••";
+  if (key.length < 24) return "••••";
   return `${key.slice(0, 3)}…${key.slice(-4)}`;
+}
+
+/** When each provider's key was last saved or cleared, by the panel's clock. */
+export type AiSavedAtBy = Partial<Record<AiProvider, number>>;
+
+/** Keep only known providers with a positive, finite time. */
+export function cleanSavedAtBy(raw: unknown): AiSavedAtBy {
+  const out: AiSavedAtBy = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const p of AI_PROVIDERS) {
+    const v = (raw as Record<string, unknown>)[p];
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) out[p] = v;
+  }
+  return out;
 }
 
 /** The keys a panel sends: one entry per provider, null = not set there. */

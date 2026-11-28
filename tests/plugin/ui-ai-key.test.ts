@@ -4,13 +4,11 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 /**
- * plugin/ui.html's AI Image Key field (harness copied from ui-rest-token.test.ts).
- * Earlier doc of the original harness: plugin/ui.html's WebSocket lifecycle, run in a vm with a fake WebSocket
- * and fake timers. ui.html is plain script (Figma loads it as-is), so this
- * is the only way to pin its reconnect behaviour: each case below was a
- * reproduced failure — a stale socket's onclose hijacking its replacement,
- * a hello sent before the stored channel was known, a silent port stalling
- * the walk, a restarted server found only after a lap of dead ports.
+ * plugin/ui.html's AI Image Key field, run in a vm with a fake WebSocket and
+ * fake timers (harness copied from ui-rest-token.test.ts). ui.html is plain
+ * script (Figma loads it as-is), so this is how its behaviour is pinned: the
+ * keys go to the main thread on Save, to the server only after `assigned`
+ * (with per-provider save times), and the badge never shows a key.
  */
 
 const html = readFileSync(fileURLToPath(new URL("../../plugin/ui.html", import.meta.url)), "utf8");
@@ -153,8 +151,8 @@ describe("the AI Image Key field", () => {
     const ws = connected();
     expect(JSON.stringify(ws.sent[0])).not.toContain("sk-");
     expect(toMain.some((m) => m.kind === "ai-keys-request")).toBe(true);
-    main({ kind: "ai-keys", keys: { openai: KEY }, savedAt: 42, reason: "sync" });
-    expect(ws.sent.at(-1)).toEqual({ type: "set_ai_keys", keys: { openai: KEY, gemini: null, flux: null, anthropic: null }, savedAt: 42 });
+    main({ kind: "ai-keys", keys: { openai: KEY }, savedAt: 42, savedAtBy: { openai: 42, flux: 30 }, reason: "sync" });
+    expect(ws.sent.at(-1)).toEqual({ type: "set_ai_keys", keys: { openai: KEY, gemini: null, flux: null, anthropic: null }, savedAt: 42, savedAtBy: { openai: 42, flux: 30 } });
   });
 
   it("nothing ever saved: it says nothing", () => {
@@ -200,13 +198,34 @@ describe("the AI Image Key field", () => {
     expect(String(els["ai-badge"]!.title)).toContain("sk-…wxyz");
   });
 
-  it("a refused key keeps what was typed and changes nothing", () => {
+  it("a refused key keeps what was typed, shows the refusal ON THE BADGE (a placeholder is hidden by the text), and changes nothing", () => {
     const ws = connected();
     els["ai-input"]!.value = "bad key";
     main({ kind: "ai-keys", keys: {}, savedAt: null, reason: "rejected", error: "That does not look like an API key" });
     expect(els["ai-input"]!.value).toBe("bad key");
-    expect(String(els["ai-input"]!.placeholder)).toMatch(/does not look like/);
+    expect(aiBadge()).toBe("Not saved");
+    expect(String(els["ai-badge"]!.className)).toContain("bad");
+    expect(String(els["ai-badge"]!.title)).toMatch(/does not look like/);
     expect(ws.sent.some((m) => m.type === "set_ai_keys")).toBe(false);
+    // Typing again clears the refusal and the stale hints.
+    (els["ai-input"]!.oninput as () => void)();
+    expect(aiBadge()).toBe("Not set");
+    expect(String(els["ai-input"]!.placeholder)).toBe("API key");
+  });
+
+  it("after \"paste a key first\", a later successful Save resets the placeholder", () => {
+    connected();
+    els["ai-input"]!.value = "";
+    (els["ai-save"]!.onclick as () => void)();
+    expect(String(els["ai-input"]!.placeholder)).toMatch(/paste a key/);
+    main({ kind: "ai-keys", keys: { openai: KEY }, savedAt: 3, savedAtBy: { openai: 3 }, reason: "saved" });
+    expect(String(els["ai-input"]!.placeholder)).toBe("API key");
+  });
+
+  it("a short key shows no characters in the badge's preview", () => {
+    connected();
+    main({ kind: "ai-keys", keys: { gemini: "short-key-1234567" }, savedAt: 1, savedAtBy: { gemini: 1 }, reason: "sync" });
+    expect(String(els["ai-badge"]!.title)).toBe("Gemini: ••••");
   });
 
   it("the server's ai_status (env keys too) drives the badge; a disconnect falls back to what the panel holds", () => {

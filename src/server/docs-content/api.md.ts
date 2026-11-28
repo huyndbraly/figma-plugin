@@ -167,12 +167,6 @@ separators; a near miss throws with the closest names — never a guess.
   name, scaleMode })\` — prefer \`filePath\` (absolute or \`~/…\`, PNG/JPEG/GIF on
   this machine) or \`imageUrl\` (public https): the SERVER reads the bytes, so
   never put base64 in your code. Dropped on a page it keeps clear of frames.
-- \`removeBackground(nodeId?, { mode?: "beside"|"replace", model?: "small"|"medium",
-  scale?, name? })\` — cuts the subject out of an image layer locally (no key,
-  no upload); no nodeId = the one selected layer. "beside" (default) adds a
-  transparent PNG right of the original; "replace" swaps an image layer's fill.
-  UNSUPPORTED_OPERATION = the optional package is not installed: tell the user
-  the hint's one-time install line, do not retry.
 
 ## SVG → editable vectors
 - Draw icons/illustrations yourself: \`create({ type: "ICON", svg, name, size?,
@@ -349,8 +343,9 @@ If it is not valid, ask the USER to paste a PAT into the plugin panel
 - \`htmlToFigma(url, { width?, selector?, parentId?, maxNodes? })\` — needs
   Playwright installed next to the server; flex → auto-layout. Any http(s)
   URL (localhost, LAN, public); CDN fonts/CSS load as in a browser.
-- \`generateImage(prompt, { provider?: "openai"|"gemini"|"flux", size?, parentId,
-  x, y, w, h })\`, \`generateSvg(prompt, { width?, height?, style?, parentId })\`
+- \`generateImage(prompt, { provider?: "openai"|"gemini"|"flux", size?,
+  transparent?, parentId, x, y, w, h })\` — \`transparent: true\` = the model cuts
+  the subject out (OpenAI only), \`generateSvg(prompt, { width?, height?, style?, parentId })\`
   (Anthropic). Keys: the plugin panel's AI Image Key field, else the server's
   env (figma_status \`aiKeys\` lists which providers have one). Never ask for a
   key in chat.

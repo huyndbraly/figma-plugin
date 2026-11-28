@@ -330,9 +330,7 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
   // The plugin draws the svg; `name` only labels the layer. figma.loadIcon()
   // fetches the svg server-side and always sends both.
   load_icon: z.object({ svg: z.string().min(1), name: z.string().optional() }).passthrough(),
-  // replaceId / besideId: removeBackground's placement (an existing node).
-  load_image: z.object({ replaceId: nodeId.optional(), besideId: nodeId.optional() }).passthrough()
-    .refine((p) => !(p.replaceId && p.besideId), { message: "load_image takes replaceId OR besideId, not both." }),
+  load_image: z.object({}).passthrough(),
   batch: z
     .object({ ops: z.array(z.object({ op: z.string(), params: z.record(z.string(), z.unknown()) })).min(1) })
     .passthrough(),
