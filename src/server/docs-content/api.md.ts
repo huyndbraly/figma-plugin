@@ -343,12 +343,22 @@ If it is not valid, ask the USER to paste a PAT into the plugin panel
 - \`htmlToFigma(url, { width?, selector?, parentId?, maxNodes? })\` — needs
   Playwright installed next to the server; flex → auto-layout. Any http(s)
   URL (localhost, LAN, public); CDN fonts/CSS load as in a browser.
+- Which generator, in order (the plugin cannot spend Figma AI credits — the
+  Plugin API has no Figma AI):
+  1. Vector icon/illustration: write the SVG yourself and \`create({ type:
+     "ICON", svg })\` — costs nothing beyond this chat. \`generateSvg\` is for
+     clients that are not Claude.
+  2. Raster image, and the user's client also has the official Figma MCP
+     connector with an image tool (paid Figma seat): use that — it bills the
+     user's Figma AI credits, no key needed.
+  3. Otherwise (Figma Starter, no connector, or it refused):
+     \`generateImage\` with the user's own key (BYOK).
 - \`generateImage(prompt, { provider?: "openai"|"gemini"|"flux", size?,
   transparent?, parentId, x, y, w, h })\` — \`transparent: true\` = the model cuts
   the subject out (OpenAI only), \`generateSvg(prompt, { width?, height?, style?, parentId })\`
   (Anthropic). Keys: the plugin panel's AI Image Key field, else the server's
-  env (figma_status \`aiKeys\` lists which providers have one). Never ask for a
-  key in chat.
+  env (figma_status \`aiKeys\` lists which providers have one). No key → say
+  so and offer step 1 or 2; never ask for a key in chat.
 
 ## Deleting components and styles
 - \`delete(componentId, {force?})\` removes a COMPONENT / COMPONENT_SET. With
