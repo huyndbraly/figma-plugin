@@ -65,7 +65,7 @@ type MainToUi =
   | { kind: "rest-token"; token: string | null; expiresAt?: number | null; savedAt?: number | null; reason: "saved" | "cleared" | "rejected" | "sync"; error?: string }
   | { kind: "ui-lang"; lang: string | null }
   // The stored AI keys. The UI forwards them with set_ai_keys; it never shows them.
-  | { kind: "ai-keys"; keys: Record<string, string>; savedAt: number | null; reason: "saved" | "sync" | "rejected"; error?: string }
+  | { kind: "ai-keys"; keys: Record<string, string>; savedAt: number | null; savedAtBy: Record<string, number>; reason: "saved" | "sync" | "rejected"; error?: string }
   | {
       kind: "local";
       id: string;
@@ -123,6 +123,9 @@ let storedResumeToken: string | null = null;
  * (rest-token-store.ts says why).
  */
 const UI_LANG_KEY = "figma-plugin:ui-lang";
+
+/** AI-key saves, chained so they never interleave (see "save-ai-key"). */
+let aiSaveQueue: Promise<void> = Promise.resolve();
 
 function helloData(): HelloData {
   return {
@@ -423,14 +426,21 @@ figma.ui.onmessage = async (msg: UiToMain) => {
       break;
     }
     case "save-ai-key": {
-      const res = await saveAiKey(figma.clientStorage, msg.provider, typeof msg.key === "string" ? msg.key : null, Date.now());
-      if (!res.ok) post({ kind: "ai-keys", keys: {}, savedAt: null, reason: "rejected", error: res.error });
-      else post({ kind: "ai-keys", keys: res.stored.keys, savedAt: res.stored.savedAt, reason: "saved" });
+      // One save at a time: two quick Saves would otherwise both read the
+      // same record and the second write would drop the first key.
+      const provider = msg.provider;
+      const key = typeof msg.key === "string" ? msg.key : null;
+      aiSaveQueue = aiSaveQueue.then(async () => {
+        const res = await saveAiKey(figma.clientStorage, provider, key, Date.now());
+        if (!res.ok) post({ kind: "ai-keys", keys: {}, savedAt: null, savedAtBy: {}, reason: "rejected", error: res.error });
+        else post({ kind: "ai-keys", keys: res.stored.keys, savedAt: res.stored.savedAt, savedAtBy: res.stored.savedAtBy, reason: "saved" });
+      }).catch(() => {});
       break;
     }
     case "ai-keys-request": {
+      await aiSaveQueue;
       const stored = await readStoredAiKeys(figma.clientStorage);
-      post({ kind: "ai-keys", keys: stored.keys, savedAt: stored.savedAt, reason: "sync" });
+      post({ kind: "ai-keys", keys: stored.keys, savedAt: stored.savedAt, savedAtBy: stored.savedAtBy, reason: "sync" });
       break;
     }
     case "rest-token-request": {

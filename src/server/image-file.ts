@@ -53,6 +53,26 @@ export function resolveImagePath(raw: unknown): string {
   return resolve(p);
 }
 
+/** A filesystem error → an OpError that says what to do (never the file's content). */
+function fsError(e: unknown, path: string): OpError {
+  if (e instanceof OpError) return e;
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EACCES" || code === "EPERM") {
+    return new OpError(ErrorCode.INVALID_PARAMS, `The MCP server may not read ${path}.`, "Check the file's permissions; on macOS, a file in Desktop, Documents or Downloads may need Full Disk Access for the app that runs the MCP server (or copy the image somewhere else).");
+  }
+  return new OpError(ErrorCode.INVALID_PARAMS, code === "ENOENT" ? `No file at ${path}.` : `Could not read ${path} (${code ?? "error"}).`, "Check the path (absolute, on the machine the MCP server runs on).");
+}
+
+/**
+ * A positional loadImage string that is a PATH, not base64: base64 never
+ * holds "." or "~" or "\", so "/Users/me/a.png", "~/a.png" and "C:\a.png" are
+ * recognisable — while "/9j/4AAQ…" (a JPEG's base64) is not mistaken for one.
+ */
+export function looksLikeImagePath(s: string): boolean {
+  if (s.length > 4096 || /[\r\n]/.test(s)) return false;
+  return /^(~\/|\/|[A-Za-z]:[\\/])/.test(s) && /[.~\\]/.test(s) && !/^[A-Za-z0-9+/=]+$/.test(s);
+}
+
 /** Read an image file → base64, after checking it IS an image Figma can decode. */
 export async function readImageFile(raw: unknown): Promise<{ base64: string; kind: ImageKind; bytes: number; path: string }> {
   const path = resolveImagePath(raw);
@@ -62,30 +82,30 @@ export async function readImageFile(raw: unknown): Promise<{ base64: string; kin
     if (!st.isFile()) throw new OpError(ErrorCode.INVALID_PARAMS, `${path} is not a file.`, "Pass the path of a .png, .jpg or .gif file.");
     size = st.size;
   } catch (e) {
-    if (e instanceof OpError) throw e;
-    const code = (e as NodeJS.ErrnoException).code;
-    throw new OpError(
-      ErrorCode.INVALID_PARAMS,
-      code === "ENOENT" ? `No file at ${path}.` : code === "EACCES" || code === "EPERM" ? `The MCP server may not read ${path}.` : `Could not read ${path} (${code ?? "error"}).`,
-      "Check the path (absolute, on the machine the MCP server runs on).",
-    );
+    throw fsError(e, path);
   }
   if (size > MAX_IMAGE_FILE_BYTES) {
     throw new OpError(ErrorCode.INVALID_PARAMS, `${path} is ${(size / 1048576).toFixed(1)} MB — over the ${MAX_IMAGE_FILE_BYTES / 1048576} MB limit.`, "Downscale it first (Figma caps images at 4096 px a side anyway).");
   }
-  const fh = await open(path, "r");
+  // stat needs no read permission: a mode-000 file, or one macOS privacy
+  // protection guards (Desktop, Documents, Downloads), fails only here.
   let buf: Buffer;
   try {
-    buf = Buffer.alloc(size);
-    let off = 0;
-    while (off < size) {
-      const { bytesRead } = await fh.read(buf, off, size - off, off);
-      if (bytesRead === 0) break;
-      off += bytesRead;
+    const fh = await open(path, "r");
+    try {
+      buf = Buffer.alloc(size);
+      let off = 0;
+      while (off < size) {
+        const { bytesRead } = await fh.read(buf, off, size - off, off);
+        if (bytesRead === 0) break;
+        off += bytesRead;
+      }
+      buf = buf.subarray(0, off);
+    } finally {
+      await fh.close();
     }
-    buf = buf.subarray(0, off);
-  } finally {
-    await fh.close();
+  } catch (e) {
+    throw fsError(e, path);
   }
   const kind = sniffImage(buf);
   if (kind === "webp") {

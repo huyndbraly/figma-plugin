@@ -12,8 +12,8 @@
 //     REST token messages (set_rest_token, rest_status, rest_event).
 // v8: the REST token is no longer read from the hello — only set_rest_token
 //     (with savedAt) after `assigned`; FigJam sections store their model.
-// v9: AI keys from the panel (set_ai_keys, ai_status); load_image takes
-//     replaceId / besideId (removeBackground) and keeps clear of the canvas.
+// v9: AI keys from the panel (set_ai_keys, ai_status); load_image / load_icon
+//     keep clear of the canvas.
 export const PROTOCOL_VERSION = 9;
 
 /** Default bridge port; server falls back to +1..+9 when busy. */
@@ -287,6 +287,8 @@ export interface SetAiKeys {
   type: "set_ai_keys";
   keys: Partial<Record<"openai" | "gemini" | "flux" | "anthropic", string | null>>;
   savedAt?: number | null;
+  /** When each provider was saved/cleared in THIS panel's storage; the server merges per provider. */
+  savedAtBy?: Partial<Record<"openai" | "gemini" | "flux" | "anthropic", number>>;
 }
 
 /** Server → plugin: which providers have a key (masked) — never a key. */

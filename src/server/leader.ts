@@ -79,7 +79,7 @@ export interface CoordinatorDeps {
   /** A plugin window saved/cleared the Figma REST token (see rest-hub.ts). */
   onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null; savedAt?: number | null }) => void;
   /** A plugin window sent its saved AI keys (see ai-keys.ts). */
-  onAiKeys?: (keys: Record<string, unknown>, savedAt: number | null) => void;
+  onAiKeys?: (keys: Record<string, unknown>, savedAt: number | null, savedAtBy?: unknown) => void;
   /**
    * Fires whenever this process starts following a leader — at election,
    * after a takeover by another process, after the leader restarted with a
@@ -188,7 +188,7 @@ export class Coordinator {
         // through the SAME validate+dispatch choke point as its own calls.
         onRpc: (op, params, sessionId, channel) => this.deps.runValidated(op, params, sessionId, channel),
         onRestToken: (token, channel, meta) => this.deps.onRestToken?.(token, channel, meta),
-        onAiKeys: (keys, savedAt) => this.deps.onAiKeys?.(keys, savedAt),
+        onAiKeys: (keys, savedAt, savedAtBy) => this.deps.onAiKeys?.(keys, savedAt, savedAtBy),
       });
       try {
         const bound = await bridge.listen(port, token);

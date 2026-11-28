@@ -441,8 +441,8 @@ export async function createServer(): Promise<ServerHandle> {
     },
     // The panel's AI Image Key field: RAM only, used by generateImage /
     // generateSvg (figma_write runs on the leader, so only its copy matters).
-    onAiKeys: (keys, savedAt) => {
-      aiKeys.set(keys, savedAt);
+    onAiKeys: (keys, savedAt, savedAtBy) => {
+      aiKeys.set(keys, savedAt, savedAtBy);
     },
     // Runs for the initial bridge AND any takeover replacement.
     onBridgeCreated: (bridge) => {
@@ -703,7 +703,13 @@ export async function createServer(): Promise<ServerHandle> {
   );
   const offRestStatus = restHub.onStatus((status) => liveBridge()?.broadcast({ type: "rest_status", status }));
   const offRestEvent = restHub.onEvent((e) => liveBridge()?.broadcast(e));
-  const offAiKeys = aiKeys.onChange(() => liveBridge()?.broadcast({ type: "ai_status", status: aiStatus() }));
+  const offAiKeys = aiKeys.onChange(() => {
+    try {
+      liveBridge()?.broadcast({ type: "ai_status", status: aiStatus() });
+    } catch {
+      /* best effort: never let a status broadcast throw into the caller */
+    }
+  });
 
   const ctx: ToolContext = { runValidated, runWrite, sessions, diagnostics, designIndex: DesignIndex.fromEnv() };
 

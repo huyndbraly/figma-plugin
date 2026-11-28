@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { ErrorCode, OpError } from "./errors.js";
 import { withTimeout } from "./rest-hub.js";
 import { aiKeys, type AiKeyStore } from "./ai-keys.js";
-import { sniffImage } from "./image-file.js";
+import { MAX_IMAGE_FILE_BYTES, sniffImage } from "./image-file.js";
 import { AI_PROVIDER_LABELS, IMAGE_PROVIDERS, isImageProvider, type ImageProvider } from "../shared/ai-key.js";
 
 export type AiFetch = (url: string, init: RequestInit) => Promise<Response>;
@@ -57,16 +57,32 @@ export function envAiKeys(env: NodeJS.ProcessEnv = process.env, file: ByokConfig
 export function readByokFile(env: NodeJS.ProcessEnv = process.env): ByokConfig {
   const path = env.FIGMA_MCP_BYOK_CONFIG;
   if (!path) return {};
+  let v: unknown;
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as ByokConfig;
+    v = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    throw new OpError(ErrorCode.INVALID_PARAMS, "FIGMA_MCP_BYOK_CONFIG points at a file that is not readable JSON.", "It should hold { openaiApiKey?, geminiApiKey?, fluxApiKey?, anthropicApiKey?, imageProvider?, imageModel?, geminiModel?, fluxModel?, svgModel? }.");
+    v = undefined;
   }
+  // `null`, a number or an array parse fine but are not a config: reading a
+  // field of them would throw a TypeError far from here (in a socket handler).
+  if (!v || typeof v !== "object" || Array.isArray(v)) {
+    throw new OpError(ErrorCode.INVALID_PARAMS, "FIGMA_MCP_BYOK_CONFIG points at a file that is not a readable JSON object.", "It should hold { openaiApiKey?, geminiApiKey?, fluxApiKey?, anthropicApiKey?, imageProvider?, imageModel?, geminiModel?, fluxModel?, svgModel? }.");
+  }
+  return v as ByokConfig;
 }
 
 /** Panel keys first (the user typed them for this), then env, then the config file. */
 export function loadByokConfig(env: NodeJS.ProcessEnv = process.env, panel: AiKeyStore = aiKeys): ByokConfig {
-  const file = readByokFile(env);
+  // A broken config file must not hide a key the panel or the environment
+  // has: it only matters when nothing else supplies one (checked below).
+  let file: ByokConfig = {};
+  let fileError: OpError | undefined;
+  try {
+    file = readByokFile(env);
+  } catch (e) {
+    if (!(e instanceof OpError)) throw e;
+    fileError = e;
+  }
   const fromEnv = envAiKeys(env, file);
   const key = (p: "openai" | "gemini" | "flux" | "anthropic") => panel.get(p) ?? fromEnv[p];
   const provider = pick(env.FIGMA_MCP_IMAGE_PROVIDER, file.imageProvider);
@@ -82,6 +98,7 @@ export function loadByokConfig(env: NodeJS.ProcessEnv = process.env, panel: AiKe
   if (g) out.geminiApiKey = g;
   if (f) out.fluxApiKey = f;
   if (a) out.anthropicApiKey = a;
+  if (fileError && !o && !g && !f && !a) throw fileError;
   return out;
 }
 
@@ -140,6 +157,12 @@ export interface GenerateImageOptions {
   size?: string;
   quality?: string;
   provider?: unknown;
+  /**
+   * A transparent background, cut out by the model itself (OpenAI
+   * `background: "transparent"`). Gemini and Flux cannot, so with no provider
+   * named this picks OpenAI.
+   */
+  transparent?: boolean;
   /** Test seam: Flux's polling delay. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -147,11 +170,14 @@ export interface GenerateImageOptions {
 /** → base64 image bytes (PNG or JPEG) from the chosen provider. */
 export async function generateImage(prompt: unknown, opts: GenerateImageOptions = {}, cfg: ByokConfig = loadByokConfig(), fetchImpl: AiFetch = (u, i) => fetch(u, i), signal?: AbortSignal): Promise<{ base64: string; model: string; size: string; provider: ImageProvider }> {
   const text = prompted(prompt);
-  const provider = chooseImageProvider(cfg, opts.provider);
+  if (opts.transparent && opts.provider !== undefined && opts.provider !== "openai") {
+    throw new OpError(ErrorCode.INVALID_PARAMS, `${isImageProvider(opts.provider) ? AI_PROVIDER_LABELS[opts.provider] : String(opts.provider)} cannot make a transparent background.`, 'Use provider "openai" (or leave provider out) with transparent: true.');
+  }
+  const provider = chooseImageProvider(cfg, opts.transparent ? "openai" : opts.provider);
   const size = opts.size && SIZES.includes(opts.size) ? opts.size : "1024x1024";
   const key = keyOf(cfg, provider)!;
   let out: { base64: string; model: string };
-  if (provider === "openai") out = await openaiImage(text, size, opts.quality, key, cfg, fetchImpl, signal);
+  if (provider === "openai") out = await openaiImage(text, size, opts.quality, key, cfg, fetchImpl, signal, opts.transparent === true);
   else if (provider === "gemini") out = await geminiImage(text, size, key, cfg, fetchImpl, signal);
   else out = await fluxImage(text, size, key, cfg, fetchImpl, signal, opts.sleep);
   const kind = sniffImage(Buffer.from(out.base64.slice(0, 64), "base64"));
@@ -161,12 +187,13 @@ export async function generateImage(prompt: unknown, opts: GenerateImageOptions 
   return { ...out, size, provider };
 }
 
-async function openaiImage(text: string, size: string, quality: string | undefined, key: string, cfg: ByokConfig, fetchImpl: AiFetch, signal?: AbortSignal): Promise<{ base64: string; model: string }> {
+async function openaiImage(text: string, size: string, quality: string | undefined, key: string, cfg: ByokConfig, fetchImpl: AiFetch, signal?: AbortSignal, transparent = false): Promise<{ base64: string; model: string }> {
   const model = cfg.imageModel ?? DEFAULT_IMAGE_MODEL;
   const res = await fetchImpl("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-    body: JSON.stringify({ model, prompt: text, size, n: 1, ...(quality ? { quality } : {}) }),
+    // A transparent background needs a format with alpha: PNG.
+    body: JSON.stringify({ model, prompt: text, size, n: 1, ...(quality ? { quality } : {}), ...(transparent ? { background: "transparent", output_format: "png" } : {}) }),
     signal: byokSignal(signal),
   });
   if (res.status === 401 || res.status === 403) throw refused("openai", res.status);
@@ -208,13 +235,22 @@ async function geminiImage(text: string, size: string, key: string, cfg: ByokCon
   return { base64: b64, model };
 }
 
-const FLUX_DEADLINE_MS = 110_000;
+/**
+ * The WHOLE Flux call — submit, polls, download — must end well inside the
+ * figma_write budget (VM_TIMEOUT_MS, 120 s), leaving time to place the image:
+ * a worker killed mid-poll throws away an image the provider already billed.
+ */
+export const FLUX_DEADLINE_MS = 90_000;
+/** A Flux sample bigger than this is not an image anyone asked for. */
+const FLUX_MAX_IMAGE_BYTES = MAX_IMAGE_FILE_BYTES;
+/** Right after submit, BFL can answer "Task not found" for a job it has not registered yet. */
+const FLUX_NOT_FOUND_GRACE_MS = 10_000;
 
 /** Only Black Forest Labs' own hosts get the key. */
 function isBflHost(url: string): boolean {
   try {
     const u = new URL(url);
-    return u.protocol === "https:" && (u.hostname === "bfl.ai" || u.hostname.endsWith(".bfl.ai") || u.hostname.endsWith(".bfl.ml"));
+    return u.protocol === "https:" && (u.hostname === "bfl.ai" || u.hostname.endsWith(".bfl.ai"));
   } catch {
     return false;
   }
@@ -223,11 +259,20 @@ function isBflHost(url: string): boolean {
 async function fluxImage(text: string, size: string, key: string, cfg: ByokConfig, fetchImpl: AiFetch, signal?: AbortSignal, sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<{ base64: string; model: string }> {
   const model = cfg.fluxModel ?? DEFAULT_FLUX_MODEL;
   const { w, h } = dims(size === "auto" ? "1024x1024" : size);
+  const started = Date.now();
+  const deadline = started + FLUX_DEADLINE_MS;
+  const timedOut = () => new OpError(ErrorCode.INTERNAL, `Flux did not finish within ${FLUX_DEADLINE_MS / 1000} s.`, "Retry, or use a faster model (FIGMA_MCP_FLUX_MODEL=flux-dev) or another provider.");
+  // Every request is bounded by what is left of the deadline, not 120 s each.
+  const left = (): AbortSignal | undefined => {
+    const ms = deadline - Date.now();
+    if (ms <= 0) throw timedOut();
+    return withTimeout(signal, ms);
+  };
   const res = await fetchImpl(`https://api.bfl.ai/v1/${encodeURIComponent(model)}`, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json", "x-key": key },
     body: JSON.stringify({ prompt: text, width: w, height: h, output_format: "png" }),
-    signal: byokSignal(signal),
+    signal: left(),
   });
   if (res.status === 401 || res.status === 403) throw refused("flux", res.status);
   if (res.status === 429) throw rateLimited("flux");
@@ -236,10 +281,11 @@ async function fluxImage(text: string, size: string, key: string, cfg: ByokConfi
   if (!job.id && !job.polling_url) throw new OpError(ErrorCode.INTERNAL, "Flux returned no job id.", "Retry.");
   const pollUrl = job.polling_url ?? `https://api.bfl.ai/v1/get_result?id=${encodeURIComponent(job.id!)}`;
   if (!isBflHost(pollUrl)) throw new OpError(ErrorCode.INTERNAL, "Flux sent a polling URL outside bfl.ai; it was not followed.", "Retry; report it if it persists.");
-  const deadline = Date.now() + FLUX_DEADLINE_MS;
+  // A job is never ready the instant it is submitted.
+  await sleep(500);
   for (;;) {
     if (signal?.aborted) throw new OpError(ErrorCode.INTERNAL, "generateImage was cancelled.", "Call again if it is still needed.");
-    const poll = await fetchImpl(pollUrl, { method: "GET", headers: { accept: "application/json", "x-key": key }, signal: byokSignal(signal) });
+    const poll = await fetchImpl(pollUrl, { method: "GET", headers: { accept: "application/json", "x-key": key }, signal: left() });
     if (poll.status === 401 || poll.status === 403) throw refused("flux", poll.status);
     if (poll.status === 429) throw rateLimited("flux");
     if (!poll.ok) throw new OpError(ErrorCode.INTERNAL, `Flux polling failed: HTTP ${poll.status}`, "Retry.");
@@ -248,14 +294,20 @@ async function fluxImage(text: string, size: string, key: string, cfg: ByokConfi
       const sample = st.result?.sample;
       if (typeof sample !== "string" || !/^https:\/\//i.test(sample)) throw new OpError(ErrorCode.INTERNAL, "Flux finished without an image URL.", "Retry.");
       // The signed delivery URL needs no key — and never gets one.
-      const img = await fetchImpl(sample, { method: "GET", signal: byokSignal(signal) });
+      const img = await fetchImpl(sample, { method: "GET", signal: left() });
       if (!img.ok) throw new OpError(ErrorCode.INTERNAL, `Downloading the Flux image failed: HTTP ${img.status}`, "Retry (the link expires after a few minutes).");
-      return { base64: Buffer.from(await img.arrayBuffer()).toString("base64"), model };
+      const tooBig = () => new OpError(ErrorCode.INTERNAL, `The Flux image is over ${FLUX_MAX_IMAGE_BYTES / 1048576} MB; it was not downloaded.`, "Retry with a smaller size.");
+      const declared = Number(img.headers?.get?.("content-length") ?? NaN);
+      if (Number.isFinite(declared) && declared > FLUX_MAX_IMAGE_BYTES) throw tooBig();
+      const bytes = Buffer.from(await img.arrayBuffer());
+      if (bytes.length > FLUX_MAX_IMAGE_BYTES) throw tooBig();
+      return { base64: bytes.toString("base64"), model };
     }
-    if (st.status && st.status !== "Pending" && st.status !== "Queued" && st.status !== "Processing") {
+    const notYetRegistered = st.status === "Task not found" && Date.now() - started < FLUX_NOT_FOUND_GRACE_MS;
+    if (st.status && !notYetRegistered && st.status !== "Pending" && st.status !== "Queued" && st.status !== "Processing") {
       throw new OpError(ErrorCode.INTERNAL, `Flux did not make the image: ${st.status}.`, /moderat/i.test(st.status) ? "The prompt or result was moderated; rephrase it." : "Retry, or use another provider.");
     }
-    if (Date.now() > deadline) throw new OpError(ErrorCode.INTERNAL, "Flux did not finish within 110 s.", "Retry, or use a faster model (FIGMA_MCP_FLUX_MODEL=flux-dev).");
+    if (Date.now() + 1000 >= deadline) throw timedOut();
     await sleep(1000);
   }
 }

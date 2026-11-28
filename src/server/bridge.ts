@@ -263,7 +263,7 @@ export interface BridgeHandlers {
    */
   onRestToken?: (token: string | null, channel: string, meta?: { expiresAt?: number | null; savedAt?: number | null }) => void;
   /** A plugin window sent its saved AI keys (see ai-keys.ts). Never stored or echoed here. */
-  onAiKeys?: (keys: Record<string, unknown>, savedAt: number | null) => void;
+  onAiKeys?: (keys: Record<string, unknown>, savedAt: number | null, savedAtBy?: unknown) => void;
 }
 
 export interface BridgeOptions {
@@ -796,9 +796,15 @@ export class Bridge {
         const keys = (msg as { keys?: unknown }).keys;
         if (!keys || typeof keys !== "object" || Array.isArray(keys)) break;
         const saved = (msg as { savedAt?: unknown }).savedAt;
-        this.handlers.onAiKeys?.(keys as Record<string, unknown>, typeof saved === "number" ? saved : null);
-        // Always answer the sender, changed or not: its badge is waiting.
-        if (this.aiStatusProvider) conn.send({ type: "ai_status", status: this.aiStatusProvider() });
+        // A throw here would escape the socket's "message" listener and take
+        // the whole process down: whatever goes wrong with keys stays here.
+        try {
+          this.handlers.onAiKeys?.(keys as Record<string, unknown>, typeof saved === "number" ? saved : null, (msg as { savedAtBy?: unknown }).savedAtBy);
+          // Always answer the sender, changed or not: its badge is waiting.
+          if (this.aiStatusProvider) conn.send({ type: "ai_status", status: this.aiStatusProvider() });
+        } catch {
+          /* status is best effort; the generation call reports real errors */
+        }
         break;
       }
       case "context": {
